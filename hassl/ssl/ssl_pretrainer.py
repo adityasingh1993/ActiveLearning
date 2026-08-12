@@ -45,13 +45,14 @@ class SSLPretrainer:
         self.rot_head = nn.LazyLinear(4).to(self.device)
         self.proj_head = nn.LazyLinear(getattr(config, 'ssl_embedding_dim', 128)).to(self.device)
 
-        # Dry run to initialize LazyLinear heads on bottleneck feature dimensions (H-4 fix)
+        # Dry run to initialize LazyLinear heads on bottleneck feature dimensions (H-4 & Sub-Patch InfoNCE fix)
         with torch.no_grad():
             dummy_x = torch.zeros(1, 1, 32, 32, 32, device=self.device)
             dummy_bottleneck = self._extract_bottleneck_features(dummy_x)
-            dummy_feat = F.adaptive_avg_pool3d(dummy_bottleneck, 1).view(1, -1)
-            self.rot_head(dummy_feat)
-            self.proj_head(dummy_feat)
+            dummy_rot_feat = F.adaptive_avg_pool3d(dummy_bottleneck, 1).view(1, -1)
+            dummy_patch_feat = F.adaptive_avg_pool3d(dummy_bottleneck, (2, 2, 2)).permute(0, 2, 3, 4, 1).reshape(-1, dummy_bottleneck.size(1))
+            self.rot_head(dummy_rot_feat)
+            self.proj_head(dummy_patch_feat)
 
         self.optimizer = torch.optim.AdamW(
             list(self.model.parameters()) + list(self.rot_head.parameters()) + list(self.proj_head.parameters()),
@@ -122,15 +123,9 @@ class SSLPretrainer:
         return rotated_x, labels
 
     def _infonce_loss(self, feat1: torch.Tensor, feat2: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
-        """Patch/Volume InfoNCE contrastive loss supporting batch_size=1 (H-5 fix)."""
-        # Multiply features across patches/samples to ensure negative pairs exist
+        """Spatial sub-patch InfoNCE contrastive loss supporting any batch size (B >= 1)."""
         feat1 = F.normalize(feat1, dim=-1)
         feat2 = F.normalize(feat2, dim=-1)
-
-        if feat1.ndim == 2 and feat1.size(0) == 1:
-            # If batch_size=1, split volume into 4 spatial quadrants for sub-patch contrastive pairs
-            # This ensures non-zero negative pairs exist even at batch_size=1 (H-5 fix)
-            return torch.tensor(0.0, device=feat1.device, requires_grad=True)
 
         sim_matrix = torch.matmul(feat1, feat2.T) / temperature
         labels = torch.arange(sim_matrix.size(0), device=feat1.device)
@@ -184,8 +179,12 @@ class SSLPretrainer:
                     rot_preds = self.rot_head(rot_feats)
                     loss_rot = self.ce_loss(rot_preds, rot_labels)
 
-                    feat1 = self.proj_head(F.adaptive_avg_pool3d(b1, 1).view(B, -1))
-                    feat2 = self.proj_head(F.adaptive_avg_pool3d(b2, 1).view(B, -1))
+                    # Extract 2x2x2 spatial sub-patch representations for InfoNCE contrastive pairs (8 patches per volume)
+                    p1 = F.adaptive_avg_pool3d(b1, (2, 2, 2)).permute(0, 2, 3, 4, 1).reshape(-1, b1.size(1))
+                    p2 = F.adaptive_avg_pool3d(b2, (2, 2, 2)).permute(0, 2, 3, 4, 1).reshape(-1, b2.size(1))
+
+                    feat1 = self.proj_head(p1)
+                    feat2 = self.proj_head(p2)
                     loss_cont = self._infonce_loss(feat1, feat2, temperature=getattr(self.config, 'ssl_contrastive_temp', 0.07))
 
                     loss = loss_inp + loss_rot + loss_cont

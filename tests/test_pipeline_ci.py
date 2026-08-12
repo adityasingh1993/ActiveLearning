@@ -172,3 +172,38 @@ def test_teacher_student_views_are_spatially_aligned():
     dice = float((2.0 * intersection / (total + 1e-8)).item())
 
     assert dice >= 0.90, f"Teacher and student views are spatially misaligned! Spatial Dice overlap: {dice:.4f} < 0.90"
+
+
+def test_ssl_contrastive_loss_nonzero_at_batch_size_1():
+    """Verify SSL InfoNCE contrastive loss is non-zero and produces gradients even at batch_size=1."""
+    try:
+        import torch
+        from hassl.config import HASSLConfig
+        from hassl.ssl.ssl_pretrainer import SSLPretrainer
+    except ImportError:
+        pytest.skip("PyTorch or MONAI not installed")
+
+    config = HASSLConfig()
+    config.device = "cpu"
+    config.compute_mode = "prototype"
+    config.unet_backbone = "unet"
+
+    pretrainer = SSLPretrainer(config=config, dataloader=[], tracker=None)
+
+    # Synthetic batch of size B=1
+    x = torch.randn(1, 1, 32, 32, 32)
+    x_aug1 = x + torch.randn_like(x) * 0.05
+    x_aug2 = x + torch.randn_like(x) * 0.05
+
+    b1 = pretrainer._extract_bottleneck_features(x_aug1)
+    b2 = pretrainer._extract_bottleneck_features(x_aug2)
+
+    p1 = torch.nn.functional.adaptive_avg_pool3d(b1, (2, 2, 2)).permute(0, 2, 3, 4, 1).reshape(-1, b1.size(1))
+    p2 = torch.nn.functional.adaptive_avg_pool3d(b2, (2, 2, 2)).permute(0, 2, 3, 4, 1).reshape(-1, b2.size(1))
+
+    feat1 = pretrainer.proj_head(p1)
+    feat2 = pretrainer.proj_head(p2)
+
+    loss_cont = pretrainer._infonce_loss(feat1, feat2)
+    assert loss_cont.item() > 0.0, f"Contrastive loss at batch_size=1 must be > 0.0, got {loss_cont.item()}"
+    assert loss_cont.requires_grad, "Contrastive loss must require grad for optimization"
