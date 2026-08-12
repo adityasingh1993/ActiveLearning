@@ -23,14 +23,13 @@ import os
 import json
 import glob
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
 try:
     from fastapi import FastAPI, HTTPException, Query
     from fastapi.staticfiles import StaticFiles
-    from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, StreamingResponse
     import uvicorn
 except ImportError:
     raise ImportError(
@@ -76,13 +75,13 @@ def _load_volume(path: str) -> np.ndarray:
 
 
 def _load_mask(path: str) -> np.ndarray:
-    """Load a segmentation mask from .seg.nrrd or .nrrd file."""
-    if nrrd is not None:
+    """Load a segmentation mask from .seg.nrrd or .nrrd file using SimpleITK first for (Z, Y, X) alignment (A-3 fix)."""
+    if sitk is not None:
+        img = sitk.ReadImage(path)
+        return sitk.GetArrayFromImage(img).astype(np.uint8)  # (Z, Y, X) order matching _load_volume
+    elif nrrd is not None:
         data, _ = nrrd.read(path)
         return data.astype(np.uint8)
-    elif sitk is not None:
-        img = sitk.ReadImage(path)
-        return sitk.GetArrayFromImage(img).astype(np.uint8)
     raise ValueError(f"Cannot load mask {path}")
 
 
@@ -108,7 +107,6 @@ def _array_to_png(arr: np.ndarray) -> bytes:
 def _create_overlay(image_slice: np.ndarray, mask_slice: np.ndarray,
                     alpha: float = 0.4) -> np.ndarray:
     """Create an RGB overlay of image + mask."""
-    from PIL import Image
     img_norm = _normalize_for_display(image_slice)
     rgb = np.stack([img_norm, img_norm, img_norm], axis=-1)  # Grayscale -> RGB
 
@@ -175,7 +173,7 @@ async def list_volumes():
     """List all volumes with their status."""
     volumes = list(_state["volumes"].values())
     # Sort: preseg first, then unlabeled, then labeled
-    priority = {"preseg": 0, "unlabeled": 1, "labeled": 2}
+    priority = {"preseg": 0, "unlabeled": 1, "labeled": 2, "human_corrected": 2, "pseudo_approved": 2}
     volumes.sort(key=lambda v: priority.get(v["status"], 3))
     return {"volumes": volumes, "total": len(volumes)}
 
@@ -197,7 +195,7 @@ async def get_volume_info(vol_id: str):
         "id": vol_id,
         "status": vol["status"],
         "shape": shape,
-        "num_slices": {"axial": shape[0], "sagittal": shape[2], "coronal": shape[1]},
+        "num_slices": {"axial": shape[0], "coronal": shape[1], "sagittal": shape[2]},
     }
 
 
@@ -231,6 +229,13 @@ async def get_slice(
             except Exception:
                 _state["cached_presegs"][cache_key] = None
         mask = _state["cached_presegs"].get(cache_key)
+
+    # A-3 fix: Verify shape agreement between image and mask
+    if mask is not None and mask.shape != image.shape:
+        print(f"[WebUI Warning] Mask shape {mask.shape} disagrees with image shape {image.shape} for {vol_id}. Transposing/reorienting mask.")
+        if mask.shape == image.shape[::-1]:
+            mask = np.transpose(mask, (2, 1, 0))
+            _state["cached_presegs"][vol_id] = mask
 
     # Extract slice
     axis_map = {"axial": 0, "coronal": 1, "sagittal": 2}
@@ -286,6 +291,12 @@ async def get_mask_slice(
     if mask is None:
         mask = np.zeros(image.shape, dtype=np.uint8)
 
+    # A-3 fix: Enforce shape alignment
+    if mask.shape != image.shape:
+        if mask.shape == image.shape[::-1]:
+            mask = np.transpose(mask, (2, 1, 0))
+            _state["cached_presegs"][vol_id] = mask
+
     axis_map = {"axial": 0, "coronal": 1, "sagittal": 2}
     ax = axis_map[axis]
     index = max(0, min(index, image.shape[ax] - 1))
@@ -302,7 +313,7 @@ async def get_mask_slice(
 
 @app.post("/api/volume/{vol_id}/slice_edit")
 async def edit_mask_slice(vol_id: str, payload: dict):
-    """Save interactive 2D slice edits into the 3D volume mask and persist to disk (A-6 fix)."""
+    """Save interactive 2D slice edits into the 3D volume mask, update manifest, and persist to disk (V6-2, V6-3 fix)."""
     if vol_id not in _state["volumes"]:
         raise HTTPException(status_code=404, detail=f"Volume {vol_id} not found")
 
@@ -353,7 +364,27 @@ async def edit_mask_slice(vol_id: str, payload: dict):
             nrrd.write(out_mask_path, mask_3d)
 
     vol["label_path"] = out_mask_path
-    vol["status"] = "pseudo_approved"
+    vol["status"] = "human_corrected"
+
+    # V6-2 & V6-3 fix: Update manifest provenance so hand corrections reach training with human_corrected status
+    manifest_path = os.path.join(config.log_dir, "pool_manifest.json")
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+            if "provenance" not in manifest:
+                manifest["provenance"] = {}
+            manifest["provenance"][vol_id] = "human_corrected"
+            if vol_id not in manifest.get("labeled_ids", []):
+                manifest["labeled_ids"].append(vol_id)
+            if vol_id in manifest.get("unlabeled_ids", []):
+                manifest["unlabeled_ids"].remove(vol_id)
+            if vol_id in manifest.get("pseudo_ids", []):
+                manifest["pseudo_ids"].remove(vol_id)
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f, indent=4)
+        except Exception as e:
+            print(f"[WebUI Server] Warning: could not update manifest provenance for slice edit: {e}")
 
     return {"message": f"Slice {index} on {axis} axis saved successfully for {vol_id}", "path": out_mask_path}
 
@@ -406,7 +437,8 @@ async def accept_volume(vol_id: str):
     # Clear cache
     _state["cached_presegs"].pop(vol_id, None)
 
-    return {"message": f"Volume {vol_id} accepted and saved to {dest}"}
+    # V6-1 fix: Return dest_approved variable, not deleted dest
+    return {"message": f"Volume {vol_id} accepted and saved to {dest_approved}"}
 
 
 @app.post("/api/volume/{vol_id}/reject")

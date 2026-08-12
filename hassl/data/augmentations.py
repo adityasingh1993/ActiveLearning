@@ -6,7 +6,6 @@ from monai.transforms import (
     RandFlipd,
     RandRotated,
     RandAffined,
-    RandGaussianNoised,
     RandGaussianSmoothd,
     RandScaleIntensityd,
     RandAdjustContrastd

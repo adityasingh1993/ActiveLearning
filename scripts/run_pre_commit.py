@@ -20,6 +20,19 @@ import hassl
 
 
 def main():
+    print("[HASSL Pre-Commit Hook] Running static analysis (ruff F821/F401)...")
+    import subprocess
+    try:
+        res = subprocess.run(["ruff", "check", "hassl", "--select", "F821,F401"], capture_output=True, text=True)
+        if res.returncode != 0:
+            print("[HASSL Pre-Commit Hook] FAILED! Ruff static analysis found errors:")
+            print(res.stdout)
+            sys.exit(1)
+        else:
+            print("  [OK] Ruff F821/F401 passed cleanly")
+    except FileNotFoundError:
+        print("  [INFO] Ruff not installed in environment, skipping ruff check")
+
     print("[HASSL Pre-Commit Hook] Running module verification (SyntaxError, NameError, & Internal Imports)...")
     failed = []
     external_missing = []

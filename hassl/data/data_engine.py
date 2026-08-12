@@ -4,10 +4,8 @@ import json
 import random
 import re
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Dict, Optional
 
-import torch
-from torch.utils.data import DataLoader
 from monai.data import CacheDataset, PersistentDataset, Dataset, DataLoader as MonaiDataLoader
 from monai.transforms import (
     Compose,
@@ -19,7 +17,7 @@ from monai.transforms import (
     ScaleIntensityRangePercentilesd
 )
 
-from .augmentations import get_strong_augmentation, get_weak_augmentation
+from .augmentations import get_strong_augmentation
 
 
 def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label_suffix: str = ".seg.nrrd", seed: int = 42, patient_id_regex: Optional[str] = None) -> Dict[str, List[str]]:
@@ -127,15 +125,16 @@ def build_labeled_dataset(data_dir: str, image_suffix: str, label_suffix: str,
         if not os.path.exists(lbl_path):
             lbl_path = str(Path(img_path).parent / f"{base_name}{label_suffix}")
 
-        # P-1 fix: Check in approved pseudo-labels directory ONLY if manifest marks it pseudo_approved
+        # P-1, V6-2 & V6-3 fix: Check in approved pseudo-labels directory ONLY if manifest marks it pseudo_approved or human_corrected
         if not os.path.exists(lbl_path):
-            if manifest_provenance.get(base_name) == "pseudo_approved":
+            prov_status = manifest_provenance.get(base_name)
+            if prov_status in ["pseudo_approved", "human_corrected"]:
                 pseudo_candidate = str(data_dir_path / "pseudo_approved" / f"{base_name}{label_suffix}")
                 if not os.path.exists(pseudo_candidate):
                     pseudo_candidate = str(data_dir_path / "pseudo" / f"{base_name}{label_suffix}")
                 if os.path.exists(pseudo_candidate):
                     lbl_path = pseudo_candidate
-                    provenance = "pseudo_approved"
+                    provenance = prov_status
 
         if os.path.exists(lbl_path):
             data_dicts.append({

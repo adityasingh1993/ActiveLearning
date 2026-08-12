@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict
 import numpy as np
 import torch
 import torch.nn as nn
@@ -7,7 +7,7 @@ import monai
 from monai.networks.nets import UNet, DynUNet, SwinUNETR
 from monai.metrics import DiceMetric
 
-from .ema import EMATeacher, enable_dropout
+from .ema import EMATeacher
 from .losses import CombinedSegLoss, UncertaintyMaskedLoss, FlexMatchThreshold
 from ..tracking import ExperimentTracker
 from ..data.augmentations import get_weak_augmentation, get_strong_augmentation
@@ -149,8 +149,9 @@ class HASSLTrainer:
             targets_l = batch_data['label'].to(self.device)
             provenance_list = batch_data.get('provenance', ['human'] * inputs_l.size(0))
 
+            # V6-3 fix: Human-corrected masks are weighted 1.0 (same as human gold annotations)
             sample_weights = torch.tensor(
-                [1.0 if p == 'human' else pseudo_weight for p in provenance_list],
+                [1.0 if p in ['human', 'human_corrected'] else pseudo_weight for p in provenance_list],
                 device=self.device, dtype=torch.float32
             )
 
@@ -181,10 +182,10 @@ class HASSLTrainer:
                 uncert_val = 0.0
 
                 if inputs_u is not None:
-                    # N-5 fix: Teacher gets weak view; Student gets strong view
+                    # N-5 fix: Execute weak augmentation for teacher and strong augmentation for student
                     try:
-                        inputs_u_teacher = inputs_u + torch.randn_like(inputs_u) * 0.01  # Mild perturbation for teacher
-                        inputs_u_student = inputs_u + torch.randn_like(inputs_u) * 0.05  # Stronger noise perturbation for student
+                        inputs_u_teacher = torch.stack([self.weak_aug({"image": inputs_u[b]})["image"] for b in range(inputs_u.size(0))])
+                        inputs_u_student = torch.stack([self.strong_aug({"image": inputs_u[b]})["image"] for b in range(inputs_u.size(0))])
                     except Exception:
                         inputs_u_teacher = inputs_u
                         inputs_u_student = inputs_u
@@ -247,8 +248,9 @@ class HASSLTrainer:
             targets_l = batch_data['label'].to(self.device)
             provenance_list = batch_data.get('provenance', ['human'] * inputs_l.size(0))
 
+            # V6-3 fix: Human-corrected masks are weighted 1.0
             sample_weights = torch.tensor(
-                [1.0 if p == 'human' else pseudo_weight for p in provenance_list],
+                [1.0 if p in ['human', 'human_corrected'] else pseudo_weight for p in provenance_list],
                 device=self.device, dtype=torch.float32
             )
 
@@ -386,21 +388,29 @@ class HASSLTrainer:
             self.dice_metric(y_pred=preds_binary, y=targets)
             confusion_metric(y_pred=preds_binary, y=targets)
 
-            try:
-                # Pass spacing for true physical distance calculation (V-6 fix)
-                hd95_metric(y_pred=preds_binary, y=targets, spacing=self.config.spacing)
-            except Exception:
-                pass  # HD95 can fail gracefully if foreground is empty
-
-            # V-5 fix: Scale voxel counts by physical voxel volume (mm³) before computing R²
+            # V-5 & V-6 fix: Extract physical voxel volume and spacing directly from current post-resize MetaTensor affine
             for b in range(inputs.size(0)):
                 voxel_vol = default_voxel_vol_mm3
-                # Extract per-sample pixdim if present in metadata
-                meta = batch_data.get('image_meta_dict') or batch_data.get('image', {}).meta if hasattr(batch_data.get('image'), 'meta') else None
-                if meta and 'pixdim' in meta:
-                    pixdim = meta['pixdim'][b] if hasattr(meta['pixdim'], '__getitem__') else meta['pixdim']
-                    if len(pixdim) >= 4:
-                        voxel_vol = float(abs(pixdim[1] * pixdim[2] * pixdim[3]))
+                spacing_b = self.config.spacing
+
+                affine_b = None
+                if hasattr(inputs, 'meta') and 'affine' in inputs.meta:
+                    affine_b = inputs.meta['affine'][b]
+                elif 'image_meta_dict' in batch_data and 'affine' in batch_data['image_meta_dict']:
+                    affine_b = batch_data['image_meta_dict']['affine'][b]
+
+                if affine_b is not None and torch.is_tensor(affine_b):
+                    try:
+                        voxel_vol = float(torch.abs(torch.det(affine_b[:3, :3])).item())
+                        spacing_b = tuple(float(torch.linalg.norm(affine_b[:3, i]).item()) for i in range(3))
+                    except Exception:
+                        pass
+
+                try:
+                    # Pass post-resize physical spacing to HD95 metric (V-6 fix)
+                    hd95_metric(y_pred=preds_binary[b:b+1], y=targets[b:b+1], spacing=spacing_b)
+                except Exception:
+                    pass
 
                 pv_mm3 = float(preds_binary[b].sum().item()) * voxel_vol
                 gv_mm3 = float(targets[b].sum().item()) * voxel_vol

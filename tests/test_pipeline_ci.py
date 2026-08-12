@@ -98,3 +98,46 @@ def test_provenance_manifest_gating(tmp_path):
     provenance_map = {item["id"]: item["provenance"] for item in ds.data}
     assert provenance_map.get("vol_human") == "human"
     assert provenance_map.get("vol_pseudo") == "pseudo_approved"
+
+
+def test_frozen_splits_patient_collapse_failure(tmp_path):
+    """Verify get_or_create_frozen_splits raises ValueError when all volumes collapse to 1 patient (V-11 fix)."""
+    data_dir = tmp_path / "data_collapse"
+    data_dir.mkdir(parents=True)
+    labels_dir = data_dir / "labels"
+    labels_dir.mkdir(parents=True)
+
+    # 10 volumes with same prefix 'commonprefix' causing single-patient collapse
+    for i in range(1, 10):
+        vol_name = f"commonprefix_case{i}"
+        (data_dir / f"{vol_name}.mha").write_bytes(b"data")
+        (labels_dir / f"{vol_name}.seg.nrrd").write_bytes(b"label")
+
+    with pytest.raises(ValueError, match="collapsed all 9 volumes into 1 single patient ID"):
+        get_or_create_frozen_splits(str(data_dir), seed=42)
+
+
+def test_written_mask_preserves_geometry(tmp_path):
+    """Verify write_mask_with_spatial_geometry preserves physical affine size, spacing, & direction (V6-5 fix)."""
+    try:
+        import SimpleITK as sitk
+    except ImportError:
+        pytest.skip("SimpleITK not installed")
+
+    src_path = str(tmp_path / "reference.mha")
+    out_path = str(tmp_path / "written_mask.seg.nrrd")
+
+    # Create dummy reference ITK image
+    arr = np.zeros((32, 32, 32), dtype=np.float32)
+    ref_img = sitk.GetImageFromArray(arr)
+    ref_img.SetSpacing((0.5, 0.4, 0.8))
+    ref_img.SetOrigin((10.0, -5.0, 3.0))
+    sitk.WriteImage(ref_img, src_path)
+
+    mask_arr = np.ones((16, 16, 16), dtype=np.uint8)  # Resized 16^3 prediction mask
+    write_mask_with_spatial_geometry(out_path, mask_arr, reference_image_path=src_path)
+
+    got_img = sitk.ReadImage(out_path)
+    assert got_img.GetSize() == ref_img.GetSize(), "Output mask size must match reference image size"
+    assert got_img.GetSpacing() == pytest.approx(ref_img.GetSpacing()), "Output mask spacing must match reference image spacing"
+    assert got_img.GetOrigin() == pytest.approx(ref_img.GetOrigin()), "Output mask origin must match reference image origin"

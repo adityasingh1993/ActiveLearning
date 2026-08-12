@@ -51,7 +51,6 @@ def run_pretrain(config: HASSLConfig) -> None:
     Also extracts and caches feature embeddings for active learning.
     """
     from hassl.tracking import ExperimentTracker
-    from hassl.data.data_engine import build_unlabeled_dataset
     from hassl.ssl.ssl_pretrainer import SSLPretrainer
     from hassl.ssl.feature_extractor import FeatureExtractor
 

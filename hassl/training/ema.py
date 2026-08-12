@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import copy
-from typing import Tuple, Optional
+from typing import Tuple
 
 
 def enable_dropout(model: nn.Module) -> None:
