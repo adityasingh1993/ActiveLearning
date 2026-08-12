@@ -38,29 +38,41 @@ class RandMultiplicativeSpeckleNoised(RandomizableTransform):
         return data_dict
 
 
-def get_weak_augmentation(keys=["image", "label"]):
-    """In-plane ultrasound flip (lateral axis only) + small rotation (§7 fix)."""
+def get_spatial_augmentation(keys=["image", "label"]):
+    """Pure spatial/geometric transforms (flip, rotation, affine). Shared between teacher and student (V7-1 fix)."""
     return Compose([
-        # In-plane lateral flips only (preserving acoustic beam propagation direction axis 0)
         RandFlipd(keys=keys, prob=0.5, spatial_axis=1),
         RandFlipd(keys=keys, prob=0.5, spatial_axis=2),
         RandRotated(keys=keys, range_x=np.pi / 36, range_y=np.pi / 36, range_z=np.pi / 36, prob=0.5),
+        RandAffined(
+            keys=keys, prob=0.5,
+            rotate_range=(np.pi / 36, np.pi / 36, np.pi / 36),
+            translate_range=(3, 3, 3), scale_range=(0.03, 0.03, 0.03),
+        ),
     ])
 
 
-def get_strong_augmentation(keys=["image", "label"]):
-    """Strong ultrasound augmentations: Affine + Multiplicative Speckle + Contrast (§7 fix)."""
+def get_intensity_augmentation(keys=["image"]):
+    """Pure photometric/intensity transforms (speckle, blur, contrast). Applied to student view only (V7-1 fix)."""
     image_keys = [k for k in keys if k == "image"]
     return Compose([
-        RandAffined(
-            keys=keys, prob=0.5,
-            rotate_range=(np.pi / 18, np.pi / 18, np.pi / 18),
-            translate_range=(5, 5, 5), scale_range=(0.05, 0.05, 0.05),
-        ),
         RandMultiplicativeSpeckleNoised(keys=image_keys, prob=0.5, std=0.08),
         RandGaussianSmoothd(keys=image_keys, prob=0.3, sigma_x=(0.5, 1.2), sigma_y=(0.5, 1.2), sigma_z=(0.5, 1.2)),
         RandScaleIntensityd(keys=image_keys, factors=0.1, prob=0.5),
         RandAdjustContrastd(keys=image_keys, prob=0.5, gamma=(0.7, 1.5)),
+    ])
+
+
+def get_weak_augmentation(keys=["image", "label"]):
+    """In-plane ultrasound flip (lateral axis only) + small rotation (§7 fix)."""
+    return get_spatial_augmentation(keys=keys)
+
+
+def get_strong_augmentation(keys=["image", "label"]):
+    """Strong ultrasound augmentations: Spatial + Photometric Speckle & Contrast (§7 fix)."""
+    return Compose([
+        get_spatial_augmentation(keys=keys),
+        get_intensity_augmentation(keys=keys),
     ])
 
 

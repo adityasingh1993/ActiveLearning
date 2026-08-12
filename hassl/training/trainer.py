@@ -120,7 +120,10 @@ class HASSLTrainer:
         self.dice_metric = DiceMetric(include_background=False if self.num_classes > 1 else True, reduction="mean")
         self.start_epoch = 0
 
-        # Pre-instantiate weak and strong augmentations for asymmetric Mean Teacher view (N-5 fix)
+        # Pre-instantiate spatial and intensity augmentations for spatially aligned Mean Teacher view (V7-1 fix)
+        from ..data.augmentations import get_spatial_augmentation, get_intensity_augmentation
+        self.spatial_aug = get_spatial_augmentation(keys=["image"])
+        self.intensity_aug = get_intensity_augmentation(keys=["image"])
         self.weak_aug = get_weak_augmentation(keys=["image"])
         self.strong_aug = get_strong_augmentation(keys=["image"])
 
@@ -177,16 +180,20 @@ class HASSLTrainer:
                 loss_sup_tensor = torch.stack(loss_sup_list)
                 loss_sup = (loss_sup_tensor * sample_weights).sum() / (sample_weights.sum() + 1e-8)
 
-                # 2. Unsupervised Loss via MC Dropout Teacher with input perturbation asymmetry (N-5 fix)
+                # 2. Unsupervised Loss via MC Dropout Teacher with input perturbation asymmetry (N-5 & V7-1 fix)
                 loss_unsup = torch.tensor(0.0, device=self.device)
                 uncert_val = 0.0
 
                 if inputs_u is not None:
-                    # N-5 fix: Execute weak augmentation for teacher and strong augmentation for student
+                    # V7-1 fix: Share exact spatial transform between teacher and student, apply intensity transform to student only
                     try:
-                        inputs_u_teacher = torch.stack([self.weak_aug({"image": inputs_u[b]})["image"] for b in range(inputs_u.size(0))])
-                        inputs_u_student = torch.stack([self.strong_aug({"image": inputs_u[b]})["image"] for b in range(inputs_u.size(0))])
-                    except Exception:
+                        spatial_img = [self.spatial_aug({"image": inputs_u[b]})["image"] for b in range(inputs_u.size(0))]
+                        spatial_tensor = torch.stack(spatial_img)
+                        inputs_u_teacher = spatial_tensor
+                        inputs_u_student = torch.stack([self.intensity_aug({"image": spatial_tensor[b]})["image"] for b in range(spatial_tensor.size(0))])
+                    except Exception as e:
+                        # V7-2 fix: Log explicit warning when augmentation fails instead of silent fallback
+                        print(f"[HASSL Warning] Augmentation failed in train_one_epoch_uamt: {e}. Falling back to unaugmented inputs.")
                         inputs_u_teacher = inputs_u
                         inputs_u_student = inputs_u
 

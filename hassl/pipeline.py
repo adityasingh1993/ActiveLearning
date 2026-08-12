@@ -29,7 +29,7 @@ from hassl.config import HASSLConfig
 
 
 def set_seed(seed: int) -> None:
-    """Set random seeds for reproducibility across all libraries."""
+    """Set random seeds for reproducibility across all libraries (V6-7 fix)."""
     import random
     random.seed(seed)
     np.random.seed(seed)
@@ -38,6 +38,11 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+    try:
+        import monai
+        monai.utils.set_determinism(seed=seed)
+    except Exception:
+        pass
 
 
 def run_pretrain(config: HASSLConfig) -> None:

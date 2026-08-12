@@ -141,3 +141,34 @@ def test_written_mask_preserves_geometry(tmp_path):
     assert got_img.GetSize() == ref_img.GetSize(), "Output mask size must match reference image size"
     assert got_img.GetSpacing() == pytest.approx(ref_img.GetSpacing()), "Output mask spacing must match reference image spacing"
     assert got_img.GetOrigin() == pytest.approx(ref_img.GetOrigin()), "Output mask origin must match reference image origin"
+
+
+def test_teacher_student_views_are_spatially_aligned():
+    """Verify teacher and student augmentation views share exact spatial coordinate frames (V7-1 fix)."""
+    try:
+        import torch
+        from hassl.data.augmentations import get_spatial_augmentation, get_intensity_augmentation
+    except ImportError:
+        pytest.skip("PyTorch or MONAI not installed")
+
+    spatial_aug = get_spatial_augmentation(keys=["image"])
+    intensity_aug = get_intensity_augmentation(keys=["image"])
+
+    # Create an asymmetric 3D phantom (off-center sphere/cube to ensure zero flip symmetry)
+    vol = torch.zeros((1, 32, 32, 32), dtype=torch.float32)
+    vol[:, 4:12, 16:28, 2:8] = 1.0  # Asymmetric off-center foreground patch
+
+    # Apply shared spatial transform
+    spatial_dict = spatial_aug({"image": vol})
+    teacher_view = spatial_dict["image"]
+    student_view = intensity_aug({"image": teacher_view})["image"]
+
+    # Binarize masks
+    t_mask = (teacher_view > 0.1).float()
+    s_mask = (student_view > 0.1).float()
+
+    intersection = (t_mask * s_mask).sum()
+    total = t_mask.sum() + s_mask.sum()
+    dice = float((2.0 * intersection / (total + 1e-8)).item())
+
+    assert dice >= 0.90, f"Teacher and student views are spatially misaligned! Spatial Dice overlap: {dice:.4f} < 0.90"

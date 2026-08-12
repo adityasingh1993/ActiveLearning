@@ -23,6 +23,7 @@ import os
 import json
 import glob
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -230,12 +231,59 @@ async def get_slice(
                 _state["cached_presegs"][cache_key] = None
         mask = _state["cached_presegs"].get(cache_key)
 
-    # A-3 fix: Verify shape agreement between image and mask
-    if mask is not None and mask.shape != image.shape:
-        print(f"[WebUI Warning] Mask shape {mask.shape} disagrees with image shape {image.shape} for {vol_id}. Transposing/reorienting mask.")
-        if mask.shape == image.shape[::-1]:
+def _verify_and_align_shape(image: np.ndarray, mask: Optional[np.ndarray], vol_id: Optional[str] = None) -> Optional[np.ndarray]:
+    """Ensure mask shape matches image shape, re-orienting if transposed (A-3, V7-4 fix)."""
+    if mask is None:
+        return None
+    if mask.shape != image.shape:
+        print(f"[WebUI Warning] Mask shape {mask.shape} disagrees with image shape {image.shape} for {vol_id or 'volume'}. Transposing mask.")
+        if mask.ndim == 3 and mask.shape == image.shape[::-1]:
             mask = np.transpose(mask, (2, 1, 0))
-            _state["cached_presegs"][vol_id] = mask
+            if vol_id and vol_id in _state["cached_presegs"]:
+                _state["cached_presegs"][vol_id] = mask
+        elif mask.ndim == 4:
+            # Handle 4D multi-segment mask (V7-5 fix)
+            mask = mask[0]
+            if mask.shape == image.shape[::-1]:
+                mask = np.transpose(mask, (2, 1, 0))
+            if vol_id and vol_id in _state["cached_presegs"]:
+                _state["cached_presegs"][vol_id] = mask
+    return mask
+
+
+@app.get("/api/volume/{vol_id}/slice")
+async def get_slice(
+    vol_id: str,
+    axis: str = Query("axial", regex="^(axial|sagittal|coronal)$"),
+    index: int = Query(0),
+    overlay: bool = Query(True),
+    alpha: float = Query(0.4),
+):
+    """Get a 2D slice as PNG image, optionally with mask overlay."""
+    if vol_id not in _state["volumes"]:
+        raise HTTPException(status_code=404, detail=f"Volume {vol_id} not found")
+
+    vol = _state["volumes"][vol_id]
+
+    # Load and cache image
+    if vol_id not in _state["cached_images"]:
+        _state["cached_images"][vol_id] = _load_volume(vol["image_path"])
+    image = _state["cached_images"][vol_id]
+
+    # Load mask (label or preseg)
+    mask = None
+    mask_path = vol.get("label_path") or vol.get("preseg_path")
+    if mask_path and overlay:
+        cache_key = vol_id
+        if cache_key not in _state["cached_presegs"]:
+            try:
+                _state["cached_presegs"][cache_key] = _load_mask(mask_path)
+            except Exception:
+                _state["cached_presegs"][cache_key] = None
+        mask = _state["cached_presegs"].get(cache_key)
+
+    # A-3 & V7-4 fix: Verify shape agreement between image and mask
+    mask = _verify_and_align_shape(image, mask, vol_id=vol_id)
 
     # Extract slice
     axis_map = {"axial": 0, "coronal": 1, "sagittal": 2}
@@ -291,11 +339,8 @@ async def get_mask_slice(
     if mask is None:
         mask = np.zeros(image.shape, dtype=np.uint8)
 
-    # A-3 fix: Enforce shape alignment
-    if mask.shape != image.shape:
-        if mask.shape == image.shape[::-1]:
-            mask = np.transpose(mask, (2, 1, 0))
-            _state["cached_presegs"][vol_id] = mask
+    # A-3 & V7-4 fix: Enforce shape alignment
+    mask = _verify_and_align_shape(image, mask, vol_id=vol_id)
 
     axis_map = {"axial": 0, "coronal": 1, "sagittal": 2}
     ax = axis_map[axis]
@@ -313,7 +358,7 @@ async def get_mask_slice(
 
 @app.post("/api/volume/{vol_id}/slice_edit")
 async def edit_mask_slice(vol_id: str, payload: dict):
-    """Save interactive 2D slice edits into the 3D volume mask, update manifest, and persist to disk (V6-2, V6-3 fix)."""
+    """Save interactive 2D slice edits into the 3D volume mask, update manifest, and persist to disk (V6-2, V6-3, V7-4 fix)."""
     if vol_id not in _state["volumes"]:
         raise HTTPException(status_code=404, detail=f"Volume {vol_id} not found")
 
@@ -337,6 +382,10 @@ async def edit_mask_slice(vol_id: str, payload: dict):
             _state["cached_presegs"][vol_id] = np.zeros(image.shape, dtype=np.uint8)
 
     mask_3d = _state["cached_presegs"][vol_id]
+    # V7-4 fix: Enforce shape alignment before mutating mask_3d
+    mask_3d = _verify_and_align_shape(image, mask_3d, vol_id=vol_id)
+    if mask_3d is None:
+        mask_3d = np.zeros(image.shape, dtype=np.uint8)
     edited_2d = np.array(slice_mask, dtype=np.uint8)
 
     axis_map = {"axial": 0, "coronal": 1, "sagittal": 2}

@@ -148,7 +148,7 @@ def build_labeled_dataset(data_dir: str, image_suffix: str, label_suffix: str,
     if use_cache_dataset and len(data_dicts) > 0:
         try:
             return CacheDataset(data=data_dicts, transform=transform, cache_rate=1.0, copy_cache=False), labeled_ids
-        except (MemoryError, RuntimeError, Exception) as e:
+        except Exception as e:
             print(f"[DataEngine Warning] CacheDataset failed ({type(e).__name__}: {e}). Falling back to PersistentDataset/Dataset.")
 
     if cache_dir is not None:
@@ -182,7 +182,7 @@ def build_unlabeled_dataset(data_dir: str, image_suffix: str, labeled_ids: set,
     if use_cache_dataset and len(data_dicts) > 0:
         try:
             return CacheDataset(data=data_dicts, transform=transform, cache_rate=1.0, copy_cache=False)
-        except (MemoryError, RuntimeError, Exception) as e:
+        except Exception as e:
             print(f"[DataEngine Warning] CacheDataset failed ({type(e).__name__}: {e}). Falling back to PersistentDataset/Dataset.")
 
     if cache_dir is not None:
@@ -318,7 +318,7 @@ def build_all_volumes_loader(config):
     if use_cache_dataset and len(data_dicts) > 0:
         try:
             dataset = CacheDataset(data=data_dicts, transform=unlabeled_transforms, cache_rate=1.0, copy_cache=False, num_workers=config.num_workers)
-        except (MemoryError, RuntimeError, Exception) as e:
+        except Exception as e:
             print(f"[DataEngine Warning] SSL CacheDataset failed ({type(e).__name__}: {e}). Falling back to PersistentDataset/Dataset.")
             if cache_dir is not None:
                 ssl_cache = os.path.join(cache_dir, "ssl")
