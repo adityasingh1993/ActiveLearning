@@ -85,6 +85,7 @@ class HASSLConfig:
     project_name: str = "hassl-ultrasound"
     experiment_name: str = "bladder-prototype"
     run_name: Optional[str] = None  # Auto-generated if None
+    mlflow_tracking_uri: Optional[str] = None  # e.g., "http://localhost:5000" or "file:./mlruns"
 
     # ─── Directories (auto-resolved) ────────────────────────────────────
     checkpoint_dir: str = "./experiments/checkpoints"

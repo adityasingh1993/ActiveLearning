@@ -61,6 +61,7 @@ al_hybrid_weights: [0.4, 0.3, 0.3]   # BALD, CoreSet, Disagreement
 tracker: "wandb"                  # "wandb", "mlflow", or "none"
 project_name: "hassl-ultrasound"
 experiment_name: "bladder-prototype"
+mlflow_tracking_uri: "http://localhost:5000"  # Or "file:./mlruns" for local directory
 
 # ─── Directories ──────────────────────────────────────────────────────
 checkpoint_dir: "./experiments/checkpoints"

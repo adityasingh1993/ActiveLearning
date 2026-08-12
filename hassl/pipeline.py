@@ -66,6 +66,7 @@ def run_pretrain(config: HASSLConfig) -> None:
         backend=config.tracker,
         project=config.project_name,
         run_name=f"{config.experiment_name}_ssl_pretrain",
+        tracking_uri=config.mlflow_tracking_uri,
     )
     tracker.log_config(config.to_dict())
 
@@ -136,6 +137,7 @@ def run_train(config: HASSLConfig, round_num: int = 0) -> None:
         backend=config.tracker,
         project=config.project_name,
         run_name=f"{config.experiment_name}_train_round{round_num}",
+        tracking_uri=config.mlflow_tracking_uri,
     )
     tracker.log_config(config.to_dict())
     tracker.log_metrics({"al_round": round_num}, step=0)
@@ -196,6 +198,7 @@ def run_query(config: HASSLConfig, round_num: int = 1) -> None:
         backend=config.tracker,
         project=config.project_name,
         run_name=f"{config.experiment_name}_query_round{round_num}",
+        tracking_uri=config.mlflow_tracking_uri,
     )
 
     # Load trained models

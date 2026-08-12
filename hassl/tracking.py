@@ -44,10 +44,12 @@ class ExperimentTracker:
         project: str = "hassl",
         run_name: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
+        tracking_uri: Optional[str] = None,
     ):
         self.backend = backend
         self.project = project
         self.run_name = run_name
+        self.tracking_uri = tracking_uri
         self._run = None
 
         if self.backend == "wandb":
@@ -69,6 +71,8 @@ class ExperimentTracker:
         elif self.backend == "mlflow":
             try:
                 import mlflow
+                if tracking_uri:
+                    mlflow.set_tracking_uri(tracking_uri)
                 mlflow.set_experiment(project)
                 self._run = mlflow.start_run(run_name=run_name)
                 if config:
