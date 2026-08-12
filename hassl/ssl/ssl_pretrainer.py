@@ -29,6 +29,7 @@ class SSLPretrainer:
                 out_channels=1,
                 kernel_size=[[3,3,3]]*5,
                 strides=[[1,1,1],[2,2,2],[2,2,2],[2,2,2],[2,2,2]],
+                upsample_kernel_size=[[2,2,2]]*4,
                 filters=[16, 32, 64, 128, 256],
                 norm_name='instance',
                 deep_supervision=True
