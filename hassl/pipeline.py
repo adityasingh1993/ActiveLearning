@@ -175,18 +175,18 @@ def run_train(config: HASSLConfig, round_num: int = 0) -> None:
 
 
 def run_query(config: HASSLConfig, round_num: int = 1) -> None:
-    """Phase 4: Active learning query.
+    """Phase 4: Active learning query (H-3 fix).
 
-    Selects the most informative unlabeled volumes for annotation.
-
-    Args:
-        config: HASSL configuration.
-        round_num: Active learning round number.
+    Selects the most informative unlabeled volumes using Hybrid Strategy
+    (BALD + CoreSet + Disagreement) and exports AI pre-segmentations.
     """
     from hassl.tracking import ExperimentTracker
     from hassl.active.query_engine import QueryEngine
-    from hassl.active.query_strategies import HybridStrategy
+    from hassl.active.query_strategies import (
+        BALDStrategy, CoreSetStrategy, DisagreementStrategy, HybridStrategy
+    )
     from hassl.training.trainer import HASSLTrainer
+    from hassl.data.data_engine import build_dataloaders
 
     print("=" * 60)
     print(f"HASSL Phase 4: Active Learning Query (Round {round_num})")
@@ -201,36 +201,72 @@ def run_query(config: HASSLConfig, round_num: int = 1) -> None:
         tracking_uri=config.mlflow_tracking_uri,
     )
 
-    # Load trained models
-    engine = QueryEngine(config=config, tracker=tracker)
+    # Load dataloaders
+    labeled_loader, unlabeled_loader, val_loader = build_dataloaders(config)
 
-    # Load embeddings
+    if unlabeled_loader is None or len(unlabeled_loader.dataset) == 0:
+        print("  No unlabeled volumes remaining to query.")
+        tracker.finish()
+        return
+
+    # Load trained models
+    trainer = HASSLTrainer(config=config, labeled_loader=labeled_loader,
+                           unlabeled_loader=unlabeled_loader, val_loader=val_loader,
+                           tracker=tracker)
+
+    best_ckpt = Path(config.checkpoint_dir) / "best_checkpoint.pth"
+    if best_ckpt.exists():
+        trainer.load_checkpoint(str(best_ckpt))
+
+    model_A, model_B = trainer.get_models()
+
+    # Load SSL embeddings for CoreSet
     embedding_path = Path(config.embedding_dir) / "ssl_embeddings.npz"
-    embeddings = None
+    embeddings_dict = {}
     if embedding_path.exists():
         data = np.load(str(embedding_path), allow_pickle=True)
-        embeddings = {k: v for k, v in data.items()}
+        embeddings_dict = {k: v for k, v in data.items()}
 
-    # Run query
+    # Build strategies (H-3 fix)
+    bald_strat = BALDStrategy(model=model_A, num_passes=config.mc_dropout_passes)
+    coreset_strat = CoreSetStrategy(embeddings_dict=embeddings_dict)
+    disagreement_strat = DisagreementStrategy(model_a=model_A, model_b=model_B)
+
+    w_bald, w_core, w_dis = config.al_hybrid_weights
+    strategy = HybridStrategy(
+        bald_strategy=bald_strat,
+        coreset_strategy=coreset_strat,
+        disagreement_strategy=disagreement_strat,
+        alpha=w_bald, beta=w_core, gamma=w_dis,
+    )
+
+    engine = QueryEngine(config=config, tracker=tracker)
+    engine.initialize_pool()
+
+    # Run query with strategy & unlabeled_loader (H-3 fix)
     queried_ids, scores = engine.run_query(
+        strategy=strategy,
+        unlabeled_loader=unlabeled_loader,
         round_num=round_num,
-        embeddings=embeddings,
+        k=config.al_query_size,
     )
 
     # Display results
     print(f"\n{'─' * 40}")
-    print(f"Top {len(queried_ids)} volumes to annotate:")
+    print(f"Top {len(queried_ids)} volumes queried by {config.al_strategy} strategy:")
     print(f"{'─' * 40}")
     for i, (vol_id, score) in enumerate(zip(queried_ids, scores)):
         print(f"  {i+1}. {vol_id}  (score: {score:.4f})")
     print(f"{'─' * 40}")
 
-    # Export pre-segmentation masks
-    print("\nExporting AI pre-segmentation masks for 3D Slicer...")
-    engine.export_presegmentation(volume_ids=queried_ids)
+    # Export AI pre-segmentation masks with trained model
+    print("\nExporting AI pre-segmentation masks for review...")
+    engine.export_presegmentation(
+        model=model_A,
+        dataloader=unlabeled_loader,
+        volume_ids=queried_ids,
+    )
     print(f"  Saved to: {config.preseg_dir}/")
-    print(f"\n  Open in 3D Slicer: Load .mha volume + .seg.nrrd pre-segmentation")
-    print(f"  Correct the AI prediction and save back to {config.data_dir}/labels/")
 
     tracker.finish()
 
@@ -252,13 +288,13 @@ def run_al_round(config: HASSLConfig, round_num: int) -> None:
     print(f"HASSL Active Learning Round {round_num}")
     print("=" * 60)
 
-    # Step 1: Detect new labels
+    # Step 1: Detect new human labels
     engine = QueryEngine(config=config)
     new_labels = engine.detect_new_labels()
     if new_labels:
-        print(f"  Detected {len(new_labels)} new labeled volumes: {new_labels}")
+        print(f"  Detected {len(new_labels)} new human-labeled volumes: {new_labels}")
     else:
-        print("  No new labels detected. Proceeding with existing labels.")
+        print("  No new human labels detected. Proceeding with existing labels.")
 
     # Step 2: Retrain
     print(f"\n  Retraining with expanded label pool...")
@@ -273,22 +309,37 @@ def run_al_round(config: HASSLConfig, round_num: int) -> None:
 
 
 def run_export_preseg(config: HASSLConfig) -> None:
-    """Export AI pre-segmentation for all unlabeled volumes.
-
-    Runs the trained model on all unlabeled volumes and saves
-    predictions as .seg.nrrd files for review in 3D Slicer.
-    """
+    """Export AI pre-segmentation for all unlabeled volumes."""
     from hassl.active.query_engine import QueryEngine
+    from hassl.training.trainer import HASSLTrainer
+    from hassl.data.data_engine import build_dataloaders
+    from hassl.tracking import ExperimentTracker
 
     print("=" * 60)
     print("HASSL: Exporting AI Pre-segmentation Masks")
     print("=" * 60)
 
-    engine = QueryEngine(config=config)
-    unlabeled_ids = engine.get_unlabeled_ids()
-    print(f"  Exporting predictions for {len(unlabeled_ids)} unlabeled volumes...")
+    labeled_loader, unlabeled_loader, val_loader = build_dataloaders(config)
 
-    engine.export_presegmentation(volume_ids=unlabeled_ids)
+    if unlabeled_loader is None or len(unlabeled_loader.dataset) == 0:
+        print("  No unlabeled volumes available.")
+        return
+
+    tracker = ExperimentTracker(backend="none")
+    trainer = HASSLTrainer(config=config, labeled_loader=labeled_loader,
+                           unlabeled_loader=unlabeled_loader, val_loader=val_loader,
+                           tracker=tracker)
+
+    best_ckpt = Path(config.checkpoint_dir) / "best_checkpoint.pth"
+    if best_ckpt.exists():
+        trainer.load_checkpoint(str(best_ckpt))
+
+    model_A, _ = trainer.get_models()
+
+    engine = QueryEngine(config=config)
+    print(f"  Exporting predictions for {len(unlabeled_loader.dataset)} unlabeled volumes...")
+
+    engine.export_presegmentation(model=model_A, dataloader=unlabeled_loader)
     print(f"  Saved to: {config.preseg_dir}/")
 
 

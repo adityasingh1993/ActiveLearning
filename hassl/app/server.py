@@ -261,7 +261,7 @@ async def get_slice(
 
 @app.post("/api/volume/{vol_id}/accept")
 async def accept_volume(vol_id: str):
-    """Accept the pre-segmentation as a label (moves preseg -> labels directory)."""
+    """Accept the pre-segmentation as a label (moves preseg -> labels directory & updates provenance C-1 fix)."""
     if vol_id not in _state["volumes"]:
         raise HTTPException(status_code=404, detail=f"Volume {vol_id} not found")
 
@@ -282,6 +282,24 @@ async def accept_volume(vol_id: str):
     # Update state
     vol["label_path"] = dest
     vol["status"] = "labeled"
+
+    # Update manifest provenance (C-1 fix)
+    manifest_path = os.path.join(config.log_dir, "pool_manifest.json")
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+            if "provenance" not in manifest:
+                manifest["provenance"] = {}
+            manifest["provenance"][vol_id] = "pseudo_approved"
+            if vol_id not in manifest.get("labeled_ids", []):
+                manifest["labeled_ids"].append(vol_id)
+            if vol_id in manifest.get("unlabeled_ids", []):
+                manifest["unlabeled_ids"].remove(vol_id)
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f, indent=4)
+        except Exception as e:
+            print(f"[WebUI Server] Warning: could not update manifest provenance: {e}")
 
     # Clear cache
     _state["cached_presegs"].pop(vol_id, None)
