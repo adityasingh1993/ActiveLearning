@@ -1,9 +1,9 @@
 import pytest
 import torch
-from hassl.losses import CombinedSegLoss, FlexMatchThreshold, UncertaintyMaskedLoss, BoundaryLoss
+from hassl.training.losses import CombinedSegLoss, FlexMatchThreshold, UncertaintyMaskedLoss, BoundaryLoss
 
 def test_combined_seg_loss():
-    loss_fn = CombinedSegLoss(include_dice=True, include_ce=True)
+    loss_fn = CombinedSegLoss(num_classes=1)
     pred = torch.rand(2, 1, 32, 32, 32)
     target = torch.randint(0, 2, (2, 1, 32, 32, 32)).float()
     loss = loss_fn(pred, target)
@@ -11,27 +11,25 @@ def test_combined_seg_loss():
     assert loss.item() >= 0
 
 def test_flexmatch_threshold():
-    thresh_fn = FlexMatchThreshold(num_classes=2)
-    probs = torch.rand(10, 2)
-    labels = torch.randint(0, 2, (10,))
-    thresh_fn.update(probs, labels)
-    thresholds = thresh_fn.get_thresholds()
+    thresh_fn = FlexMatchThreshold(num_classes=2, threshold_base=0.8)
+    probs = torch.rand(10, 2, 16, 16, 16)
+    thresholds = thresh_fn.get_threshold(probs)
     assert thresholds.shape == (2,)
 
 def test_uncertainty_masked_loss():
-    base_loss = CombinedSegLoss()
+    base_loss = CombinedSegLoss(num_classes=1)
     masked_loss = UncertaintyMaskedLoss(base_loss)
     
     pred = torch.rand(2, 1, 32, 32, 32)
     target = torch.randint(0, 2, (2, 1, 32, 32, 32)).float()
-    uncertainty = torch.rand(2, 1, 32, 32, 32)
+    mask = (torch.rand(2, 1, 32, 32, 32) > 0.5).float()
     
-    # Check that mask reduces loss (high uncertainty = lower loss weight)
-    loss1 = masked_loss(pred, target, uncertainty)
+    loss1 = masked_loss(pred, target, mask)
     assert loss1.dim() == 0
+    assert loss1.item() >= 0
 
 def test_boundary_loss():
-    loss_fn = BoundaryLoss()
+    loss_fn = BoundaryLoss(num_classes=1)
     pred = torch.rand(2, 1, 32, 32, 32)
     target = torch.randint(0, 2, (2, 1, 32, 32, 32)).float()
     loss = loss_fn(pred, target)

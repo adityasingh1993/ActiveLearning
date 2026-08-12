@@ -291,12 +291,15 @@ class HASSLTrainer:
         self.net_A.eval()
         self.dice_metric.reset()
 
+        from monai.inferers import SlidingWindowInferer
+        inferer = SlidingWindowInferer(roi_size=self.config.spatial_size, sw_batch_size=2, overlap=0.25)
+
         for batch_data in self.val_loader:
             inputs = batch_data['image'].to(self.device)
             targets = batch_data['label'].to(self.device)
 
             with torch.amp.autocast(self.device_type, enabled=(self.device_type == 'cuda')):
-                preds = self.net_A(inputs)
+                preds = inferer(inputs, self.net_A)
                 if isinstance(preds, (list, tuple)):
                     preds = preds[0]
                 elif preds.ndim == 6:
