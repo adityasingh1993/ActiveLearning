@@ -48,8 +48,8 @@ class FeatureExtractor:
             return out[0] if isinstance(out, (list, tuple)) else out
 
     @torch.no_grad()
-    def extract_all((self) -> Dict[str, np.ndarray]:
-        """Extract 128-dim normalized feature embeddings for all volumes."""
+    def extract_all(self) -> Dict[str, np.ndarray]:
+        """Extract 128-dim normalized feature embeddings for all volumes (R-2 fix)."""
         self.embeddings_cache = {}
 
         for batch in self.dataloader:

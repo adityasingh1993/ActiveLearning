@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import copy
+from typing import Tuple, Optional
 
 
 def enable_dropout(model: nn.Module) -> None:
@@ -45,6 +46,9 @@ class EMATeacher(nn.Module):
                 out = self.shadow(x)
                 if isinstance(out, (list, tuple)):
                     out = out[0]
+                elif out.ndim == 6:
+                    out = out[:, 0]
+
                 probs = torch.sigmoid(out) if out.shape[1] == 1 else torch.softmax(out, dim=1)
                 mc_preds.append(probs)
 

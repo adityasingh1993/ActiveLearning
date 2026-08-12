@@ -5,7 +5,8 @@ import time
 from pathlib import Path
 import torch
 import numpy as np
-import nrrd
+
+from hassl.data.nrrd_utils import write_mask_with_spatial_geometry
 
 
 class QueryEngine:
@@ -99,7 +100,7 @@ class QueryEngine:
                 if vid in self.state.get('pseudo_ids', []):
                     self.state['pseudo_ids'].remove(vid)
                 self.state['labeled_ids'].append(vid)
-                self.state['provenance'][vid] = "human"  # Gold standard provenance
+                self.state['provenance'][vid] = "human"
 
         if new_labeled:
             self._save_manifest()
@@ -108,15 +109,14 @@ class QueryEngine:
 
         return new_labeled
 
-    def auto_promote_pseudo_labels(self, model, dataloader, k=10, confidence_threshold=0.90):
-        """Rank, filter, and promote top K high-confidence pseudo-labels to data/pseudo/ (C-1 & C-2 fix)."""
+    def auto_promote_pseudo_labels(self, model, dataloader, k=10, confidence_threshold=0.85):
+        """Rank, filter, and promote top K high-confidence pseudo-labels to data/pseudo/ (C-1, C-2 & N-1 fix)."""
         if model is None or dataloader is None:
             raise ValueError("model and dataloader are required for pseudo-label promotion.")
 
         model.eval()
         candidates = []
 
-        # C-1 fix: Write pseudo-labels to data/pseudo/ NEVER directly to gold data/labels/
         output_pseudo_dir = os.path.join(self.config.data_dir, 'pseudo') if self.config else './data/pseudo'
         os.makedirs(output_pseudo_dir, exist_ok=True)
 
@@ -124,6 +124,7 @@ class QueryEngine:
             for batch in dataloader:
                 x = batch['image'].to(self.device)
                 vids = batch.get('id', batch.get('volume_id', []))
+                image_paths = batch.get('image_meta_dict', {}).get('filename_or_obj', [None] * len(vids))
 
                 out = model(x)
                 if isinstance(out, (tuple, list)):
@@ -134,20 +135,27 @@ class QueryEngine:
                 probs = torch.sigmoid(out) if getattr(self.config, 'num_classes', 1) == 1 else torch.softmax(out, dim=1)
                 preds = (probs > 0.5).cpu().numpy().astype(np.uint8)
 
-                # Compute confidence per volume (distance of max probability from 0.5 margin)
-                confidence_scores = (torch.abs(probs - 0.5) * 2.0).mean(dim=(1, 2, 3, 4)).cpu().numpy()
-
                 for i, vid in enumerate(vids):
                     if vid in self.state['unlabeled_ids']:
-                        conf = float(confidence_scores[i])
+                        p_vol = probs[i, 0]
+                        fg_mask = p_vol > 0.5
+                        fg_count = fg_mask.sum().item()
+
+                        # N-1 fix: Score confidence ONLY on foreground prediction + require >10 non-zero voxels
+                        if fg_count > 10:
+                            conf = float((p_vol[fg_mask] - 0.5).mean().item() * 2.0)
+                        else:
+                            conf = 0.0  # Empty background prediction has zero confidence
+
                         if conf >= confidence_threshold:
                             candidates.append({
                                 'id': vid,
                                 'confidence': conf,
                                 'pred_vol': preds[i, 0],
+                                'ref_path': image_paths[i] if i < len(image_paths) else None,
                             })
 
-        # C-2 fix: Sort candidates by confidence score descending
+        # Sort candidates by confidence score descending (C-2 fix)
         candidates.sort(key=lambda c: c['confidence'], reverse=True)
         top_k_candidates = candidates[:k]
 
@@ -155,14 +163,17 @@ class QueryEngine:
         for cand in top_k_candidates:
             vid = cand['id']
             pred_vol = cand['pred_vol']
+            ref_path = cand['ref_path']
             output_path = os.path.join(output_pseudo_dir, f'{vid}{self.config.label_suffix if self.config else ".seg.nrrd"}')
-            nrrd.write(output_path, pred_vol)
+
+            # W-1 fix: Preserve spatial geometry (origin, spacing, direction matrix)
+            write_mask_with_spatial_geometry(output_path, pred_vol, reference_image_path=ref_path)
 
             self.state['unlabeled_ids'].remove(vid)
             if 'pseudo_ids' not in self.state:
                 self.state['pseudo_ids'] = []
             self.state['pseudo_ids'].append(vid)
-            self.state['provenance'][vid] = "pseudo_unreviewed"  # Machine provenance
+            self.state['provenance'][vid] = "pseudo_unreviewed"
             promoted_ids.append(vid)
 
         self._save_manifest()
@@ -204,7 +215,7 @@ class QueryEngine:
         return top_k_ids, [scores.get(vid, 0.0) for vid in top_k_ids]
 
     def export_presegmentation(self, model, dataloader, volume_ids=None, output_dir=None):
-        """Export AI pre-segmentation masks for human review (C-3 fix)."""
+        """Export AI pre-segmentation masks for human review with spatial geometry (C-3 & W-1 fix)."""
         if model is None or dataloader is None:
             raise RuntimeError("Cannot export pre-segmentation: trained model and dataloader are required (C-3 fix).")
 
@@ -220,6 +231,7 @@ class QueryEngine:
             for batch in dataloader:
                 x = batch['image'].to(self.device)
                 vids = batch.get('id', batch.get('volume_id', []))
+                image_paths = batch.get('image_meta_dict', {}).get('filename_or_obj', [None] * len(vids))
 
                 out = model(x)
                 if isinstance(out, (tuple, list)):
@@ -232,8 +244,11 @@ class QueryEngine:
                 for i, vid in enumerate(vids):
                     if volume_ids is None or vid in volume_ids:
                         pred_vol = preds[i, 0]
+                        ref_path = image_paths[i] if i < len(image_paths) else None
                         output_path = os.path.join(output_dir, f'{vid}.seg.nrrd')
-                        nrrd.write(output_path, pred_vol)
+
+                        # W-1 fix: Write with SimpleITK to preserve spatial origin, spacing, and direction matrix
+                        write_mask_with_spatial_geometry(output_path, pred_vol, reference_image_path=ref_path)
                         exported_count += 1
 
         if self.tracker:

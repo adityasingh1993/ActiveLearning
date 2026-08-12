@@ -18,34 +18,28 @@ from monai.transforms import (
     ScaleIntensityRangePercentilesd
 )
 
+from .augmentations import get_strong_augmentation, get_weak_augmentation
+
 
 def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label_suffix: str = ".seg.nrrd", seed: int = 42) -> Dict[str, List[str]]:
-    """Create or load a frozen split file (splits.json) with patient/volume-level holdouts (C-4 fix).
-
-    Ensures:
-      - test_ids: Frozen test set never queried or trained on.
-      - val_ids: Fixed validation set across all AL rounds (comparable Dice).
-      - initial_train_ids: Remaining initial labeled IDs for Round 0.
-    """
+    """Create or load a frozen split file (splits.json) with patient/volume-level holdouts (C-4 fix)."""
     splits_file = Path(data_dir) / "splits.json"
     if splits_file.exists():
         with open(splits_file, "r") as f:
             return json.load(f)
 
-    # Scan for initial labeled pairs
     data_dir_path = Path(data_dir)
     image_files = sorted(glob.glob(str(data_dir_path / f"**/*{image_suffix}"), recursive=True))
 
     all_labeled_ids = []
     for img_path in image_files:
         base_name = os.path.basename(img_path).replace(image_suffix, "")
-        lbl_path = str(Path(img_path).parent / f"{base_name}{label_suffix}")
+        lbl_path = str(data_dir_path / "labels" / f"{base_name}{label_suffix}")
         if not os.path.exists(lbl_path):
-            lbl_path = str(data_dir_path / "labels" / f"{base_name}{label_suffix}")
+            lbl_path = str(Path(img_path).parent / f"{base_name}{label_suffix}")
         if os.path.exists(lbl_path):
             all_labeled_ids.append(base_name)
 
-    # Seeded deterministic shuffle
     rng = random.Random(seed)
     shuffled_ids = list(all_labeled_ids)
     rng.shuffle(shuffled_ids)
@@ -76,7 +70,7 @@ def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label
 def build_labeled_dataset(data_dir: str, image_suffix: str, label_suffix: str,
                           include_ids: Optional[List[str]] = None,
                           transform=None, cache_dir: Optional[str] = None):
-    """Build dataset for labeled volumes (human + approved pseudo)."""
+    """Build dataset for labeled volumes, supporting both human gold labels and approved pseudo-labels (N-2 fix)."""
     data_dir_path = Path(data_dir)
     image_files = sorted(glob.glob(str(data_dir_path / f"**/*{image_suffix}"), recursive=True))
 
@@ -89,17 +83,26 @@ def build_labeled_dataset(data_dir: str, image_suffix: str, label_suffix: str,
         if include_ids is not None and base_name not in include_ids:
             continue
 
-        # Check in human labels directory first, then same parent
         lbl_path = str(data_dir_path / "labels" / f"{base_name}{label_suffix}")
+        provenance = "human"
+
+        # Check in human labels directory first
         if not os.path.exists(lbl_path):
             lbl_path = str(Path(img_path).parent / f"{base_name}{label_suffix}")
+
+        # N-2 fix: Check in approved pseudo-labels directory if human label absent
+        if not os.path.exists(lbl_path):
+            pseudo_candidate = str(data_dir_path / "pseudo" / f"{base_name}{label_suffix}")
+            if os.path.exists(pseudo_candidate):
+                lbl_path = pseudo_candidate
+                provenance = "pseudo_approved"
 
         if os.path.exists(lbl_path):
             data_dicts.append({
                 "image": img_path,
                 "label": lbl_path,
                 "id": base_name,
-                "provenance": "human",
+                "provenance": provenance,
             })
             labeled_ids.add(base_name)
 
@@ -137,13 +140,13 @@ def build_unlabeled_dataset(data_dir: str, image_suffix: str, labeled_ids: set,
         return Dataset(data=data_dicts, transform=transform)
 
 
-def get_base_transforms(config, keys=["image", "label"]):
-    """Build MONAI preprocessing transform chain."""
+def get_base_transforms(config, keys=["image", "label"], is_training: bool = False):
+    """Build MONAI preprocessing transform chain with ultrasound domain augmentations (W-3 fix)."""
     mode = tuple(["bilinear" if k == "image" else "nearest" for k in keys])
     resize_mode = tuple(["trilinear" if k == "image" else "nearest" for k in keys])
 
     transforms = [
-        LoadImaged(keys=keys, reader="ITKReader", image_only=True),
+        LoadImaged(keys=keys, reader="ITKReader", image_only=False),
         EnsureChannelFirstd(keys=keys),
         Orientationd(keys=keys, axcodes="RAS"),
         Spacingd(keys=keys, pixdim=config.spacing, mode=mode),
@@ -152,11 +155,15 @@ def get_base_transforms(config, keys=["image", "label"]):
     if "image" in keys:
         transforms.append(ScaleIntensityRangePercentilesd(keys=["image"], lower=1, upper=99, b_min=0, b_max=1, clip=True))
 
+    # W-3 fix: Wire strong augmentations during training
+    if is_training:
+        transforms.append(get_strong_augmentation(keys=keys))
+
     return Compose(transforms)
 
 
 def build_dataloaders(config):
-    """Build train, unlabeled, and FIXED validation dataloaders (C-4 fix)."""
+    """Build train, unlabeled, and FIXED validation dataloaders (C-4 & W-3 fix)."""
     splits = get_or_create_frozen_splits(
         config.data_dir,
         image_suffix=config.image_suffix,
@@ -167,8 +174,10 @@ def build_dataloaders(config):
     val_ids_set = set(splits.get("val_ids", []))
     test_ids_set = set(splits.get("test_ids", []))
 
-    labeled_transforms = get_base_transforms(config, keys=["image", "label"])
-    unlabeled_transforms = get_base_transforms(config, keys=["image"])
+    # W-3 fix: Apply training augmentations to labeled training dataloader
+    train_transforms = get_base_transforms(config, keys=["image", "label"], is_training=True)
+    val_transforms = get_base_transforms(config, keys=["image", "label"], is_training=False)
+    unlabeled_transforms = get_base_transforms(config, keys=["image"], is_training=False)
 
     cache_dir = getattr(config, 'cache_dir', None)
 
@@ -178,7 +187,7 @@ def build_dataloaders(config):
         config.image_suffix,
         config.label_suffix,
         include_ids=splits.get("val_ids"),
-        transform=labeled_transforms,
+        transform=val_transforms,
         cache_dir=cache_dir,
     )
 
@@ -186,7 +195,6 @@ def build_dataloaders(config):
     data_dir_path = Path(config.data_dir)
     all_image_files = sorted(glob.glob(str(data_dir_path / f"**/*{config.image_suffix}"), recursive=True))
 
-    # All labeled IDs currently available except val & test
     available_train_labeled = []
     for img_path in all_image_files:
         base_name = os.path.basename(img_path).replace(config.image_suffix, "")
@@ -195,6 +203,8 @@ def build_dataloaders(config):
         lbl_path = str(data_dir_path / "labels" / f"{base_name}{config.label_suffix}")
         if not os.path.exists(lbl_path):
             lbl_path = str(Path(img_path).parent / f"{base_name}{config.label_suffix}")
+        if not os.path.exists(lbl_path):
+            lbl_path = str(data_dir_path / "pseudo" / f"{base_name}{config.label_suffix}")
         if os.path.exists(lbl_path):
             available_train_labeled.append(base_name)
 
@@ -203,7 +213,7 @@ def build_dataloaders(config):
         config.image_suffix,
         config.label_suffix,
         include_ids=available_train_labeled,
-        transform=labeled_transforms,
+        transform=train_transforms,
         cache_dir=cache_dir,
     )
 
@@ -238,7 +248,7 @@ def build_all_volumes_loader(config):
     )
     test_ids_set = set(splits.get("test_ids", []))
 
-    unlabeled_transforms = get_base_transforms(config, keys=["image"])
+    unlabeled_transforms = get_base_transforms(config, keys=["image"], is_training=False)
 
     data_dir_path = Path(config.data_dir)
     image_files = sorted(glob.glob(str(data_dir_path / f"**/*{config.image_suffix}"), recursive=True))

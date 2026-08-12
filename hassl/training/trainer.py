@@ -168,9 +168,9 @@ class HASSLTrainer:
                         inputs_u, num_passes=self.config.mc_dropout_passes
                     )
 
-                    # Absolute/quantile uncertainty mask (H-2 fix)
-                    # Mask out top 25% most uncertain voxels
-                    thresh = torch.quantile(uncertainty.detach(), 0.75)
+                    # Absolute/quantile uncertainty mask (H-2 & N-3 fix)
+                    # Mask out top 25% most uncertain voxels (cast to float for CUDA autocast N-3 fix)
+                    thresh = torch.quantile(uncertainty.detach().float(), 0.75)
                     mask = (uncertainty < thresh).float()
 
                     if self.num_classes == 1:
@@ -241,8 +241,12 @@ class HASSLTrainer:
                     preds_A_u = self.net_A(inputs_u)
                     preds_B_u = self.net_B(inputs_u)
 
+                    # N-4 fix: Handle DynUNet deep supervision list/tuple and 6D stacked tensors
                     if isinstance(preds_A_u, (list, tuple)): preds_A_u = preds_A_u[0]
+                    elif preds_A_u.ndim == 6: preds_A_u = preds_A_u[:, 0]
+
                     if isinstance(preds_B_u, (list, tuple)): preds_B_u = preds_B_u[0]
+                    elif preds_B_u.ndim == 6: preds_B_u = preds_B_u[:, 0]
 
                     if self.num_classes == 1:
                         probs_A = torch.sigmoid(preds_A_u)

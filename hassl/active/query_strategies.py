@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from scipy.spatial.distance import cdist
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union, Any
 
 from hassl.training.ema import enable_dropout
 
@@ -92,7 +92,7 @@ class CoreSetStrategy:
         return result
 
     def query(self, unlabeled_ids: Union[List[str], Any], labeled_ids: List[str], k: int) -> Tuple[List[str], Dict[str, float]]:
-        """Greedy k-Center Iterative CoreSet Selection (M-4 fix)."""
+        """Greedy k-Center Iterative CoreSet Selection (M-4 & R-3 fix)."""
         if hasattr(unlabeled_ids, '__iter__') and not isinstance(unlabeled_ids, (list, tuple)):
             # If DataLoader passed, extract volume IDs
             loader_vids = []
@@ -116,7 +116,6 @@ class CoreSetStrategy:
             labeled_feats = np.array([self.embeddings[lid] for lid in valid_labeled])
             min_dists = np.min(cdist(unlabeled_feats, labeled_feats, metric='euclidean'), axis=1)
         else:
-            # First pick is arbitrary/random if no labeled points
             min_dists = np.ones(len(valid_unlabeled))
 
         selected_ids = []
@@ -176,7 +175,7 @@ class DisagreementStrategy:
 
 
 class HybridStrategy:
-    """Hybrid Query Strategy fusing BALD + CoreSet + Disagreement scores."""
+    """Hybrid Query Strategy fusing BALD + CoreSet + Disagreement scores (W-2 fix)."""
 
     def __init__(self, bald_strategy, coreset_strategy, disagreement_strategy, alpha=0.4, beta=0.3, gamma=0.3):
         self.bald = bald_strategy
@@ -213,7 +212,8 @@ class HybridStrategy:
                 dis_scores[vid] = float(d_scores[i])
                 unlabeled_ids.append(vid)
 
-        coreset_scores = self.coreset.score(unlabeled_ids, labeled_ids)
+        # W-2 fix: Call coreset.query to invoke greedy k-center selection
+        selected_coreset, coreset_scores = self.coreset.query(unlabeled_ids, labeled_ids, k=len(unlabeled_ids))
 
         bald_norm = self._normalize(bald_scores)
         coreset_norm = self._normalize(coreset_scores)
@@ -226,6 +226,5 @@ class HybridStrategy:
                      self.gamma * dis_norm.get(vid, 0.5))
             final_scores[vid] = float(score)
 
-        # C-2 & M-4 fix: CoreSet greedy refinement on top candidates
         sorted_ids = sorted(final_scores.keys(), key=lambda x: final_scores[x], reverse=True)
         return sorted_ids[:k], final_scores
