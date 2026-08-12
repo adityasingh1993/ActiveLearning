@@ -259,6 +259,105 @@ async def get_slice(
     return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
 
 
+@app.get("/api/volume/{vol_id}/mask_slice")
+async def get_mask_slice(
+    vol_id: str,
+    axis: str = Query("axial", regex="^(axial|sagittal|coronal)$"),
+    index: int = Query(0),
+):
+    """Get raw 2D uint8 mask slice for interactive canvas editing."""
+    if vol_id not in _state["volumes"]:
+        raise HTTPException(status_code=404, detail=f"Volume {vol_id} not found")
+
+    vol = _state["volumes"][vol_id]
+    mask_path = vol.get("label_path") or vol.get("preseg_path")
+
+    if vol_id not in _state["cached_images"]:
+        _state["cached_images"][vol_id] = _load_volume(vol["image_path"])
+    image = _state["cached_images"][vol_id]
+
+    if mask_path and vol_id not in _state["cached_presegs"]:
+        try:
+            _state["cached_presegs"][vol_id] = _load_mask(mask_path)
+        except Exception:
+            _state["cached_presegs"][vol_id] = None
+
+    mask = _state["cached_presegs"].get(vol_id)
+    if mask is None:
+        mask = np.zeros(image.shape, dtype=np.uint8)
+
+    axis_map = {"axial": 0, "coronal": 1, "sagittal": 2}
+    ax = axis_map[axis]
+    index = max(0, min(index, image.shape[ax] - 1))
+
+    if ax == 0:
+        mask_slice = mask[index, :, :]
+    elif ax == 1:
+        mask_slice = mask[:, index, :]
+    else:
+        mask_slice = mask[:, :, index]
+
+    return {"axis": axis, "index": index, "shape": list(mask_slice.shape), "mask": mask_slice.tolist()}
+
+
+@app.post("/api/volume/{vol_id}/slice_edit")
+async def edit_mask_slice(vol_id: str, payload: dict):
+    """Save interactive 2D slice edits into the 3D volume mask and persist to disk (A-6 fix)."""
+    if vol_id not in _state["volumes"]:
+        raise HTTPException(status_code=404, detail=f"Volume {vol_id} not found")
+
+    vol = _state["volumes"][vol_id]
+    axis = payload.get("axis", "axial")
+    index = int(payload.get("index", 0))
+    slice_mask = payload.get("mask_data")
+
+    if slice_mask is None:
+        raise HTTPException(status_code=400, detail="Missing mask_data in payload")
+
+    if vol_id not in _state["cached_images"]:
+        _state["cached_images"][vol_id] = _load_volume(vol["image_path"])
+    image = _state["cached_images"][vol_id]
+
+    if vol_id not in _state["cached_presegs"] or _state["cached_presegs"][vol_id] is None:
+        mask_path = vol.get("label_path") or vol.get("preseg_path")
+        if mask_path and os.path.exists(mask_path):
+            _state["cached_presegs"][vol_id] = _load_mask(mask_path)
+        else:
+            _state["cached_presegs"][vol_id] = np.zeros(image.shape, dtype=np.uint8)
+
+    mask_3d = _state["cached_presegs"][vol_id]
+    edited_2d = np.array(slice_mask, dtype=np.uint8)
+
+    axis_map = {"axial": 0, "coronal": 1, "sagittal": 2}
+    ax = axis_map[axis]
+    index = max(0, min(index, image.shape[ax] - 1))
+
+    if ax == 0:
+        mask_3d[index, :, :] = edited_2d
+    elif ax == 1:
+        mask_3d[:, index, :] = edited_2d
+    else:
+        mask_3d[:, :, index] = edited_2d
+
+    # Persist updated 3D volume mask to approved pseudo directory
+    config = _state["config"]
+    approved_dir = os.path.join(config.data_dir, "pseudo_approved")
+    os.makedirs(approved_dir, exist_ok=True)
+    out_mask_path = os.path.join(approved_dir, f"{vol_id}{config.label_suffix}")
+
+    try:
+        from hassl.data.nrrd_utils import write_mask_with_spatial_geometry
+        write_mask_with_spatial_geometry(out_mask_path, mask_3d, reference_image_path=vol["image_path"])
+    except Exception:
+        if nrrd is not None:
+            nrrd.write(out_mask_path, mask_3d)
+
+    vol["label_path"] = out_mask_path
+    vol["status"] = "pseudo_approved"
+
+    return {"message": f"Slice {index} on {axis} axis saved successfully for {vol_id}", "path": out_mask_path}
+
+
 @app.post("/api/volume/{vol_id}/accept")
 async def accept_volume(vol_id: str):
     """Accept the pre-segmentation as a label (moves preseg -> labels directory & updates provenance C-1 fix)."""
@@ -272,20 +371,17 @@ async def accept_volume(vol_id: str):
         raise HTTPException(status_code=400, detail="No pre-segmentation available")
 
     config = _state["config"]
-    label_dir = os.path.join(config.data_dir, "labels")
     approved_dir = os.path.join(config.data_dir, "pseudo_approved")
-    os.makedirs(label_dir, exist_ok=True)
     os.makedirs(approved_dir, exist_ok=True)
 
     import shutil
-    dest = os.path.join(label_dir, f"{vol_id}{config.label_suffix}")
     dest_approved = os.path.join(approved_dir, f"{vol_id}{config.label_suffix}")
-    shutil.copy2(preseg_path, dest)
+    # V-4 (A-1) fix: Write strictly to pseudo_approved, NEVER to data/labels/ (gold directory)
     shutil.copy2(preseg_path, dest_approved)
 
     # Update state
-    vol["label_path"] = dest
-    vol["status"] = "labeled"
+    vol["label_path"] = dest_approved
+    vol["status"] = "pseudo_approved"
 
     # Update manifest provenance (P-1 fix)
     manifest_path = os.path.join(config.log_dir, "pool_manifest.json")

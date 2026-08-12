@@ -52,7 +52,12 @@ def write_mask_with_spatial_geometry(output_path: str, mask_arr: np.ndarray, ref
     if sitk is not None and reference_image_path and os.path.exists(reference_image_path):
         try:
             ref_img = sitk.ReadImage(reference_image_path)
-            mask_img = sitk.GetImageFromArray(mask_arr.astype(np.uint8))
+            # Squeeze extra dimensions (e.g. channel dim C=1) so mask_arr is strictly 3D (Z, Y, X) / (D, H, W)
+            clean_arr = np.squeeze(mask_arr).astype(np.uint8)
+            if clean_arr.ndim != 3:
+                raise ValueError(f"Mask array must be 3D after squeeze, got shape {mask_arr.shape}")
+
+            mask_img = sitk.GetImageFromArray(clean_arr)
 
             if mask_img.GetSize() != ref_img.GetSize():
                 # Compute physical spacing for preprocessed mask

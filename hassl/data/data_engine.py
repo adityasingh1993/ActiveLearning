@@ -2,12 +2,13 @@ import os
 import glob
 import json
 import random
+import re
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
 import torch
 from torch.utils.data import DataLoader
-from monai.data import PersistentDataset, Dataset, DataLoader as MonaiDataLoader
+from monai.data import CacheDataset, PersistentDataset, Dataset, DataLoader as MonaiDataLoader
 from monai.transforms import (
     Compose,
     LoadImaged,
@@ -21,8 +22,8 @@ from monai.transforms import (
 from .augmentations import get_strong_augmentation, get_weak_augmentation
 
 
-def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label_suffix: str = ".seg.nrrd", seed: int = 42) -> Dict[str, List[str]]:
-    """Create or load a frozen split file (splits.json) with patient-level holdouts (C-4 fix)."""
+def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label_suffix: str = ".seg.nrrd", seed: int = 42, patient_id_regex: Optional[str] = None) -> Dict[str, List[str]]:
+    """Create or load a frozen split file (splits.json) with patient-level holdouts (C-4, V-11 fix)."""
     splits_file = Path(data_dir) / "splits.json"
     if splits_file.exists():
         with open(splits_file, "r") as f:
@@ -38,13 +39,28 @@ def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label
         if not os.path.exists(lbl_path):
             lbl_path = str(Path(img_path).parent / f"{base_name}{label_suffix}")
         if os.path.exists(lbl_path):
-            # Patient-level grouping (C-4 fix): extract patient ID prefix
-            patient_id = base_name.split('_')[0] if '_' in base_name else base_name
+            # Patient-level grouping (C-4, V-11 fix): extract patient ID prefix using regex if supplied
+            if patient_id_regex:
+                match = re.search(patient_id_regex, base_name)
+                patient_id = match.group(1) if match else base_name
+            else:
+                patient_id = base_name.split('_')[0] if '_' in base_name else base_name
+
             if patient_id not in patient_map:
                 patient_map[patient_id] = []
             patient_map[patient_id].append(base_name)
 
     patient_ids = sorted(list(patient_map.keys()))
+    n_total_vols = sum(len(vols) for vols in patient_map.values())
+    n_total_p = len(patient_ids)
+
+    # V-11 fix: Assert on patient grouping heuristic failure
+    if n_total_vols > 5:
+        if n_total_p == 1:
+            raise ValueError(f"[DataEngine Error] Patient extraction collapsed all {n_total_vols} volumes into 1 single patient ID '{patient_ids[0]}'. Check filename structure or set config.patient_id_regex.")
+        elif n_total_p == n_total_vols:
+            print(f"[DataEngine Warning] Patient ID heuristic found {n_total_p} patients for {n_total_vols} volumes (1:1 mapping). Ensure volumes are independent subjects.")
+
     rng = random.Random(seed)
     rng.shuffle(patient_ids)
 
@@ -133,8 +149,8 @@ def build_labeled_dataset(data_dir: str, image_suffix: str, label_suffix: str,
     if use_cache_dataset and len(data_dicts) > 0:
         try:
             return CacheDataset(data=data_dicts, transform=transform, cache_rate=1.0, copy_cache=False), labeled_ids
-        except Exception:
-            pass
+        except (MemoryError, RuntimeError, Exception) as e:
+            print(f"[DataEngine Warning] CacheDataset failed ({type(e).__name__}: {e}). Falling back to PersistentDataset/Dataset.")
 
     if cache_dir is not None:
         os.makedirs(cache_dir, exist_ok=True)
@@ -167,8 +183,8 @@ def build_unlabeled_dataset(data_dir: str, image_suffix: str, labeled_ids: set,
     if use_cache_dataset and len(data_dicts) > 0:
         try:
             return CacheDataset(data=data_dicts, transform=transform, cache_rate=1.0, copy_cache=False)
-        except Exception:
-            pass
+        except (MemoryError, RuntimeError, Exception) as e:
+            print(f"[DataEngine Warning] CacheDataset failed ({type(e).__name__}: {e}). Falling back to PersistentDataset/Dataset.")
 
     if cache_dir is not None:
         os.makedirs(cache_dir, exist_ok=True)
@@ -200,11 +216,13 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
 
 def build_dataloaders(config):
     """Build train, unlabeled, and FIXED validation dataloaders with asymmetric transforms (C-4, N-5, P-1 fix)."""
+    patient_id_regex = getattr(config, 'patient_id_regex', None)
     splits = get_or_create_frozen_splits(
         config.data_dir,
         image_suffix=config.image_suffix,
         label_suffix=config.label_suffix,
         seed=config.seed,
+        patient_id_regex=patient_id_regex,
     )
 
     val_ids_set = set(splits.get("val_ids", []))
@@ -213,8 +231,8 @@ def build_dataloaders(config):
     train_transforms = get_base_transforms(config, keys=["image", "label"], is_training=True)
     val_transforms = get_base_transforms(config, keys=["image", "label"], is_training=False)
 
-    # N-5 fix: Strong augmentations for student unlabeled stream
-    unlabeled_transforms = get_base_transforms(config, keys=["image"], is_training=True)
+    # N-5 fix: Base transforms for unlabeled stream; weak/strong views applied per-model in trainer
+    unlabeled_transforms = get_base_transforms(config, keys=["image"], is_training=False)
 
     cache_dir = getattr(config, 'cache_dir', None)
 
@@ -271,11 +289,13 @@ def build_dataloaders(config):
 
 def build_all_volumes_loader(config):
     """Build a dataloader for ALL volumes (excluding test set), without labels for SSL."""
+    patient_id_regex = getattr(config, 'patient_id_regex', None)
     splits = get_or_create_frozen_splits(
         config.data_dir,
         image_suffix=config.image_suffix,
         label_suffix=config.label_suffix,
         seed=config.seed,
+        patient_id_regex=patient_id_regex,
     )
     test_ids_set = set(splits.get("test_ids", []))
 
@@ -299,7 +319,8 @@ def build_all_volumes_loader(config):
     if use_cache_dataset and len(data_dicts) > 0:
         try:
             dataset = CacheDataset(data=data_dicts, transform=unlabeled_transforms, cache_rate=1.0, copy_cache=False, num_workers=config.num_workers)
-        except Exception:
+        except (MemoryError, RuntimeError, Exception) as e:
+            print(f"[DataEngine Warning] SSL CacheDataset failed ({type(e).__name__}: {e}). Falling back to PersistentDataset/Dataset.")
             if cache_dir is not None:
                 ssl_cache = os.path.join(cache_dir, "ssl")
                 os.makedirs(ssl_cache, exist_ok=True)

@@ -76,9 +76,10 @@
                     <button class="axis-tab" data-axis="sagittal" onclick="switchAxis('sagittal', this)">Sagittal</button>
                 </div>
 
-                <!-- Canvas -->
-                <div class="canvas-wrapper">
+                <!-- Canvas Wrapper -->
+                <div class="canvas-wrapper" id="canvas-wrapper">
                     <img id="slice-image" class="slice-image" alt="Slice View" draggable="false">
+                    <canvas id="draw-canvas" class="draw-canvas"></canvas>
                     <div class="slice-info" id="slice-info">Slice 0 / 0</div>
                 </div>
 
@@ -90,7 +91,7 @@
                     <button class="btn-icon" onclick="changeSlice(1)">▶</button>
                 </div>
 
-                <!-- Controls -->
+                <!-- Controls & Drawing Toolbar -->
                 <div class="controls-row">
                     <div class="control-group">
                         <label for="overlay-toggle">Overlay</label>
@@ -101,10 +102,22 @@
                         <input type="range" id="alpha-slider" min="0" max="100" value="40"
                                oninput="updateSlice()">
                     </div>
+                    <div class="control-group tool-group">
+                        <label>Tool:</label>
+                        <button id="tool-brush" class="btn-tool active" onclick="setDrawTool('brush')">🖌️ Brush</button>
+                        <button id="tool-eraser" class="btn-tool" onclick="setDrawTool('eraser')">🧹 Eraser</button>
+                    </div>
+                    <div class="control-group">
+                        <label for="brush-radius">Radius: <span id="radius-val">8</span>px</label>
+                        <input type="range" id="brush-radius" min="1" max="30" value="8" oninput="updateRadiusVal(this.value)">
+                    </div>
                 </div>
 
                 <!-- Action Buttons -->
                 <div class="action-row">
+                    <button id="btn-save-slice" class="btn btn-primary" onclick="saveSliceEdit()">
+                        💾 Save Slice Edit
+                    </button>
                     <button id="btn-accept" class="btn btn-accept" onclick="acceptVolume()">
                         ✅ Accept Label
                     </button>

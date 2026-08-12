@@ -1,12 +1,16 @@
 import os
+from typing import Dict, List, Optional, Tuple, Any
+import numpy as np
 import torch
 import torch.nn as nn
+import monai
 from monai.networks.nets import UNet, DynUNet, SwinUNETR
 from monai.metrics import DiceMetric
 
 from .ema import EMATeacher, enable_dropout
 from .losses import CombinedSegLoss, UncertaintyMaskedLoss, FlexMatchThreshold
 from ..tracking import ExperimentTracker
+from ..data.augmentations import get_weak_augmentation, get_strong_augmentation
 
 
 def build_network(backbone: str, num_classes: int, dropout: float) -> nn.Module:
@@ -78,6 +82,9 @@ class HASSLTrainer:
         self.val_loader = val_loader
         self.tracker = tracker
 
+        # V-10 fix: Set seed determinism
+        monai.utils.set_determinism(seed=config.seed)
+
         self.device_type = 'cuda' if torch.cuda.is_available() and config.device == 'cuda' else 'cpu'
         self.device = torch.device(self.device_type)
 
@@ -113,6 +120,10 @@ class HASSLTrainer:
         self.dice_metric = DiceMetric(include_background=False if self.num_classes > 1 else True, reduction="mean")
         self.start_epoch = 0
 
+        # Pre-instantiate weak and strong augmentations for asymmetric Mean Teacher view (N-5 fix)
+        self.weak_aug = get_weak_augmentation(keys=["image"])
+        self.strong_aug = get_strong_augmentation(keys=["image"])
+
         # Load pre-trained SSL weights if available
         if pretrained_weights and os.path.exists(pretrained_weights):
             self._load_pretrained(pretrained_weights)
@@ -138,7 +149,6 @@ class HASSLTrainer:
             targets_l = batch_data['label'].to(self.device)
             provenance_list = batch_data.get('provenance', ['human'] * inputs_l.size(0))
 
-            # P-1b fix: Compute per-sample loss weight (human = 1.0, pseudo_approved = 0.5)
             sample_weights = torch.tensor(
                 [1.0 if p == 'human' else pseudo_weight for p in provenance_list],
                 device=self.device, dtype=torch.float32
@@ -156,25 +166,34 @@ class HASSLTrainer:
             self.optimizer.zero_grad()
 
             with torch.amp.autocast(self.device_type, enabled=(self.device_type == 'cuda')):
-                # 1. Supervised Loss with sample weighting (P-1b fix)
+                # 1. Supervised Loss with exact per-sample weighting (V-8 fix)
                 preds_l = self.net_A(inputs_l)
-                loss_sup = compute_multiscale_loss(self.criterion, preds_l, targets_l)
-                if sample_weights.numel() == inputs_l.size(0):
-                    loss_sup = loss_sup * sample_weights.mean()
+                loss_sup_list = []
+                for b in range(inputs_l.size(0)):
+                    p_b = preds_l[b:b+1] if torch.is_tensor(preds_l) else [p[b:b+1] for p in preds_l]
+                    l_b = compute_multiscale_loss(self.criterion, p_b, targets_l[b:b+1])
+                    loss_sup_list.append(l_b)
+                loss_sup_tensor = torch.stack(loss_sup_list)
+                loss_sup = (loss_sup_tensor * sample_weights).sum() / (sample_weights.sum() + 1e-8)
 
                 # 2. Unsupervised Loss via MC Dropout Teacher with input perturbation asymmetry (N-5 fix)
                 loss_unsup = torch.tensor(0.0, device=self.device)
                 uncert_val = 0.0
 
                 if inputs_u is not None:
-                    preds_u = self.net_A(inputs_u)
+                    # N-5 fix: Teacher gets weak view; Student gets strong view
+                    try:
+                        inputs_u_teacher = inputs_u + torch.randn_like(inputs_u) * 0.01  # Mild perturbation for teacher
+                        inputs_u_student = inputs_u + torch.randn_like(inputs_u) * 0.05  # Stronger noise perturbation for student
+                    except Exception:
+                        inputs_u_teacher = inputs_u
+                        inputs_u_student = inputs_u
+
+                    preds_u = self.net_A(inputs_u_student)
                     if isinstance(preds_u, (list, tuple)):
                         preds_u = preds_u[0]
                     elif preds_u.ndim == 6:
                         preds_u = preds_u[:, 0]
-
-                    # N-5 fix: Add light perturbation noise to teacher view for true input asymmetry
-                    inputs_u_teacher = inputs_u + torch.randn_like(inputs_u) * 0.02
 
                     # Perform genuine stochastic MC dropout through teacher (H-1 fix)
                     pseudo_probs, uncertainty = self.teacher.forward_mc_dropout(
@@ -249,21 +268,19 @@ class HASSLTrainer:
                 preds_A_l = self.net_A(inputs_l)
                 preds_B_l = self.net_B(inputs_l)
 
-                loss_sup_A = compute_multiscale_loss(self.criterion, preds_A_l, targets_l)
-                loss_sup_B = compute_multiscale_loss(self.criterion, preds_B_l, targets_l)
+                loss_sup_A_list = [compute_multiscale_loss(self.criterion, preds_A_l[b:b+1] if torch.is_tensor(preds_A_l) else [p[b:b+1] for p in preds_A_l], targets_l[b:b+1]) for b in range(inputs_l.size(0))]
+                loss_sup_B_list = [compute_multiscale_loss(self.criterion, preds_B_l[b:b+1] if torch.is_tensor(preds_B_l) else [p[b:b+1] for p in preds_B_l], targets_l[b:b+1]) for b in range(inputs_l.size(0))]
 
-                if sample_weights.numel() == inputs_l.size(0):
-                    loss_sup_A = loss_sup_A * sample_weights.mean()
-                    loss_sup_B = loss_sup_B * sample_weights.mean()
+                loss_sup_A = (torch.stack(loss_sup_A_list) * sample_weights).sum() / (sample_weights.sum() + 1e-8)
+                loss_sup_B = (torch.stack(loss_sup_B_list) * sample_weights).sum() / (sample_weights.sum() + 1e-8)
 
                 loss_cps_A = torch.tensor(0.0, device=self.device)
                 loss_cps_B = torch.tensor(0.0, device=self.device)
 
                 if inputs_u is not None:
-                    # N-5 fix: Create perturbed view for Net B cross supervision
-                    inputs_u_pert = inputs_u + torch.randn_like(inputs_u) * 0.02
+                    # Both networks see aligned input (N-5 fix)
                     preds_A_u = self.net_A(inputs_u)
-                    preds_B_u = self.net_B(inputs_u_pert)
+                    preds_B_u = self.net_B(inputs_u)
 
                     if isinstance(preds_A_u, (list, tuple)): preds_A_u = preds_A_u[0]
                     elif preds_A_u.ndim == 6: preds_A_u = preds_A_u[:, 0]
@@ -319,7 +336,7 @@ class HASSLTrainer:
                 'val_recall': 0.0,
                 'val_rve_pct': 0.0,
                 'val_volume_r2': 0.0,
-                'val_hd95': 0.0,
+                'val_hd95': float('nan'),
             }
 
         self.net_A.eval()
@@ -333,17 +350,19 @@ class HASSLTrainer:
             metric_name=["precision", "recall"],
             reduction="mean"
         )
+        # V-6 fix: Pass physical spacing to HD95 metric
         hd95_metric = HausdorffDistanceMetric(
             include_background=False if self.num_classes > 1 else True,
             percentile=95,
             reduction="mean"
         )
 
-        pred_vols = []
-        gt_vols = []
+        pred_vols_mm3 = []
+        gt_vols_mm3 = []
         first_batch_sample = None
 
         inferer = SlidingWindowInferer(roi_size=self.config.spatial_size, sw_batch_size=2, overlap=0.25)
+        default_voxel_vol_mm3 = float(self.config.spacing[0] * self.config.spacing[1] * self.config.spacing[2])
 
         for batch_idx, batch_data in enumerate(self.val_loader):
             inputs = batch_data['image'].to(self.device)
@@ -368,15 +387,25 @@ class HASSLTrainer:
             confusion_metric(y_pred=preds_binary, y=targets)
 
             try:
-                hd95_metric(y_pred=preds_binary, y=targets)
+                # Pass spacing for true physical distance calculation (V-6 fix)
+                hd95_metric(y_pred=preds_binary, y=targets, spacing=self.config.spacing)
             except Exception:
                 pass  # HD95 can fail gracefully if foreground is empty
 
+            # V-5 fix: Scale voxel counts by physical voxel volume (mm³) before computing R²
             for b in range(inputs.size(0)):
-                pv = float(preds_binary[b].sum().item())
-                gv = float(targets[b].sum().item())
-                pred_vols.append(pv)
-                gt_vols.append(gv)
+                voxel_vol = default_voxel_vol_mm3
+                # Extract per-sample pixdim if present in metadata
+                meta = batch_data.get('image_meta_dict') or batch_data.get('image', {}).meta if hasattr(batch_data.get('image'), 'meta') else None
+                if meta and 'pixdim' in meta:
+                    pixdim = meta['pixdim'][b] if hasattr(meta['pixdim'], '__getitem__') else meta['pixdim']
+                    if len(pixdim) >= 4:
+                        voxel_vol = float(abs(pixdim[1] * pixdim[2] * pixdim[3]))
+
+                pv_mm3 = float(preds_binary[b].sum().item()) * voxel_vol
+                gv_mm3 = float(targets[b].sum().item()) * voxel_vol
+                pred_vols_mm3.append(pv_mm3)
+                gt_vols_mm3.append(gv_mm3)
 
         val_dice = self.dice_metric.aggregate().item()
         val_dice = 0.0 if torch.isnan(torch.tensor(val_dice)) else float(val_dice)
@@ -385,14 +414,15 @@ class HASSLTrainer:
         val_prec = float(cm_res[0].item()) if not torch.isnan(cm_res[0]).any() else 0.0
         val_rec = float(cm_res[1].item()) if not torch.isnan(cm_res[1]).any() else 0.0
 
+        # V-7 fix: Propagate float('nan') when metric aggregation fails or produces NaN
         try:
-            val_hd95 = hd95_metric.aggregate().item()
-            val_hd95 = 0.0 if torch.isnan(torch.tensor(val_hd95)) else float(val_hd95)
+            raw_hd95 = hd95_metric.aggregate().item()
+            val_hd95 = float('nan') if torch.isnan(torch.tensor(raw_hd95)) else float(raw_hd95)
         except Exception:
-            val_hd95 = 0.0
+            val_hd95 = float('nan')
 
-        pred_arr = np.array(pred_vols)
-        gt_arr = np.array(gt_vols)
+        pred_arr = np.array(pred_vols_mm3)
+        gt_arr = np.array(gt_vols_mm3)
 
         rve_list = np.abs(pred_arr - gt_arr) / (gt_arr + 1e-8) * 100.0
         val_rve_pct = float(np.mean(rve_list)) if len(rve_list) > 0 else 0.0
@@ -419,7 +449,6 @@ class HASSLTrainer:
     def log_validation_samples(self, epoch: int, img_t: torch.Tensor, gt_t: torch.Tensor, pred_t: torch.Tensor):
         """Generate and log 4-panel slice preview grid (Image | GT | Pred | Error Map)."""
         try:
-            import numpy as np
             img_np = img_t[0].numpy()
             gt_np = gt_t[0].numpy()
             pred_np = pred_t[0].numpy()
@@ -495,11 +524,13 @@ class HASSLTrainer:
             }
             self.tracker.log_metrics(metrics, step=epoch)
 
+            hd95_str = f"{val_metrics['val_hd95']:.2f}mm" if not np.isnan(val_metrics['val_hd95']) else "N/A"
+
             print(f"  Epoch {epoch:3d}/{end_epoch} | "
                   f"Loss: {train_loss:.4f} | Dice: {val_dice:.4f} | "
                   f"Prec: {val_metrics['val_precision']:.4f} | Rec: {val_metrics['val_recall']:.4f} | "
                   f"RVE: {val_metrics['val_rve_pct']:.1f}% | R²: {val_metrics['val_volume_r2']:.3f} | "
-                  f"HD95: {val_metrics['val_hd95']:.2f}mm")
+                  f"HD95: {hd95_str}")
 
             if val_dice > self.best_dice:
                 self.best_dice = val_dice

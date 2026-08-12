@@ -178,7 +178,7 @@ class ExperimentTracker:
                 os.makedirs(save_local_dir, exist_ok=True)
                 out_path = os.path.join(save_local_dir, f"{name}_step{step:03d}.png")
                 if image.dtype != np.uint8:
-                    img_norm = ((image - image.min()) / (image.ptp() + 1e-8) * 255).astype(np.uint8)
+                    img_norm = ((image - image.min()) / (np.ptp(image) + 1e-8) * 255).astype(np.uint8)
                 else:
                     img_norm = image
                 pil_img = PILImage.fromarray(img_norm)

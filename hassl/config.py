@@ -33,6 +33,7 @@ class HASSLConfig:
     val_split: int = 5  # Number of labeled volumes held out for validation
     cache_dir: str = "./cache"  # PersistentDataset cache
     use_cache_dataset: bool = True  # Cache preprocessed tensors in RAM/CacheDataset
+    patient_id_regex: Optional[str] = None  # Custom regex for extracting patient ID prefix from volume filename
 
     # ─── Compute ────────────────────────────────────────────────────────
     compute_mode: str = "prototype"  # "prototype" (8GB) or "full" (24GB)
@@ -72,6 +73,7 @@ class HASSLConfig:
     flexmatch_threshold: float = 0.95  # Initial pseudo-label confidence threshold
     mc_dropout_passes: int = 5  # 5 for 8GB, 10 for 24GB
     consistency_rampup_epochs: int = 30  # Linear rampup for unsupervised weight
+    pseudo_label_weight: float = 0.5  # Weight multiplier for pseudo-labeled approved samples
     save_every_n_epochs: int = 20  # Checkpoint frequency
     log_image_every_n_epochs: int = 10  # Log sample predictions
 
