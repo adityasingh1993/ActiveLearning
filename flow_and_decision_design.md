@@ -90,8 +90,8 @@ graph TD
     BB{Backbone Configuration} -->|unet| U[MONAI UNet]
     BB -->|dynunet| D[MONAI DynUNet]
 
-    U --> U_Specs[Channels: 16,32,64,128,256 | Strides: 2,2,2,2 | Num Res Units: 2]
-    D --> D_Specs[Filters: 16,32,64,128,256 | Deep Supervision: True | InstanceNorm3d]
+    U --> U_Specs["Channels: 16,32,64,128,256 - Strides: 2,2,2,2 - Num Res Units: 2"]
+D --> D_Specs["Filters: 16,32,64,128,256 - Deep Supervision: True - InstanceNorm3d"]
 ```
 
 ---
