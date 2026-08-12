@@ -1,0 +1,1 @@
+"""HASSL Web Application."""

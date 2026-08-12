@@ -1,0 +1,69 @@
+# HASSL Full Configuration (24GB GPU)
+# Dual-network CPS with SwinUNETR for maximum performance
+
+# ─── Data ─────────────────────────────────────────────────────────────
+data_dir: "./data"
+image_suffix: ".mha"
+label_suffix: ".seg.nrrd"
+num_classes: 1
+spacing: [0.1, 0.1, 0.1]
+spatial_size: [128, 128, 128]
+val_split: 5
+cache_dir: "./cache"
+
+# ─── Compute ──────────────────────────────────────────────────────────
+compute_mode: "full"              # Full mode: dual-network CPS
+device: "cuda"
+batch_size: 2                     # 2 for 24GB
+num_workers: 4
+use_amp: true
+use_gradient_checkpointing: true
+seed: 42
+
+# ─── Network ──────────────────────────────────────────────────────────
+unet_backbone: "dynunet"
+unet_channels: [16, 32, 64, 128, 256]
+unet_strides: [2, 2, 2, 2]
+unet_num_res_units: 2
+dynunet_deep_supervision: true
+dropout: 0.2
+
+swinunetr_feature_size: 48
+
+# ─── SSL Pre-training ─────────────────────────────────────────────────
+ssl_epochs: 200                   # More epochs for full training
+ssl_lr: 0.0001
+ssl_weight_decay: 0.00001
+ssl_mask_ratio: 0.3
+ssl_mask_cube_size: 16
+ssl_contrastive_temp: 0.07
+ssl_embedding_dim: 128
+
+# ─── Semi-Supervised Training ─────────────────────────────────────────
+train_epochs: 300                 # More epochs for full training
+train_lr: 0.0001
+train_weight_decay: 0.00001
+lambda_unsup: 1.0
+ema_decay: 0.999
+flexmatch_threshold: 0.95
+mc_dropout_passes: 10             # More passes for better uncertainty
+consistency_rampup_epochs: 30
+save_every_n_epochs: 20
+log_image_every_n_epochs: 10
+
+# ─── Active Learning ──────────────────────────────────────────────────
+al_query_size: 10
+al_rounds: 4                     # Can afford more rounds with faster training
+al_strategy: "hybrid"
+al_hybrid_weights: [0.4, 0.3, 0.3]
+
+# ─── Experiment Tracking ──────────────────────────────────────────────
+tracker: "wandb"
+project_name: "hassl-ultrasound"
+experiment_name: "bladder-full"
+
+# ─── Directories ──────────────────────────────────────────────────────
+checkpoint_dir: "./experiments/checkpoints"
+log_dir: "./experiments/logs"
+preseg_dir: "./data/al_preseg"
+embedding_dir: "./experiments/embeddings"

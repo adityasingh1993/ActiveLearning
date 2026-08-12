@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Pytest & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# WandB & MLflow logs
+wandb/
+mlruns/
+experiments/
+
+# Cache & Data (keep directory structure, exclude large binary volumes)
+cache/
+data/images/
+data/labels/
+data/al_preseg/
+*.mha
+*.nrrd
+*.pth
+*.npz
+
+# Exception: keep README / markdown / yaml files in data if any
+!data/.gitkeep

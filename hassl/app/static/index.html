@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HASSL — 3D Annotation UI</title>
+    <meta name="description" content="Browser-based annotation tool for 3D BMode ultrasound segmentation">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/index.css">
+</head>
+<body>
+    <!-- Header -->
+    <header id="main-header">
+        <div class="header-left">
+            <h1 class="logo">HASSL</h1>
+            <span class="subtitle">3D Annotation UI</span>
+        </div>
+        <div class="header-center" id="metrics-bar">
+            <div class="metric-chip" id="chip-labeled">
+                <span class="metric-icon">✅</span>
+                <span class="metric-label">Labeled</span>
+                <span class="metric-value" id="count-labeled">0</span>
+            </div>
+            <div class="metric-chip" id="chip-preseg">
+                <span class="metric-icon">🤖</span>
+                <span class="metric-label">AI Pre-seg</span>
+                <span class="metric-value" id="count-preseg">0</span>
+            </div>
+            <div class="metric-chip" id="chip-unlabeled">
+                <span class="metric-icon">⬜</span>
+                <span class="metric-label">Unlabeled</span>
+                <span class="metric-value" id="count-unlabeled">0</span>
+            </div>
+        </div>
+        <div class="header-right">
+            <button id="btn-retrain" class="btn btn-accent" onclick="triggerRetrain()">
+                🔄 Retrain Model
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Layout -->
+    <main id="app-layout">
+        <!-- Left Panel: Volume Queue -->
+        <aside id="volume-panel">
+            <div class="panel-header">
+                <h2>Volume Queue</h2>
+                <div class="filter-tabs">
+                    <button class="tab active" data-filter="all" onclick="filterVolumes('all', this)">All</button>
+                    <button class="tab" data-filter="preseg" onclick="filterVolumes('preseg', this)">AI Pre-seg</button>
+                    <button class="tab" data-filter="unlabeled" onclick="filterVolumes('unlabeled', this)">Unlabeled</button>
+                    <button class="tab" data-filter="labeled" onclick="filterVolumes('labeled', this)">Labeled</button>
+                </div>
+            </div>
+            <div id="volume-list" class="volume-list">
+                <!-- Populated by JS -->
+            </div>
+        </aside>
+
+        <!-- Center: Slice Viewer -->
+        <section id="viewer-panel">
+            <div id="viewer-placeholder" class="viewer-placeholder">
+                <div class="placeholder-content">
+                    <span class="placeholder-icon">🔬</span>
+                    <h3>Select a volume to start</h3>
+                    <p>Choose a volume from the left panel to view slices</p>
+                </div>
+            </div>
+
+            <div id="viewer-container" class="viewer-container" style="display:none;">
+                <!-- Axis Tabs -->
+                <div class="axis-tabs">
+                    <button class="axis-tab active" data-axis="axial" onclick="switchAxis('axial', this)">Axial</button>
+                    <button class="axis-tab" data-axis="coronal" onclick="switchAxis('coronal', this)">Coronal</button>
+                    <button class="axis-tab" data-axis="sagittal" onclick="switchAxis('sagittal', this)">Sagittal</button>
+                </div>
+
+                <!-- Canvas -->
+                <div class="canvas-wrapper">
+                    <img id="slice-image" class="slice-image" alt="Slice View" draggable="false">
+                    <div class="slice-info" id="slice-info">Slice 0 / 0</div>
+                </div>
+
+                <!-- Slice Slider -->
+                <div class="slider-row">
+                    <button class="btn-icon" onclick="changeSlice(-1)">◀</button>
+                    <input type="range" id="slice-slider" class="slice-slider" min="0" max="100" value="50"
+                           oninput="onSliderChange(this.value)">
+                    <button class="btn-icon" onclick="changeSlice(1)">▶</button>
+                </div>
+
+                <!-- Controls -->
+                <div class="controls-row">
+                    <div class="control-group">
+                        <label for="overlay-toggle">Overlay</label>
+                        <input type="checkbox" id="overlay-toggle" checked onchange="updateSlice()">
+                    </div>
+                    <div class="control-group">
+                        <label for="alpha-slider">Opacity</label>
+                        <input type="range" id="alpha-slider" min="0" max="100" value="40"
+                               oninput="updateSlice()">
+                    </div>
+                </div>
+
+                <!-- Action Buttons -->
+                <div class="action-row">
+                    <button id="btn-accept" class="btn btn-accept" onclick="acceptVolume()">
+                        ✅ Accept Label
+                    </button>
+                    <button id="btn-reject" class="btn btn-reject" onclick="rejectVolume()">
+                        ❌ Reject
+                    </button>
+                    <button id="btn-next" class="btn btn-secondary" onclick="loadNextVolume()">
+                        ➡️ Next Volume
+                    </button>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

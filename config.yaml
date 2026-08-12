@@ -1,0 +1,69 @@
+# HASSL Prototype Configuration (8GB GPU)
+# For full mode (24GB), change compute_mode to "full" or use config_full.yaml
+
+# ─── Data ─────────────────────────────────────────────────────────────
+data_dir: "./data"
+image_suffix: ".mha"
+label_suffix: ".seg.nrrd"
+num_classes: 1                    # 1 = binary (bladder), increase for multi-organ
+spacing: [0.1, 0.1, 0.1]         # Spacingd pixdim — adjust to your ultrasound resolution
+spatial_size: [128, 128, 128]     # Resize target
+val_split: 5                      # Hold out 5 labeled volumes for validation
+cache_dir: "./cache"
+
+# ─── Compute ──────────────────────────────────────────────────────────
+compute_mode: "prototype"         # "prototype" (8GB) or "full" (24GB)
+device: "cuda"
+batch_size: 1                     # Auto-adjusted: 1 for prototype, 2 for full
+num_workers: 2
+use_amp: true
+use_gradient_checkpointing: true
+seed: 42
+
+# ─── Network ──────────────────────────────────────────────────────────
+unet_backbone: "dynunet"          # "unet" or "dynunet"
+unet_channels: [16, 32, 64, 128, 256]
+unet_strides: [2, 2, 2, 2]
+unet_num_res_units: 2             # Only for UNet
+dynunet_deep_supervision: true    # Only for DynUNet
+dropout: 0.2
+
+swinunetr_feature_size: 48       # Only used in full mode
+
+# ─── SSL Pre-training ─────────────────────────────────────────────────
+ssl_epochs: 100
+ssl_lr: 0.0001
+ssl_weight_decay: 0.00001
+ssl_mask_ratio: 0.3
+ssl_mask_cube_size: 16
+ssl_contrastive_temp: 0.07
+ssl_embedding_dim: 128
+
+# ─── Semi-Supervised Training ─────────────────────────────────────────
+train_epochs: 200
+train_lr: 0.0001
+train_weight_decay: 0.00001
+lambda_unsup: 1.0
+ema_decay: 0.999
+flexmatch_threshold: 0.95
+mc_dropout_passes: 5              # Auto-adjusted: 5 for prototype, 10 for full
+consistency_rampup_epochs: 30
+save_every_n_epochs: 20
+log_image_every_n_epochs: 10
+
+# ─── Active Learning ──────────────────────────────────────────────────
+al_query_size: 10
+al_rounds: 3
+al_strategy: "hybrid"
+al_hybrid_weights: [0.4, 0.3, 0.3]   # BALD, CoreSet, Disagreement
+
+# ─── Experiment Tracking ──────────────────────────────────────────────
+tracker: "wandb"                  # "wandb", "mlflow", or "none"
+project_name: "hassl-ultrasound"
+experiment_name: "bladder-prototype"
+
+# ─── Directories ──────────────────────────────────────────────────────
+checkpoint_dir: "./experiments/checkpoints"
+log_dir: "./experiments/logs"
+preseg_dir: "./data/al_preseg"
+embedding_dir: "./experiments/embeddings"

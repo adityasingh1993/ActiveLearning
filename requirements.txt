@@ -1,0 +1,33 @@
+# HASSL: Hybrid Active Semi-Supervised Learning
+# Core dependencies
+monai[all]>=1.3.0
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Medical image I/O
+nibabel>=5.0.0
+pynrrd>=1.0.0
+SimpleITK>=2.3.0
+
+# ML utilities
+scikit-learn>=1.3.0
+scipy>=1.11.0
+einops>=0.7.0
+
+# Configuration
+pyyaml>=6.0
+
+# Experiment tracking (install one or both)
+wandb>=0.16.0
+mlflow>=2.9.0
+
+# Visualization & Web UI
+matplotlib>=3.8.0
+umap-learn>=0.5.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pillow>=10.0.0
+python-multipart>=0.0.6
+
+# Testing
+pytest>=7.4.0

@@ -1,0 +1,184 @@
+"""
+HASSL Configuration Module.
+
+Centralized YAML-driven configuration for all HASSL pipeline components.
+Supports two compute tiers (prototype/full) and configurable network backbones.
+"""
+
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Tuple, Optional, List
+import yaml
+
+
+@dataclass
+class HASSLConfig:
+    """Master configuration for the HASSL pipeline.
+
+    This config drives all pipeline phases: data loading, SSL pre-training,
+    semi-supervised training, active learning, and experiment tracking.
+
+    Two compute tiers:
+        - "prototype" (8GB VRAM): Single UNet/DynUNet + UA-Mean Teacher
+        - "full" (24GB VRAM): Dual-network CPS (UNet/DynUNet + SwinUNETR)
+    """
+
+    # ─── Data ───────────────────────────────────────────────────────────
+    data_dir: str = "./data"
+    image_suffix: str = ".mha"
+    label_suffix: str = ".seg.nrrd"
+    num_classes: int = 1  # 1 = binary (sigmoid), >1 = multi-class (softmax)
+    spacing: Tuple[float, float, float] = (0.1, 0.1, 0.1)  # Spacingd pixdim
+    spatial_size: Tuple[int, int, int] = (128, 128, 128)  # Resize target
+    val_split: int = 5  # Number of labeled volumes held out for validation
+    cache_dir: str = "./cache"  # PersistentDataset cache
+
+    # ─── Compute ────────────────────────────────────────────────────────
+    compute_mode: str = "prototype"  # "prototype" (8GB) or "full" (24GB)
+    device: str = "cuda"  # "cuda" or "cpu"
+    batch_size: int = 1  # 1 for 8GB, 2 for 24GB
+    num_workers: int = 2
+    use_amp: bool = True  # Mixed precision training
+    use_gradient_checkpointing: bool = True
+    seed: int = 42
+
+    # ─── Network ────────────────────────────────────────────────────────
+    unet_backbone: str = "dynunet"  # "unet" or "dynunet"
+    unet_channels: Tuple[int, ...] = (16, 32, 64, 128, 256)
+    unet_strides: Tuple[int, ...] = (2, 2, 2, 2)
+    unet_num_res_units: int = 2  # Only for UNet
+    dynunet_deep_supervision: bool = True  # Only for DynUNet
+    dropout: float = 0.2  # For MC Dropout during uncertainty estimation
+
+    # Full mode additional network
+    swinunetr_feature_size: int = 48
+
+    # ─── SSL Pre-training (Phase 2) ─────────────────────────────────────
+    ssl_epochs: int = 100
+    ssl_lr: float = 1e-4
+    ssl_weight_decay: float = 1e-5
+    ssl_mask_ratio: float = 0.3  # Fraction of volume to mask
+    ssl_mask_cube_size: int = 16  # Size of each masked sub-cube
+    ssl_contrastive_temp: float = 0.07  # InfoNCE temperature
+    ssl_embedding_dim: int = 128  # Projection head output dim
+
+    # ─── Semi-Supervised Training (Phase 3) ──────────────────────────────
+    train_epochs: int = 200  # Per AL round
+    train_lr: float = 1e-4
+    train_weight_decay: float = 1e-5
+    lambda_unsup: float = 1.0  # Max weight for unsupervised loss
+    ema_decay: float = 0.999  # EMA teacher momentum
+    flexmatch_threshold: float = 0.95  # Initial pseudo-label confidence threshold
+    mc_dropout_passes: int = 5  # 5 for 8GB, 10 for 24GB
+    consistency_rampup_epochs: int = 30  # Linear rampup for unsupervised weight
+    save_every_n_epochs: int = 20  # Checkpoint frequency
+    log_image_every_n_epochs: int = 10  # Log sample predictions
+
+    # ─── Active Learning (Phase 4) ───────────────────────────────────────
+    al_query_size: int = 10  # Volumes to query per round
+    al_rounds: int = 3  # Total AL rounds (3-4 is optimal)
+    al_strategy: str = "hybrid"  # "bald", "coreset", "disagreement", "hybrid"
+    al_hybrid_weights: Tuple[float, float, float] = (0.4, 0.3, 0.3)  # BALD, CoreSet, Disagreement
+
+    # ─── Experiment Tracking (Phase 5) ───────────────────────────────────
+    tracker: str = "wandb"  # "wandb", "mlflow", or "none"
+    project_name: str = "hassl-ultrasound"
+    experiment_name: str = "bladder-prototype"
+    run_name: Optional[str] = None  # Auto-generated if None
+
+    # ─── Directories (auto-resolved) ────────────────────────────────────
+    checkpoint_dir: str = "./experiments/checkpoints"
+    log_dir: str = "./experiments/logs"
+    preseg_dir: str = "./data/al_preseg"
+    embedding_dir: str = "./experiments/embeddings"
+
+    def __post_init__(self):
+        """Validate and adjust config based on compute mode."""
+        if self.compute_mode == "prototype":
+            # Enforce 8GB-friendly settings
+            if self.batch_size > 1:
+                print(f"[HASSL Config] Overriding batch_size={self.batch_size} → 1 for prototype mode")
+                self.batch_size = 1
+            if self.mc_dropout_passes > 5:
+                print(f"[HASSL Config] Overriding mc_dropout_passes={self.mc_dropout_passes} → 5 for prototype mode")
+                self.mc_dropout_passes = 5
+        elif self.compute_mode == "full":
+            # Use higher settings for 24GB
+            if self.batch_size < 2:
+                self.batch_size = 2
+            if self.mc_dropout_passes < 10:
+                self.mc_dropout_passes = 10
+
+        # Create directories
+        for dir_attr in ["checkpoint_dir", "log_dir", "preseg_dir", "embedding_dir", "cache_dir"]:
+            Path(getattr(self, dir_attr)).mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str) -> "HASSLConfig":
+        """Load config from a YAML file.
+
+        Args:
+            yaml_path: Path to the YAML configuration file.
+
+        Returns:
+            HASSLConfig instance with values from YAML overriding defaults.
+        """
+        with open(yaml_path, "r") as f:
+            yaml_config = yaml.safe_load(f) or {}
+
+        # Convert nested tuples from YAML lists
+        for key in ["spacing", "spatial_size", "unet_channels", "unet_strides", "al_hybrid_weights"]:
+            if key in yaml_config and isinstance(yaml_config[key], list):
+                yaml_config[key] = tuple(yaml_config[key])
+
+        return cls(**yaml_config)
+
+    def to_yaml(self, yaml_path: str) -> None:
+        """Save config to a YAML file.
+
+        Args:
+            yaml_path: Output path for the YAML file.
+        """
+        config_dict = asdict(self)
+        # Convert tuples to lists for YAML serialization
+        for key, value in config_dict.items():
+            if isinstance(value, tuple):
+                config_dict[key] = list(value)
+
+        Path(yaml_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(yaml_path, "w") as f:
+            yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+
+    def to_dict(self) -> dict:
+        """Convert config to dictionary for experiment tracking."""
+        return asdict(self)
+
+    @property
+    def is_binary(self) -> bool:
+        """Whether this is a binary segmentation task."""
+        return self.num_classes == 1
+
+    @property
+    def output_channels(self) -> int:
+        """Number of output channels for the network.
+
+        Binary: 1 channel (sigmoid), Multi-class: N channels (softmax).
+        """
+        return 1 if self.is_binary else self.num_classes
+
+    @property
+    def activation(self) -> str:
+        """Activation function for the final layer."""
+        return "sigmoid" if self.is_binary else "softmax"
+
+    def get_full_mode_config(self) -> "HASSLConfig":
+        """Return a copy of this config upgraded to full (24GB) mode.
+
+        Useful for switching from prototype to full without editing YAML.
+        """
+        import copy
+        full_config = copy.deepcopy(self)
+        full_config.compute_mode = "full"
+        full_config.batch_size = 2
+        full_config.mc_dropout_passes = 10
+        return full_config
