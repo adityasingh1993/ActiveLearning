@@ -53,11 +53,34 @@ def write_mask_with_spatial_geometry(output_path: str, mask_arr: np.ndarray, ref
         try:
             ref_img = sitk.ReadImage(reference_image_path)
             mask_img = sitk.GetImageFromArray(mask_arr.astype(np.uint8))
+
+            if mask_img.GetSize() != ref_img.GetSize():
+                # Compute physical spacing for preprocessed mask
+                ref_size = ref_img.GetSize()
+                ref_spacing = ref_img.GetSpacing()
+                mask_size = mask_img.GetSize()
+
+                mask_spacing = tuple(
+                    (ref_size[i] * ref_spacing[i]) / max(1, mask_size[i])
+                    for i in range(3)
+                )
+
+                mask_img.SetSpacing(mask_spacing)
+                mask_img.SetOrigin(ref_img.GetOrigin())
+                mask_img.SetDirection(ref_img.GetDirection())
+
+                # Resample back into native reference grid
+                resampler = sitk.ResampleImageFilter()
+                resampler.SetReferenceImage(ref_img)
+                resampler.SetInterpolator(sitk.sitkNearestNeighbor)
+                resampler.SetTransform(sitk.Transform())
+                mask_img = resampler.Execute(mask_img)
+
             mask_img.CopyInformation(ref_img)
             sitk.WriteImage(mask_img, output_path)
             return
         except Exception as e:
-            print(f"[NRRD Utils] Warning: SimpleITK spatial write failed ({e}), falling back to pynrrd")
+            print(f"[NRRD Utils] Warning: SimpleITK spatial write failed ({type(e).__name__}: {e}), falling back to pynrrd")
 
     # Fallback to pynrrd if SimpleITK fails
     header = {

@@ -159,6 +159,7 @@ class ExperimentTracker:
         name: str,
         step: int,
         caption: Optional[str] = None,
+        save_local_dir: Optional[str] = "./experiments/logs/val_previews",
     ) -> None:
         """Log an image array.
 
@@ -167,7 +168,24 @@ class ExperimentTracker:
             name: Name/key for the image.
             step: Training step.
             caption: Optional caption for the image.
+            save_local_dir: Directory to save image locally as PNG file.
         """
+        # Save local copy if path specified
+        if save_local_dir:
+            try:
+                import os
+                from PIL import Image as PILImage
+                os.makedirs(save_local_dir, exist_ok=True)
+                out_path = os.path.join(save_local_dir, f"{name}_step{step:03d}.png")
+                if image.dtype != np.uint8:
+                    img_norm = ((image - image.min()) / (image.ptp() + 1e-8) * 255).astype(np.uint8)
+                else:
+                    img_norm = image
+                pil_img = PILImage.fromarray(img_norm)
+                pil_img.save(out_path)
+            except Exception as e:
+                logger.warning(f"Failed to save local preview image: {e}")
+
         if self.backend == "wandb":
             import wandb
             wandb.log({name: wandb.Image(image, caption=caption)}, step=step)

@@ -6,10 +6,11 @@ data_dir: "./data"
 image_suffix: ".mha"
 label_suffix: ".seg.nrrd"
 num_classes: 1
-spacing: [0.1, 0.1, 0.1]
+spacing: [0.100, 0.0386, 0.0982]
 spatial_size: [128, 128, 128]
 val_split: 5
 cache_dir: "./cache"
+use_cache_dataset: true
 
 # ─── Compute ──────────────────────────────────────────────────────────
 compute_mode: "full"              # Full mode: dual-network CPS

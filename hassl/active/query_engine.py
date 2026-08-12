@@ -117,7 +117,7 @@ class QueryEngine:
         model.eval()
         candidates = []
 
-        output_pseudo_dir = os.path.join(self.config.data_dir, 'pseudo') if self.config else './data/pseudo'
+        output_pseudo_dir = os.path.join(self.config.data_dir, 'pseudo_unreviewed') if self.config else './data/pseudo_unreviewed'
         os.makedirs(output_pseudo_dir, exist_ok=True)
 
         with torch.no_grad():

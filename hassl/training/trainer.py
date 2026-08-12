@@ -125,6 +125,7 @@ class HASSLTrainer:
     def train_one_epoch_uamt(self, epoch: int):
         self.net_A.train()
         unsup_weight = self.get_rampup_weight(epoch)
+        pseudo_weight = getattr(self.config, 'pseudo_label_weight', 0.5)
         total_loss, total_sup, total_unsup, total_uncert = 0.0, 0.0, 0.0, 0.0
 
         if self.unlabeled_loader is None or len(self.unlabeled_loader.dataset) == 0:
@@ -135,6 +136,13 @@ class HASSLTrainer:
         for batch_idx, batch_data in enumerate(self.labeled_loader):
             inputs_l = batch_data['image'].to(self.device)
             targets_l = batch_data['label'].to(self.device)
+            provenance_list = batch_data.get('provenance', ['human'] * inputs_l.size(0))
+
+            # P-1b fix: Compute per-sample loss weight (human = 1.0, pseudo_approved = 0.5)
+            sample_weights = torch.tensor(
+                [1.0 if p == 'human' else pseudo_weight for p in provenance_list],
+                device=self.device, dtype=torch.float32
+            )
 
             inputs_u = None
             if iter_unlabeled is not None:
@@ -148,11 +156,13 @@ class HASSLTrainer:
             self.optimizer.zero_grad()
 
             with torch.amp.autocast(self.device_type, enabled=(self.device_type == 'cuda')):
-                # 1. Supervised Loss (handles DynUNet deep supervision, H-8 fix)
+                # 1. Supervised Loss with sample weighting (P-1b fix)
                 preds_l = self.net_A(inputs_l)
                 loss_sup = compute_multiscale_loss(self.criterion, preds_l, targets_l)
+                if sample_weights.numel() == inputs_l.size(0):
+                    loss_sup = loss_sup * sample_weights.mean()
 
-                # 2. Unsupervised Loss via MC Dropout Teacher (H-1 & H-2 fix)
+                # 2. Unsupervised Loss via MC Dropout Teacher with input perturbation asymmetry (N-5 fix)
                 loss_unsup = torch.tensor(0.0, device=self.device)
                 uncert_val = 0.0
 
@@ -163,13 +173,14 @@ class HASSLTrainer:
                     elif preds_u.ndim == 6:
                         preds_u = preds_u[:, 0]
 
+                    # N-5 fix: Add light perturbation noise to teacher view for true input asymmetry
+                    inputs_u_teacher = inputs_u + torch.randn_like(inputs_u) * 0.02
+
                     # Perform genuine stochastic MC dropout through teacher (H-1 fix)
                     pseudo_probs, uncertainty = self.teacher.forward_mc_dropout(
-                        inputs_u, num_passes=self.config.mc_dropout_passes
+                        inputs_u_teacher, num_passes=self.config.mc_dropout_passes
                     )
 
-                    # Absolute/quantile uncertainty mask (H-2 & N-3 fix)
-                    # Mask out top 25% most uncertain voxels (cast to float for CUDA autocast N-3 fix)
                     thresh = torch.quantile(uncertainty.detach().float(), 0.75)
                     mask = (uncertainty < thresh).float()
 
@@ -204,6 +215,7 @@ class HASSLTrainer:
         self.net_A.train()
         self.net_B.train()
         unsup_weight = self.get_rampup_weight(epoch)
+        pseudo_weight = getattr(self.config, 'pseudo_label_weight', 0.5)
         total_loss, total_sup, total_unsup = 0.0, 0.0, 0.0
 
         if self.unlabeled_loader is None or len(self.unlabeled_loader.dataset) == 0:
@@ -214,6 +226,12 @@ class HASSLTrainer:
         for batch_idx, batch_data in enumerate(self.labeled_loader):
             inputs_l = batch_data['image'].to(self.device)
             targets_l = batch_data['label'].to(self.device)
+            provenance_list = batch_data.get('provenance', ['human'] * inputs_l.size(0))
+
+            sample_weights = torch.tensor(
+                [1.0 if p == 'human' else pseudo_weight for p in provenance_list],
+                device=self.device, dtype=torch.float32
+            )
 
             inputs_u = None
             if iter_unlabeled is not None:
@@ -234,14 +252,19 @@ class HASSLTrainer:
                 loss_sup_A = compute_multiscale_loss(self.criterion, preds_A_l, targets_l)
                 loss_sup_B = compute_multiscale_loss(self.criterion, preds_B_l, targets_l)
 
+                if sample_weights.numel() == inputs_l.size(0):
+                    loss_sup_A = loss_sup_A * sample_weights.mean()
+                    loss_sup_B = loss_sup_B * sample_weights.mean()
+
                 loss_cps_A = torch.tensor(0.0, device=self.device)
                 loss_cps_B = torch.tensor(0.0, device=self.device)
 
                 if inputs_u is not None:
+                    # N-5 fix: Create perturbed view for Net B cross supervision
+                    inputs_u_pert = inputs_u + torch.randn_like(inputs_u) * 0.02
                     preds_A_u = self.net_A(inputs_u)
-                    preds_B_u = self.net_B(inputs_u)
+                    preds_B_u = self.net_B(inputs_u_pert)
 
-                    # N-4 fix: Handle DynUNet deep supervision list/tuple and 6D stacked tensors
                     if isinstance(preds_A_u, (list, tuple)): preds_A_u = preds_A_u[0]
                     elif preds_A_u.ndim == 6: preds_A_u = preds_A_u[:, 0]
 
@@ -288,17 +311,41 @@ class HASSLTrainer:
         return total_loss / N, total_sup / N, total_unsup / N, 0.0
 
     @torch.no_grad()
-    def validate(self) -> float:
+    def validate(self, epoch: int = 0, should_log_image: bool = False) -> Dict[str, float]:
         if self.val_loader is None or len(self.val_loader.dataset) == 0:
-            return 0.0
+            return {
+                'val_dice': 0.0,
+                'val_precision': 0.0,
+                'val_recall': 0.0,
+                'val_rve_pct': 0.0,
+                'val_volume_r2': 0.0,
+                'val_hd95': 0.0,
+            }
 
         self.net_A.eval()
         self.dice_metric.reset()
 
         from monai.inferers import SlidingWindowInferer
+        from monai.metrics import ConfusionMatrixMetric, HausdorffDistanceMetric
+
+        confusion_metric = ConfusionMatrixMetric(
+            include_background=False if self.num_classes > 1 else True,
+            metric_name=["precision", "recall"],
+            reduction="mean"
+        )
+        hd95_metric = HausdorffDistanceMetric(
+            include_background=False if self.num_classes > 1 else True,
+            percentile=95,
+            reduction="mean"
+        )
+
+        pred_vols = []
+        gt_vols = []
+        first_batch_sample = None
+
         inferer = SlidingWindowInferer(roi_size=self.config.spatial_size, sw_batch_size=2, overlap=0.25)
 
-        for batch_data in self.val_loader:
+        for batch_idx, batch_data in enumerate(self.val_loader):
             inputs = batch_data['image'].to(self.device)
             targets = batch_data['label'].to(self.device)
 
@@ -310,39 +357,149 @@ class HASSLTrainer:
                     preds = preds[:, 0]
 
                 if self.num_classes == 1:
-                    preds = (torch.sigmoid(preds) > 0.5).float()
+                    preds_binary = (torch.sigmoid(preds) > 0.5).float()
                 else:
-                    preds = torch.argmax(preds, dim=1, keepdim=True)
+                    preds_binary = torch.argmax(preds, dim=1, keepdim=True).float()
 
-            self.dice_metric(y_pred=preds, y=targets)
+            if first_batch_sample is None and should_log_image:
+                first_batch_sample = (inputs[0].detach().cpu(), targets[0].detach().cpu(), preds_binary[0].detach().cpu())
 
-        val_score = self.dice_metric.aggregate().item()
-        return val_score if not torch.isnan(torch.tensor(val_score)) else 0.0
+            self.dice_metric(y_pred=preds_binary, y=targets)
+            confusion_metric(y_pred=preds_binary, y=targets)
+
+            try:
+                hd95_metric(y_pred=preds_binary, y=targets)
+            except Exception:
+                pass  # HD95 can fail gracefully if foreground is empty
+
+            for b in range(inputs.size(0)):
+                pv = float(preds_binary[b].sum().item())
+                gv = float(targets[b].sum().item())
+                pred_vols.append(pv)
+                gt_vols.append(gv)
+
+        val_dice = self.dice_metric.aggregate().item()
+        val_dice = 0.0 if torch.isnan(torch.tensor(val_dice)) else float(val_dice)
+
+        cm_res = confusion_metric.aggregate()
+        val_prec = float(cm_res[0].item()) if not torch.isnan(cm_res[0]).any() else 0.0
+        val_rec = float(cm_res[1].item()) if not torch.isnan(cm_res[1]).any() else 0.0
+
+        try:
+            val_hd95 = hd95_metric.aggregate().item()
+            val_hd95 = 0.0 if torch.isnan(torch.tensor(val_hd95)) else float(val_hd95)
+        except Exception:
+            val_hd95 = 0.0
+
+        pred_arr = np.array(pred_vols)
+        gt_arr = np.array(gt_vols)
+
+        rve_list = np.abs(pred_arr - gt_arr) / (gt_arr + 1e-8) * 100.0
+        val_rve_pct = float(np.mean(rve_list)) if len(rve_list) > 0 else 0.0
+
+        if len(gt_arr) > 1 and np.var(gt_arr) > 1e-6:
+            ss_res = np.sum((gt_arr - pred_arr) ** 2)
+            ss_tot = np.sum((gt_arr - np.mean(gt_arr)) ** 2)
+            val_volume_r2 = float(1.0 - (ss_res / (ss_tot + 1e-8)))
+        else:
+            val_volume_r2 = 1.0 if np.allclose(pred_arr, gt_arr) else 0.0
+
+        if should_log_image and first_batch_sample is not None:
+            self.log_validation_samples(epoch, *first_batch_sample)
+
+        return {
+            'val_dice': val_dice,
+            'val_precision': val_prec,
+            'val_recall': val_rec,
+            'val_rve_pct': val_rve_pct,
+            'val_volume_r2': val_volume_r2,
+            'val_hd95': val_hd95,
+        }
+
+    def log_validation_samples(self, epoch: int, img_t: torch.Tensor, gt_t: torch.Tensor, pred_t: torch.Tensor):
+        """Generate and log 4-panel slice preview grid (Image | GT | Pred | Error Map)."""
+        try:
+            import numpy as np
+            img_np = img_t[0].numpy()
+            gt_np = gt_t[0].numpy()
+            pred_np = pred_t[0].numpy()
+
+            gt_sums = gt_np.sum(axis=(1, 2))
+            slice_idx = int(gt_sums.argmax()) if gt_sums.max() > 0 else img_np.shape[0] // 2
+
+            slice_img = img_np[slice_idx]
+            slice_gt = (gt_np[slice_idx] > 0.5).astype(np.float32)
+            slice_pred = (pred_np[slice_idx] > 0.5).astype(np.float32)
+
+            p_min, p_max = slice_img.min(), slice_img.max()
+            slice_norm = (slice_img - p_min) / (p_max - p_min + 1e-8)
+            base_gray = (slice_norm * 255).astype(np.uint8)
+            base_rgb = np.stack([base_gray] * 3, axis=-1)
+
+            # Panel 1: Original Image
+            p1 = base_rgb.copy()
+
+            # Panel 2: Ground Truth (Green overlay)
+            p2 = base_rgb.copy()
+            p2[slice_gt > 0, 1] = np.clip(p2[slice_gt > 0, 1].astype(np.int32) + 120, 0, 255).astype(np.uint8)
+
+            # Panel 3: Prediction (Cyan overlay)
+            p3 = base_rgb.copy()
+            p3[slice_pred > 0, 0] = np.clip(p3[slice_pred > 0, 0].astype(np.int32) + 120, 0, 255).astype(np.uint8)
+            p3[slice_pred > 0, 2] = np.clip(p3[slice_pred > 0, 2].astype(np.int32) + 120, 0, 255).astype(np.uint8)
+
+            # Panel 4: Composite Error (Green=TP, Red=FP, Blue=FN)
+            p4 = base_rgb.copy()
+            tp = (slice_gt > 0) & (slice_pred > 0)
+            fp = (slice_gt == 0) & (slice_pred > 0)
+            fn = (slice_gt > 0) & (slice_pred == 0)
+
+            p4[tp, 1] = 255  # Green for True Positive
+            p4[fp, 0] = 255  # Red for False Positive
+            p4[fn, 2] = 255  # Blue for False Negative
+
+            grid_img = np.concatenate([p1, p2, p3, p4], axis=1)
+
+            self.tracker.log_image(
+                grid_img,
+                name="val_slice_preview",
+                step=epoch,
+                caption=f"Epoch {epoch} Slice {slice_idx} (Image | GT | Pred | Error: TP-Green, FP-Red, FN-Blue)",
+                save_local_dir=os.path.join(self.config.log_dir, "val_previews")
+            )
+        except Exception as e:
+            print(f"  [Warning] Failed to generate validation slice preview: {e}")
 
     def train(self, num_epochs: int):
         end_epoch = self.start_epoch + num_epochs
+        log_img_freq = getattr(self.config, 'log_image_every_n_epochs', 10)
+
         for epoch in range(self.start_epoch, end_epoch):
             if self.mode == 'prototype':
                 train_loss, sup_loss, unsup_loss, uncert = self.train_one_epoch_uamt(epoch)
             else:
                 train_loss, sup_loss, unsup_loss, uncert = self.train_one_epoch_cps(epoch)
 
-            val_dice = self.validate()
+            should_log_image = ((epoch + 1) % log_img_freq == 0) or (epoch == end_epoch - 1)
+            val_metrics = self.validate(epoch=epoch, should_log_image=should_log_image)
+            val_dice = val_metrics['val_dice']
 
             metrics = {
                 'train_loss': train_loss,
-                'val_dice': val_dice,
                 'supervised_loss': sup_loss,
                 'unsupervised_loss': unsup_loss,
                 'learning_rate': self.config.train_lr,
                 'uncertainty_mean': uncert,
                 'epoch': epoch,
+                **val_metrics
             }
             self.tracker.log_metrics(metrics, step=epoch)
 
             print(f"  Epoch {epoch:3d}/{end_epoch} | "
                   f"Loss: {train_loss:.4f} | Dice: {val_dice:.4f} | "
-                  f"Sup: {sup_loss:.4f} | Unsup: {unsup_loss:.4f}")
+                  f"Prec: {val_metrics['val_precision']:.4f} | Rec: {val_metrics['val_recall']:.4f} | "
+                  f"RVE: {val_metrics['val_rve_pct']:.1f}% | R²: {val_metrics['val_volume_r2']:.3f} | "
+                  f"HD95: {val_metrics['val_hd95']:.2f}mm")
 
             if val_dice > self.best_dice:
                 self.best_dice = val_dice

@@ -28,10 +28,11 @@ class HASSLConfig:
     image_suffix: str = ".mha"
     label_suffix: str = ".seg.nrrd"
     num_classes: int = 1  # 1 = binary (sigmoid), >1 = multi-class (softmax)
-    spacing: Tuple[float, float, float] = (0.1, 0.1, 0.1)  # Spacingd pixdim
+    spacing: Tuple[float, float, float] = (0.100, 0.0386, 0.0982)  # Spacingd pixdim (mm per voxel)
     spatial_size: Tuple[int, int, int] = (128, 128, 128)  # Resize target
     val_split: int = 5  # Number of labeled volumes held out for validation
     cache_dir: str = "./cache"  # PersistentDataset cache
+    use_cache_dataset: bool = True  # Cache preprocessed tensors in RAM/CacheDataset
 
     # ─── Compute ────────────────────────────────────────────────────────
     compute_mode: str = "prototype"  # "prototype" (8GB) or "full" (24GB)

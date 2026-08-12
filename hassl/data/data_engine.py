@@ -22,7 +22,7 @@ from .augmentations import get_strong_augmentation, get_weak_augmentation
 
 
 def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label_suffix: str = ".seg.nrrd", seed: int = 42) -> Dict[str, List[str]]:
-    """Create or load a frozen split file (splits.json) with patient/volume-level holdouts (C-4 fix)."""
+    """Create or load a frozen split file (splits.json) with patient-level holdouts (C-4 fix)."""
     splits_file = Path(data_dir) / "splits.json"
     if splits_file.exists():
         with open(splits_file, "r") as f:
@@ -31,26 +31,33 @@ def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label
     data_dir_path = Path(data_dir)
     image_files = sorted(glob.glob(str(data_dir_path / f"**/*{image_suffix}"), recursive=True))
 
-    all_labeled_ids = []
+    patient_map = {}
     for img_path in image_files:
         base_name = os.path.basename(img_path).replace(image_suffix, "")
         lbl_path = str(data_dir_path / "labels" / f"{base_name}{label_suffix}")
         if not os.path.exists(lbl_path):
             lbl_path = str(Path(img_path).parent / f"{base_name}{label_suffix}")
         if os.path.exists(lbl_path):
-            all_labeled_ids.append(base_name)
+            # Patient-level grouping (C-4 fix): extract patient ID prefix
+            patient_id = base_name.split('_')[0] if '_' in base_name else base_name
+            if patient_id not in patient_map:
+                patient_map[patient_id] = []
+            patient_map[patient_id].append(base_name)
 
+    patient_ids = sorted(list(patient_map.keys()))
     rng = random.Random(seed)
-    shuffled_ids = list(all_labeled_ids)
-    rng.shuffle(shuffled_ids)
+    rng.shuffle(patient_ids)
 
-    n_total = len(shuffled_ids)
-    n_test = max(1, int(n_total * 0.15)) if n_total >= 5 else 0
-    n_val = max(1, int(n_total * 0.15)) if n_total >= 5 else 1
+    n_total_p = len(patient_ids)
+    n_test_p = max(1, int(n_total_p * 0.15)) if n_total_p >= 5 else 0
+    n_val_p = max(1, int(n_total_p * 0.15)) if n_total_p >= 5 else (1 if n_total_p > 1 else 0)
 
-    test_ids = shuffled_ids[:n_test]
-    val_ids = shuffled_ids[n_test:n_test + n_val]
-    train_ids = shuffled_ids[n_test + n_val:]
+    test_patients = set(patient_ids[:n_test_p])
+    val_patients = set(patient_ids[n_test_p:n_test_p + n_val_p])
+
+    test_ids = [vid for pid in test_patients for vid in patient_map[pid]]
+    val_ids = [vid for pid in val_patients for vid in patient_map[pid]]
+    train_ids = [vid for pid in patient_ids[n_test_p + n_val_p:] for vid in patient_map[pid]]
 
     splits = {
         "test_ids": test_ids,
@@ -63,16 +70,30 @@ def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label
     with open(splits_file, "w") as f:
         json.dump(splits, f, indent=4)
 
-    print(f"[DataEngine] Created frozen splits: {len(train_ids)} train, {len(val_ids)} val, {len(test_ids)} test")
+    print(f"[DataEngine] Created patient-level frozen splits: {len(train_ids)} train, {len(val_ids)} val, {len(test_ids)} test")
     return splits
 
 
 def build_labeled_dataset(data_dir: str, image_suffix: str, label_suffix: str,
                           include_ids: Optional[List[str]] = None,
-                          transform=None, cache_dir: Optional[str] = None):
-    """Build dataset for labeled volumes, supporting both human gold labels and approved pseudo-labels (N-2 fix)."""
+                          transform=None, cache_dir: Optional[str] = None,
+                          manifest_path: Optional[str] = None,
+                          use_cache_dataset: bool = True):
+    """Build dataset for labeled volumes with strict manifest provenance gating (P-1 fix) & CacheDataset RAM caching."""
     data_dir_path = Path(data_dir)
     image_files = sorted(glob.glob(str(data_dir_path / f"**/*{image_suffix}"), recursive=True))
+
+    manifest_provenance = {}
+    m_path = manifest_path or str(data_dir_path.parent / "logs" / "pool_manifest.json")
+    if not os.path.exists(m_path):
+        m_path = "./experiments/logs/pool_manifest.json"
+    if os.path.exists(m_path):
+        try:
+            with open(m_path, 'r') as f:
+                state = json.load(f)
+                manifest_provenance = state.get('provenance', {})
+        except Exception:
+            pass
 
     data_dicts = []
     labeled_ids = set()
@@ -90,12 +111,15 @@ def build_labeled_dataset(data_dir: str, image_suffix: str, label_suffix: str,
         if not os.path.exists(lbl_path):
             lbl_path = str(Path(img_path).parent / f"{base_name}{label_suffix}")
 
-        # N-2 fix: Check in approved pseudo-labels directory if human label absent
+        # P-1 fix: Check in approved pseudo-labels directory ONLY if manifest marks it pseudo_approved
         if not os.path.exists(lbl_path):
-            pseudo_candidate = str(data_dir_path / "pseudo" / f"{base_name}{label_suffix}")
-            if os.path.exists(pseudo_candidate):
-                lbl_path = pseudo_candidate
-                provenance = "pseudo_approved"
+            if manifest_provenance.get(base_name) == "pseudo_approved":
+                pseudo_candidate = str(data_dir_path / "pseudo_approved" / f"{base_name}{label_suffix}")
+                if not os.path.exists(pseudo_candidate):
+                    pseudo_candidate = str(data_dir_path / "pseudo" / f"{base_name}{label_suffix}")
+                if os.path.exists(pseudo_candidate):
+                    lbl_path = pseudo_candidate
+                    provenance = "pseudo_approved"
 
         if os.path.exists(lbl_path):
             data_dicts.append({
@@ -106,6 +130,12 @@ def build_labeled_dataset(data_dir: str, image_suffix: str, label_suffix: str,
             })
             labeled_ids.add(base_name)
 
+    if use_cache_dataset and len(data_dicts) > 0:
+        try:
+            return CacheDataset(data=data_dicts, transform=transform, cache_rate=1.0, copy_cache=False), labeled_ids
+        except Exception:
+            pass
+
     if cache_dir is not None:
         os.makedirs(cache_dir, exist_ok=True)
         return PersistentDataset(data=data_dicts, transform=transform, cache_dir=cache_dir), labeled_ids
@@ -115,8 +145,9 @@ def build_labeled_dataset(data_dir: str, image_suffix: str, label_suffix: str,
 
 def build_unlabeled_dataset(data_dir: str, image_suffix: str, labeled_ids: set,
                            exclude_ids: Optional[set] = None,
-                           transform=None, cache_dir: Optional[str] = None):
-    """Build dataset for unlabeled volumes, excluding labeled and frozen test IDs."""
+                           transform=None, cache_dir: Optional[str] = None,
+                           use_cache_dataset: bool = True):
+    """Build dataset for unlabeled volumes with CacheDataset RAM caching."""
     data_dir_path = Path(data_dir)
     image_files = sorted(glob.glob(str(data_dir_path / f"**/*{image_suffix}"), recursive=True))
 
@@ -132,6 +163,12 @@ def build_unlabeled_dataset(data_dir: str, image_suffix: str, labeled_ids: set,
                 "image": img_path,
                 "id": base_name,
             })
+
+    if use_cache_dataset and len(data_dicts) > 0:
+        try:
+            return CacheDataset(data=data_dicts, transform=transform, cache_rate=1.0, copy_cache=False)
+        except Exception:
+            pass
 
     if cache_dir is not None:
         os.makedirs(cache_dir, exist_ok=True)
@@ -155,7 +192,6 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
     if "image" in keys:
         transforms.append(ScaleIntensityRangePercentilesd(keys=["image"], lower=1, upper=99, b_min=0, b_max=1, clip=True))
 
-    # W-3 fix: Wire strong augmentations during training
     if is_training:
         transforms.append(get_strong_augmentation(keys=keys))
 
@@ -163,7 +199,7 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
 
 
 def build_dataloaders(config):
-    """Build train, unlabeled, and FIXED validation dataloaders (C-4 & W-3 fix)."""
+    """Build train, unlabeled, and FIXED validation dataloaders with asymmetric transforms (C-4, N-5, P-1 fix)."""
     splits = get_or_create_frozen_splits(
         config.data_dir,
         image_suffix=config.image_suffix,
@@ -174,10 +210,11 @@ def build_dataloaders(config):
     val_ids_set = set(splits.get("val_ids", []))
     test_ids_set = set(splits.get("test_ids", []))
 
-    # W-3 fix: Apply training augmentations to labeled training dataloader
     train_transforms = get_base_transforms(config, keys=["image", "label"], is_training=True)
     val_transforms = get_base_transforms(config, keys=["image", "label"], is_training=False)
-    unlabeled_transforms = get_base_transforms(config, keys=["image"], is_training=False)
+
+    # N-5 fix: Strong augmentations for student unlabeled stream
+    unlabeled_transforms = get_base_transforms(config, keys=["image"], is_training=True)
 
     cache_dir = getattr(config, 'cache_dir', None)
 
@@ -200,13 +237,7 @@ def build_dataloaders(config):
         base_name = os.path.basename(img_path).replace(config.image_suffix, "")
         if base_name in val_ids_set or base_name in test_ids_set:
             continue
-        lbl_path = str(data_dir_path / "labels" / f"{base_name}{config.label_suffix}")
-        if not os.path.exists(lbl_path):
-            lbl_path = str(Path(img_path).parent / f"{base_name}{config.label_suffix}")
-        if not os.path.exists(lbl_path):
-            lbl_path = str(data_dir_path / "pseudo" / f"{base_name}{config.label_suffix}")
-        if os.path.exists(lbl_path):
-            available_train_labeled.append(base_name)
+        available_train_labeled.append(base_name)
 
     train_ds, train_labeled_ids = build_labeled_dataset(
         config.data_dir,
@@ -262,8 +293,20 @@ def build_all_volumes_loader(config):
                 "id": base_name,
             })
 
+    use_cache_dataset = getattr(config, 'use_cache_dataset', True)
     cache_dir = getattr(config, 'cache_dir', None)
-    if cache_dir is not None:
+
+    if use_cache_dataset and len(data_dicts) > 0:
+        try:
+            dataset = CacheDataset(data=data_dicts, transform=unlabeled_transforms, cache_rate=1.0, copy_cache=False, num_workers=config.num_workers)
+        except Exception:
+            if cache_dir is not None:
+                ssl_cache = os.path.join(cache_dir, "ssl")
+                os.makedirs(ssl_cache, exist_ok=True)
+                dataset = PersistentDataset(data=data_dicts, transform=unlabeled_transforms, cache_dir=ssl_cache)
+            else:
+                dataset = Dataset(data=data_dicts, transform=unlabeled_transforms)
+    elif cache_dir is not None:
         ssl_cache = os.path.join(cache_dir, "ssl")
         os.makedirs(ssl_cache, exist_ok=True)
         dataset = PersistentDataset(data=data_dicts, transform=unlabeled_transforms, cache_dir=ssl_cache)

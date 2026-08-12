@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from monai.transforms import (
     Compose,
+    RandomizableTransform,
     RandFlipd,
     RandRotated,
     RandAffined,
@@ -12,25 +13,29 @@ from monai.transforms import (
 )
 
 
-class RandMultiplicativeSpeckleNoised:
-    """Ultrasound multiplicative Rayleigh speckle noise transform (§7 fix)."""
+class RandMultiplicativeSpeckleNoised(RandomizableTransform):
+    """Ultrasound multiplicative Rayleigh speckle noise transform (N-6 fix)."""
 
     def __init__(self, keys=["image"], prob=0.5, std=0.08):
+        super().__init__(prob=prob)
         self.keys = keys
-        self.prob = prob
         self.std = std
 
+    def randomize(self, data=None):
+        super().randomize(data)
+
     def __call__(self, data_dict):
-        if np.random.rand() > self.prob:
+        self.randomize(data_dict)
+        if not self._do_transform:
             return data_dict
 
         data_dict = dict(data_dict)
         for k in self.keys:
             if k in data_dict:
                 img = data_dict[k]
-                # Rayleigh-like multiplicative noise: I_noisy = I * (1 + N(0, std))
-                noise = 1.0 + torch.randn_like(img) * self.std
-                data_dict[k] = torch.clamp(img * noise, 0.0, 1.0)
+                noise_np = 1.0 + self.R.normal(0.0, self.std, size=img.shape)
+                noise_tensor = torch.from_numpy(noise_np).to(dtype=img.dtype, device=img.device)
+                data_dict[k] = torch.clamp(img * noise_tensor, 0.0, 1.0)
         return data_dict
 
 

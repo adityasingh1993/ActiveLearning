@@ -2,10 +2,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from scipy.spatial.distance import cdist
 from typing import Dict, List, Tuple, Optional, Union, Any
 
 from hassl.training.ema import enable_dropout
+
+
+def _cdist_euclidean(X: np.ndarray, Y: np.ndarray) -> np.ndarray:
+    """Compute Euclidean distance matrix between X [N, D] and Y [M, D] with fallback."""
+    try:
+        from scipy.spatial.distance import cdist
+        return cdist(X, Y, metric='euclidean')
+    except ImportError:
+        x_sq = np.sum(X ** 2, axis=1, keepdims=True)
+        y_sq = np.sum(Y ** 2, axis=1, keepdims=True)
+        d_sq = x_sq + y_sq.T - 2.0 * np.dot(X, Y.T)
+        return np.sqrt(np.maximum(0.0, d_sq))
 
 
 class BALDStrategy:
@@ -82,7 +93,7 @@ class CoreSetStrategy:
         labeled_feats = np.array([self.embeddings[lid] for lid in valid_labeled])
         unlabeled_feats = np.array([self.embeddings[uid] for uid in valid_unlabeled])
 
-        dists = cdist(unlabeled_feats, labeled_feats, metric='euclidean')
+        dists = _cdist_euclidean(unlabeled_feats, labeled_feats)
         min_dists = np.min(dists, axis=1)
 
         result = {uid: float(dist) for uid, dist in zip(valid_unlabeled, min_dists)}
@@ -114,25 +125,40 @@ class CoreSetStrategy:
 
         if valid_labeled:
             labeled_feats = np.array([self.embeddings[lid] for lid in valid_labeled])
-            min_dists = np.min(cdist(unlabeled_feats, labeled_feats, metric='euclidean'), axis=1)
+            min_dists = np.min(_cdist_euclidean(unlabeled_feats, labeled_feats), axis=1)
         else:
             min_dists = np.ones(len(valid_unlabeled))
 
         selected_ids = []
-        scores_dict = {uid: float(d) for uid, d in zip(valid_unlabeled, min_dists)}
+        dynamic_scores = {}
+        n_unlabeled = len(valid_unlabeled)
 
-        # Greedy k-Center Selection loop (M-4 fix)
-        for _ in range(min(k, len(valid_unlabeled))):
+        # Greedy k-Center Selection loop (M-4 & W-2b fix)
+        for rank in range(min(k, n_unlabeled)):
             idx = np.argmax(min_dists)
             chosen_id = valid_unlabeled[idx]
             selected_ids.append(chosen_id)
 
+            # Assign score based on max minimum distance at selection step & selection rank
+            curr_dist = float(min_dists[idx])
+            rank_bonus = 1.0 - (rank / max(1, n_unlabeled))
+            dynamic_scores[chosen_id] = curr_dist * rank_bonus
+
             # Update min_dists with distance to newly chosen center
             chosen_feat = unlabeled_feats[idx:idx + 1]
-            new_dists = cdist(unlabeled_feats, chosen_feat, metric='euclidean').flatten()
+            new_dists = _cdist_euclidean(unlabeled_feats, chosen_feat).flatten()
             min_dists = np.minimum(min_dists, new_dists)
 
-        return selected_ids, scores_dict
+        # Assign remaining unselected items lower default scores based on final min_dists
+        for uid, d in zip(valid_unlabeled, min_dists):
+            if uid not in dynamic_scores:
+                dynamic_scores[uid] = float(d) * 0.1
+
+        for uid in unlabeled_ids:
+            if uid not in dynamic_scores:
+                dynamic_scores[uid] = 0.0
+
+        return selected_ids, dynamic_scores
 
 
 class DisagreementStrategy:
@@ -175,7 +201,7 @@ class DisagreementStrategy:
 
 
 class HybridStrategy:
-    """Hybrid Query Strategy fusing BALD + CoreSet + Disagreement scores (W-2 fix)."""
+    """Hybrid Query Strategy fusing BALD + CoreSet + Disagreement scores with greedy batch diversity (W-2b fix)."""
 
     def __init__(self, bald_strategy, coreset_strategy, disagreement_strategy, alpha=0.4, beta=0.3, gamma=0.3):
         self.bald = bald_strategy
@@ -212,7 +238,7 @@ class HybridStrategy:
                 dis_scores[vid] = float(d_scores[i])
                 unlabeled_ids.append(vid)
 
-        # W-2 fix: Call coreset.query to invoke greedy k-center selection
+        # W-2b fix: Call coreset.query to run greedy k-center selection & receive dynamic rank-weighted diversity scores
         selected_coreset, coreset_scores = self.coreset.query(unlabeled_ids, labeled_ids, k=len(unlabeled_ids))
 
         bald_norm = self._normalize(bald_scores)

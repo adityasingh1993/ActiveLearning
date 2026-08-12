@@ -6,10 +6,11 @@ data_dir: "./data"
 image_suffix: ".mha"
 label_suffix: ".seg.nrrd"
 num_classes: 1                    # 1 = binary (bladder), increase for multi-organ
-spacing: [0.1, 0.1, 0.1]         # Spacingd pixdim — adjust to your ultrasound resolution
+spacing: [0.100, 0.0386, 0.0982]         # Spacingd pixdim — ultrasound volume voxel resolution
 spatial_size: [128, 128, 128]     # Resize target
 val_split: 5                      # Hold out 5 labeled volumes for validation
 cache_dir: "./cache"
+use_cache_dataset: true           # Cache preprocessed 128^3 tensors in RAM for fast epochs
 
 # ─── Compute ──────────────────────────────────────────────────────────
 compute_mode: "prototype"         # "prototype" (8GB) or "full" (24GB)

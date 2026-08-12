@@ -273,17 +273,21 @@ async def accept_volume(vol_id: str):
 
     config = _state["config"]
     label_dir = os.path.join(config.data_dir, "labels")
+    approved_dir = os.path.join(config.data_dir, "pseudo_approved")
     os.makedirs(label_dir, exist_ok=True)
+    os.makedirs(approved_dir, exist_ok=True)
 
     import shutil
     dest = os.path.join(label_dir, f"{vol_id}{config.label_suffix}")
+    dest_approved = os.path.join(approved_dir, f"{vol_id}{config.label_suffix}")
     shutil.copy2(preseg_path, dest)
+    shutil.copy2(preseg_path, dest_approved)
 
     # Update state
     vol["label_path"] = dest
     vol["status"] = "labeled"
 
-    # Update manifest provenance (C-1 fix)
+    # Update manifest provenance (P-1 fix)
     manifest_path = os.path.join(config.log_dir, "pool_manifest.json")
     if os.path.exists(manifest_path):
         try:
@@ -296,6 +300,8 @@ async def accept_volume(vol_id: str):
                 manifest["labeled_ids"].append(vol_id)
             if vol_id in manifest.get("unlabeled_ids", []):
                 manifest["unlabeled_ids"].remove(vol_id)
+            if vol_id in manifest.get("pseudo_ids", []):
+                manifest["pseudo_ids"].remove(vol_id)
             with open(manifest_path, "w") as f:
                 json.dump(manifest, f, indent=4)
         except Exception as e:

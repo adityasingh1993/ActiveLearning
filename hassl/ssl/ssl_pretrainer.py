@@ -137,12 +137,18 @@ class SSLPretrainer:
         return self.ce_loss(sim_matrix, labels)
 
     def train(self, num_epochs: int):
-        self.model.train()
+        log_img_freq = getattr(self.config, 'log_image_every_n_epochs', 10)
 
         for epoch in range(num_epochs):
             epoch_loss = 0.0
+            epoch_inp = 0.0
+            epoch_rot = 0.0
+            epoch_cont = 0.0
+            first_batch_sample = None
 
-            for batch in self.dataloader:
+            should_log_image = ((epoch + 1) % log_img_freq == 0) or (epoch == num_epochs - 1) or (epoch == 0)
+
+            for batch_idx, batch in enumerate(self.dataloader):
                 x = batch['image'].to(self.device)
                 self.optimizer.zero_grad()
 
@@ -161,23 +167,25 @@ class SSLPretrainer:
                     else:
                         loss_inp = self.mse_loss(out_inp, x)
 
-                    # 2. Rotation Prediction on Encoder Bottleneck Features (H-4 fix)
+                    # 2 & 3. Rotation & Contrastive Learning via single batched bottleneck forward pass (GPU Speedup)
                     x_rot, rot_labels = self._apply_rotation(x)
-                    bottleneck_rot = self._extract_bottleneck_features(x_rot)
-                    rot_feats = F.adaptive_avg_pool3d(bottleneck_rot, 1).view(x.size(0), -1)
-                    rot_preds = self.rot_head(rot_feats)
-                    loss_rot = self.ce_loss(rot_preds, rot_labels)
-
-                    # 3. Contrastive Learning on Encoder Bottleneck Features (H-4 & H-5 fix)
                     x_aug1 = x + torch.randn_like(x) * 0.05
                     x_aug2 = x + torch.randn_like(x) * 0.05
 
-                    b1 = self._extract_bottleneck_features(x_aug1)
-                    b2 = self._extract_bottleneck_features(x_aug2)
+                    B = x.size(0)
+                    x_combined = torch.cat([x_rot, x_aug1, x_aug2], dim=0)
+                    bottlenecks = self._extract_bottleneck_features(x_combined)
 
-                    feat1 = self.proj_head(F.adaptive_avg_pool3d(b1, 1).view(x.size(0), -1))
-                    feat2 = self.proj_head(F.adaptive_avg_pool3d(b2, 1).view(x.size(0), -1))
+                    b_rot = bottlenecks[:B]
+                    b1 = bottlenecks[B:2*B]
+                    b2 = bottlenecks[2*B:]
 
+                    rot_feats = F.adaptive_avg_pool3d(b_rot, 1).view(B, -1)
+                    rot_preds = self.rot_head(rot_feats)
+                    loss_rot = self.ce_loss(rot_preds, rot_labels)
+
+                    feat1 = self.proj_head(F.adaptive_avg_pool3d(b1, 1).view(B, -1))
+                    feat2 = self.proj_head(F.adaptive_avg_pool3d(b2, 1).view(B, -1))
                     loss_cont = self._infonce_loss(feat1, feat2, temperature=getattr(self.config, 'ssl_contrastive_temp', 0.07))
 
                     loss = loss_inp + loss_rot + loss_cont
@@ -187,10 +195,35 @@ class SSLPretrainer:
                 self.scaler.update()
 
                 epoch_loss += loss.item()
+                epoch_inp += loss_inp.item()
+                epoch_rot += loss_rot.item()
+                epoch_cont += loss_cont.item()
 
-            avg_loss = epoch_loss / max(1, len(self.dataloader))
-            print(f"  [SSL Pre-train] Epoch {epoch + 1:3d}/{num_epochs} | Loss: {avg_loss:.4f}")
-            self.tracker.log_metrics({'ssl_loss': avg_loss}, step=epoch)
+                if first_batch_sample is None and should_log_image:
+                    first_batch_sample = (
+                        x[0].detach().cpu(),
+                        x_masked[0].detach().cpu(),
+                        out_inp[0].detach().cpu()
+                    )
+
+            N = max(1, len(self.dataloader))
+            avg_loss = epoch_loss / N
+            avg_inp = epoch_inp / N
+            avg_rot = epoch_rot / N
+            avg_cont = epoch_cont / N
+
+            print(f"  [SSL Pre-train] Epoch {epoch + 1:3d}/{num_epochs} | "
+                  f"Loss: {avg_loss:.4f} (Inp: {avg_inp:.4f}, Rot: {avg_rot:.4f}, Cont: {avg_cont:.4f})")
+
+            self.tracker.log_metrics({
+                'ssl_loss': avg_loss,
+                'ssl_loss_inpainting': avg_inp,
+                'ssl_loss_rotation': avg_rot,
+                'ssl_loss_contrastive': avg_cont,
+            }, step=epoch)
+
+            if should_log_image and first_batch_sample is not None:
+                self.log_ssl_inpainting_samples(epoch, *first_batch_sample)
 
         ckpt_dir = getattr(self.config, 'checkpoint_dir', './experiments/checkpoints')
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -198,6 +231,46 @@ class SSLPretrainer:
         torch.save(self.model.state_dict(), save_path)
         self.tracker.log_artifact(save_path, name="ssl_pretrained_weights")
         print(f"  Pre-trained model saved to {save_path}")
+
+    def log_ssl_inpainting_samples(self, epoch: int, orig_t: torch.Tensor, masked_t: torch.Tensor, inp_t: torch.Tensor):
+        """Generate and log 3-panel SSL inpainting preview grid (Original | Masked | Inpainted)."""
+        try:
+            import numpy as np
+            orig_np = orig_t[0].numpy()
+            masked_np = masked_t[0].numpy()
+            inp_np = inp_t[0].numpy()
+
+            slice_idx = orig_np.shape[0] // 2
+
+            s_orig = orig_np[slice_idx]
+            s_masked = masked_np[slice_idx]
+            s_inp = inp_np[slice_idx]
+
+            def norm_uint8(arr):
+                mn, mx = arr.min(), arr.max()
+                norm = (arr - mn) / (mx - mn + 1e-8) * 255.0
+                return norm.astype(np.uint8)
+
+            p1_gray = norm_uint8(s_orig)
+            p2_gray = norm_uint8(s_masked)
+            p3_gray = norm_uint8(s_inp)
+
+            p1 = np.stack([p1_gray] * 3, axis=-1)
+            p2 = np.stack([p2_gray] * 3, axis=-1)
+            p3 = np.stack([p3_gray] * 3, axis=-1)
+
+            grid_img = np.concatenate([p1, p2, p3], axis=1)
+            log_dir = getattr(self.config, 'log_dir', './experiments/logs')
+
+            self.tracker.log_image(
+                grid_img,
+                name="ssl_inpainting_preview",
+                step=epoch,
+                caption=f"SSL Epoch {epoch} Inpainting Slice {slice_idx} (Original | 30% Masked | Model Inpainting)",
+                save_local_dir=os.path.join(log_dir, "ssl_previews")
+            )
+        except Exception as e:
+            print(f"  [Warning] Failed to generate SSL inpainting preview image: {e}")
 
     def get_encoder(self):
         """Return the pre-trained encoder model."""
