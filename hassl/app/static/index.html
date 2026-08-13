@@ -79,6 +79,15 @@
             <button id="tool-holes" class="btn-tool" onclick="fillHoles()" title="Fill Holes (seal interior hollow cavities)">
                 🕳️ Fill Holes
             </button>
+            <button id="btn-undo" class="btn-tool" onclick="undo()" title="Undo Last Mask Action (Ctrl+Z)">
+                ↩️ Undo
+            </button>
+            <button id="btn-redo" class="btn-tool" onclick="redo()" title="Redo Last Mask Action (Ctrl+Y)">
+                ↪️ Redo
+            </button>
+            <button id="btn-clear" class="btn-tool btn-danger-tool" onclick="clearSlice()" title="Clear Slice Mask (Delete)">
+                🗑️ Clear
+            </button>
         </div>
 
         <div class="tool-divider"></div>

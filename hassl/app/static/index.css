@@ -156,6 +156,11 @@ body.slicer-theme {
     border-color: var(--accent-color);
 }
 
+.btn-danger-tool:hover {
+    border-color: var(--accent-danger);
+    color: var(--accent-danger);
+}
+
 .btn-tool.active {
     background-color: var(--accent-color);
     color: #000;

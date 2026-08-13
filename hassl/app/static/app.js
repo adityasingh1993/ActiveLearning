@@ -2,8 +2,9 @@
  * 3D Slicer HASSL Multi-Planar Annotation Studio (app.js)
  *
  * Implements 4-quadrant synchronized MPR viewports (Axial, Coronal, Sagittal)
- * with 3D crosshair navigation, flood fill, window/level contrast control,
- * distance measurement ruler in mm, brush, eraser, and active learning save workflow.
+ * with 3D crosshair navigation, interactive Lasso Cut, Paint/Erase, Flood Fill,
+ * Keep Largest Island, Fill Holes, Undo (Ctrl+Z), Redo (Ctrl+Y), Clear Mask (Delete),
+ * Window/Level contrast control, and Distance Ruler tool.
  */
 
 const state = {
@@ -14,15 +15,19 @@ const state = {
     maxSlices: { axial: 128, coronal: 128, sagittal: 128 },
     spacing: [1.0, 1.0, 1.0],               // [sp_z, sp_y, sp_x] in mm
     filter: 'all',
-    currentTool: 'crosshair',               // 'crosshair', 'brush', 'eraser', 'fill', 'winlevel', 'ruler'
+    currentTool: 'crosshair',               // 'crosshair', 'brush', 'eraser', 'fill', 'lasso', 'winlevel', 'ruler'
     brushRadius: 8,
     opacity: 0.4,
     showCrosshairs: true,
     winLevel: { window: 255, level: 128 },  // WW / WL contrast
     masks2D: { axial: null, coronal: null, sagittal: null },
     maskShapes: { axial: [0, 0], coronal: [0, 0], sagittal: [0, 0] },
+    undoStacks: { axial: [], coronal: [], sagittal: [] },
+    redoStacks: { axial: [], coronal: [], sagittal: [] },
     rulerPoints: [],                        // [{x, y}, {x, y}] for distance tool
+    lassoPoints: [],                        // [{x, y}, ...] for freehand polygon tool
     isDrawing: false,
+    isLassoDrawing: false,
     activeViewport: 'axial',
 };
 
@@ -51,6 +56,25 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Global Hotkeys
     document.addEventListener('keydown', (e) => {
         if (!state.currentVolume) return;
+
+        // Undo / Redo / Delete Hotkeys
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+            e.preventDefault();
+            if (e.shiftKey) redo();
+            else undo();
+            return;
+        }
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) {
+            e.preventDefault();
+            redo();
+            return;
+        }
+        if (e.key === 'Delete' || e.key === 'Backspace') {
+            e.preventDefault();
+            clearSlice();
+            return;
+        }
+
         switch (e.key) {
             case '1': setDrawTool('crosshair'); break;
             case '2': setDrawTool('brush'); break;
@@ -74,11 +98,73 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 });
 
+// ─── Undo / Redo / History Management ────────────────────────────────
+
+function pushHistory(axis = state.activeViewport) {
+    const mask = state.masks2D[axis];
+    if (!mask) return;
+    const shape = state.maskShapes[axis];
+
+    // Deep clone 2D mask array
+    const snapshot = mask.map(row => new Uint8Array(row));
+    state.undoStacks[axis].push(snapshot);
+    if (state.undoStacks[axis].length > 30) {
+        state.undoStacks[axis].shift();  // Cap history at 30 steps
+    }
+    state.redoStacks[axis] = [];  // Clear redo stack on new action
+}
+
+function undo(axis = state.activeViewport) {
+    const stack = state.undoStacks[axis];
+    if (!stack || stack.length === 0) {
+        showToast('Nothing to undo');
+        return;
+    }
+    const currentMask = state.masks2D[axis];
+    if (currentMask) {
+        const snapshot = currentMask.map(row => new Uint8Array(row));
+        state.redoStacks[axis].push(snapshot);
+    }
+    state.masks2D[axis] = stack.pop();
+    showToast(`Undo edit on ${axis.toUpperCase()}`);
+    renderViewportCanvas(axis);
+}
+
+function redo(axis = state.activeViewport) {
+    const stack = state.redoStacks[axis];
+    if (!stack || stack.length === 0) {
+        showToast('Nothing to redo');
+        return;
+    }
+    const currentMask = state.masks2D[axis];
+    if (currentMask) {
+        const snapshot = currentMask.map(row => new Uint8Array(row));
+        state.undoStacks[axis].push(snapshot);
+    }
+    state.masks2D[axis] = stack.pop();
+    showToast(`Redo edit on ${axis.toUpperCase()}`);
+    renderViewportCanvas(axis);
+}
+
+function clearSlice(axis = state.activeViewport) {
+    const mask = state.masks2D[axis];
+    if (!mask) return;
+    pushHistory(axis);
+    for (let y = 0; y < mask.length; y++) {
+        mask[y].fill(0);
+    }
+    showToast(`Cleared ${axis.toUpperCase()} slice mask`);
+    renderViewportCanvas(axis);
+}
+
 // ─── Slicer Tool Selection ──────────────────────────────────────────
 
 function setDrawTool(tool) {
     state.currentTool = tool;
     state.rulerPoints = [];
+    state.lassoPoints = [];
+    state.isLassoDrawing = false;
+
     document.querySelectorAll('.btn-tool').forEach(btn => btn.classList.remove('active'));
     const activeBtn = document.getElementById(`tool-${tool}`);
     if (activeBtn) activeBtn.classList.add('active');
@@ -88,6 +174,7 @@ function setDrawTool(tool) {
         brush: '🖌️ Paint Brush',
         eraser: '🧹 Erase Brush',
         fill: '🪣 Flood Fill',
+        lasso: '✂️ Lasso / Scissors Cut (Click & drag polygon)',
         winlevel: '🌗 Window / Level Contrast',
         ruler: '📏 Physical Distance Ruler (mm)'
     };
@@ -128,13 +215,20 @@ function initViewportCanvas(axis) {
 
         if (state.currentTool === 'crosshair') {
             update3DCursorFromViewport(axis, pt.x, pt.y);
+        } else if (state.currentTool === 'lasso') {
+            pushHistory(axis);
+            state.lassoPoints = [pt];
+            state.isLassoDrawing = true;
+            renderViewportCanvas(axis);
         } else if (state.currentTool === 'fill') {
+            pushHistory(axis);
             floodFill(axis, pt.x, pt.y);
         } else if (state.currentTool === 'ruler') {
             addRulerPoint(axis, pt);
         } else if (state.currentTool === 'winlevel') {
             dragStartWW = { x: pt.clientX, y: pt.clientY, ww: state.winLevel.window, wl: state.winLevel.level };
         } else if (state.currentTool === 'brush' || state.currentTool === 'eraser') {
+            pushHistory(axis);
             state.isDrawing = true;
             applyBrushStroke(axis, pt);
         }
@@ -146,6 +240,9 @@ function initViewportCanvas(axis) {
 
         if (state.currentTool === 'crosshair' && e.buttons === 1) {
             update3DCursorFromViewport(axis, pt.x, pt.y);
+        } else if (state.currentTool === 'lasso' && state.isLassoDrawing) {
+            state.lassoPoints.push(pt);
+            renderViewportCanvas(axis);
         } else if (state.currentTool === 'winlevel' && dragStartWW && e.buttons === 1) {
             const dx = pt.clientX - dragStartWW.x;
             const dy = pt.clientY - dragStartWW.y;
@@ -158,6 +255,10 @@ function initViewportCanvas(axis) {
     };
 
     const handlePointerUp = () => {
+        if (state.currentTool === 'lasso' && state.isLassoDrawing) {
+            state.isLassoDrawing = false;
+            finishLassoCut(axis);
+        }
         state.isDrawing = false;
         dragStartWW = null;
     };
@@ -178,15 +279,12 @@ function initViewportCanvas(axis) {
 
 function update3DCursorFromViewport(axis, ptX, ptY) {
     if (axis === 'axial') {
-        // Axial slice is (Z). ptX maps to Sagittal (X), ptY maps to Coronal (Y)
         state.cursor.x = Math.max(0, Math.min(ptX, state.maxSlices.sagittal - 1));
         state.cursor.y = Math.max(0, Math.min(ptY, state.maxSlices.coronal - 1));
     } else if (axis === 'coronal') {
-        // Coronal slice is (Y). ptX maps to Sagittal (X), ptY maps to Axial (Z)
         state.cursor.x = Math.max(0, Math.min(ptX, state.maxSlices.sagittal - 1));
         state.cursor.z = Math.max(0, Math.min(ptY, state.maxSlices.axial - 1));
     } else if (axis === 'sagittal') {
-        // Sagittal slice is (X). ptX maps to Coronal (Y), ptY maps to Axial (Z)
         state.cursor.y = Math.max(0, Math.min(ptX, state.maxSlices.coronal - 1));
         state.cursor.z = Math.max(0, Math.min(ptY, state.maxSlices.axial - 1));
     }
@@ -207,7 +305,7 @@ function onViewportSliderChange(axis, value) {
     updateAllViewports();
 }
 
-// ─── Brush & Flood Fill ──────────────────────────────────────────────
+// ─── Brush & Flood Fill & Lasso ──────────────────────────────────────
 
 function applyBrushStroke(axis, pt) {
     const mask = state.masks2D[axis];
@@ -256,12 +354,60 @@ function floodFill(axis, startX, startY) {
     renderViewportCanvas(axis);
 }
 
+function finishLassoCut(axis) {
+    const mask = state.masks2D[axis];
+    const pts = state.lassoPoints;
+    if (!mask || pts.length < 3) {
+        state.lassoPoints = [];
+        renderViewportCanvas(axis);
+        return;
+    }
+
+    const shape = state.maskShapes[axis];
+    const [h, w] = shape;
+
+    // Use offscreen 2D canvas context for accurate polygon rasterization
+    const canvasOff = document.createElement('canvas');
+    canvasOff.width = w;
+    canvasOff.height = h;
+    const ctxOff = canvasOff.getContext('2d');
+
+    ctxOff.fillStyle = '#ffffff';
+    ctxOff.beginPath();
+    ctxOff.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) {
+        ctxOff.lineTo(pts[i].x, pts[i].y);
+    }
+    ctxOff.closePath();
+    ctxOff.fill();
+
+    const imgData = ctxOff.getImageData(0, 0, w, h);
+    const data = imgData.data;
+
+    let filledCount = 0;
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            const idx = (y * w + x) * 4;
+            if (data[idx + 3] > 128) {
+                mask[y][x] = 1;  // Fill polygon interior with mask label
+                filledCount++;
+            }
+        }
+    }
+
+    state.lassoPoints = [];
+    showToast(`Filled Lasso polygon (${filledCount} voxels)`);
+    renderViewportCanvas(axis);
+}
+
 // ─── 3D Slicer Segment Processing Tools ──────────────────────────────
 
 function keepLargestIsland(axis = state.activeViewport) {
     const mask = state.masks2D[axis];
     const shape = state.maskShapes[axis];
     if (!mask || !shape[0]) return;
+    pushHistory(axis);
+
     const [h, w] = shape;
     const visited = Array.from({ length: h }, () => new Uint8Array(w));
     let maxComponent = [];
@@ -302,6 +448,8 @@ function fillHoles(axis = state.activeViewport) {
     const mask = state.masks2D[axis];
     const shape = state.maskShapes[axis];
     if (!mask || !shape[0]) return;
+    pushHistory(axis);
+
     const [h, w] = shape;
     const bg = Array.from({ length: h }, () => new Uint8Array(w));
     const stack = [];
@@ -356,12 +504,11 @@ function addRulerPoint(axis, pt) {
     renderViewportCanvas(axis);
 }
 
-// ─── Rendering Viewports & Crosshairs ────────────────────────────────
+// ─── Rendering Viewports & Crosshairs & Lasso Preview ───────────────
 
 function updateAllViewports() {
     if (!state.currentVolume) return;
 
-    // Update Sliders & HUD Text
     document.getElementById('slider-axial').value = state.cursor.z;
     document.getElementById('slider-coronal').value = state.cursor.y;
     document.getElementById('slider-sagittal').value = state.cursor.x;
@@ -393,7 +540,6 @@ async function fetchAndRenderSlice(axis, index) {
     const url = `/api/volume/${state.currentVolume}/slice?axis=${axis}&index=${index}&overlay=false`;
     imgEl.src = url;
 
-    // Fetch mask slice
     try {
         const data = await api(`/volume/${state.currentVolume}/mask_slice?axis=${axis}&index=${index}`);
         if (data.encoding === 'rle' && data.mask_rle) {
@@ -458,6 +604,24 @@ function renderViewportCanvas(axis) {
             }
         }
         ctx.putImageData(imgData, 0, 0);
+    }
+
+    // Draw Live Lasso Polygon Path Preview
+    if (state.currentTool === 'lasso' && state.lassoPoints.length > 1 && state.activeViewport === axis) {
+        ctx.strokeStyle = '#ffcc00';  // Slicer yellow dashed line
+        ctx.fillStyle = 'rgba(255, 204, 0, 0.2)';
+        ctx.setLineDash([4, 4]);
+        ctx.lineWidth = 2;
+
+        ctx.beginPath();
+        ctx.moveTo(state.lassoPoints[0].x, state.lassoPoints[0].y);
+        for (let i = 1; i < state.lassoPoints.length; i++) {
+            ctx.lineTo(state.lassoPoints[i].x, state.lassoPoints[i].y);
+        }
+        ctx.closePath();
+        ctx.stroke();
+        ctx.fill();
+        ctx.setLineDash([]);  // Reset line dash
     }
 
     // Draw 3D Crosshairs
@@ -542,6 +706,9 @@ async function selectVolume(volId) {
         state.maxSlices = info.num_slices;
         state.spacing = info.spacing || [1.0, 1.0, 1.0];
         state.status = info.status;
+
+        state.undoStacks = { axial: [], coronal: [], sagittal: [] };
+        state.redoStacks = { axial: [], coronal: [], sagittal: [] };
 
         state.cursor = {
             z: Math.floor(info.num_slices.axial / 2),
