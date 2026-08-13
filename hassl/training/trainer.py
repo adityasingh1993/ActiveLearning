@@ -327,6 +327,7 @@ class HASSLTrainer:
 
                 loss = loss_sup + unsup_weight * loss_unsup
 
+            self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.net_A.parameters(), max_norm=12.0)  # V10-5 fix: Gradient clipping
             self.scaler.step(self.optimizer)
@@ -428,6 +429,7 @@ class HASSLTrainer:
 
                 loss = loss_sup_A + loss_sup_B + unsup_weight * (loss_cps_A + loss_cps_B)
 
+            self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer_A)
             self.scaler.unscale_(self.optimizer_B)
             torch.nn.utils.clip_grad_norm_(self.net_A.parameters(), max_norm=12.0)  # V10-5 fix: Gradient clipping
