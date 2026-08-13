@@ -205,7 +205,7 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
       Resized regardless of mode for OOM-safe whole-volume inference.
     """
     mode = tuple(["bilinear" if k == "image" else "nearest" for k in keys])
-    resize_mode = tuple(["area" if k == "image" else "nearest" for k in keys])
+    resize_mode = tuple(["trilinear" if k == "image" else "nearest" for k in keys])
     preprocessing_mode = getattr(config, 'preprocessing_mode', 'resize')
 
     transforms = [

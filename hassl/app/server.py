@@ -19,6 +19,7 @@ Endpoints:
 
 import argparse
 import io
+import logging
 import os
 import json
 import glob
@@ -27,6 +28,8 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 try:
     from fastapi import FastAPI, HTTPException, Query
@@ -575,14 +578,16 @@ async def segment_op(vol_id: str, body: dict):
 
     if op == "largest_island":
         try:
-            from scipy.ndimage import label
-            labeled, num_features = label(mask_3d > 0)
+            from scipy.ndimage import label as ndi_label
+            labeled, num_features = ndi_label(mask_3d > 0)
             if num_features > 0:
-                sizes = [np.sum(labeled == i) for i in range(1, num_features + 1)]
-                largest_label = np.argmax(sizes) + 1
+                # O(N) bincount instead of quadratic list comprehension
+                counts = np.bincount(labeled.ravel())
+                counts[0] = 0  # ignore background
+                largest_label = int(counts.argmax())
                 mask_3d = (labeled == largest_label).astype(np.uint8)
-        except Exception:
-            pass  # Fallback if scipy unavailable
+        except Exception as e:
+            logger.warning("[HASSL] largest_island scipy fallback failed: %s", e)
         _state["cached_presegs"][vol_id] = mask_3d
         return {"message": f"Kept largest 3D component in {vol_id}"}
 
@@ -590,8 +595,8 @@ async def segment_op(vol_id: str, body: dict):
         try:
             from scipy.ndimage import binary_fill_holes
             mask_3d = binary_fill_holes(mask_3d > 0).astype(np.uint8)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[HASSL] fill_holes scipy fallback failed: %s", e)
         _state["cached_presegs"][vol_id] = mask_3d
         return {"message": f"Filled all 3D interior holes in {vol_id}"}
 
@@ -656,14 +661,35 @@ async def accept_volume(vol_id: str):
     approved_dir = os.path.join(config.data_dir, "pseudo_approved")
     os.makedirs(approved_dir, exist_ok=True)
 
-    import shutil
     dest_approved = os.path.join(approved_dir, f"{vol_id}{config.label_suffix}")
-    # V-4 (A-1) fix: Write strictly to pseudo_approved, NEVER to data/labels/ (gold directory)
-    shutil.copy2(preseg_path, dest_approved)
+    provenance_tag = "pseudo_approved"
+
+    # C-1 fix: prefer the in-memory edited mask over the raw preseg file.
+    # Any 3D lasso / island / hole edits live in cached_presegs; copying the
+    # preseg file directly discards all annotator work silently.
+    edited_mask = _state["cached_presegs"].get(vol_id) if _state["cached_presegs"] else None
+    if edited_mask is not None:
+        # Write the edited in-memory mask with spatial metadata preserved.
+        try:
+            ref_path = vol.get("image_path") or preseg_path
+            from hassl.data.nrrd_utils import write_mask_with_spatial_geometry
+            write_mask_with_spatial_geometry(dest_approved, edited_mask, reference_image_path=ref_path)
+            provenance_tag = "human_corrected"
+        except Exception as e:
+            logger.warning(
+                "[HASSL] accept_volume: could not write edited mask via write_mask_with_spatial_geometry "
+                "(%s); falling back to copying preseg file.", e
+            )
+            import shutil
+            shutil.copy2(preseg_path, dest_approved)
+    else:
+        # No in-memory edits — annotator accepted without changes.
+        import shutil
+        shutil.copy2(preseg_path, dest_approved)
 
     # Update state
     vol["label_path"] = dest_approved
-    vol["status"] = "pseudo_approved"
+    vol["status"] = provenance_tag
 
     # Update manifest provenance (P-1 fix)
     manifest_path = os.path.join(config.log_dir, "pool_manifest.json")
@@ -673,7 +699,7 @@ async def accept_volume(vol_id: str):
                 manifest = json.load(f)
             if "provenance" not in manifest:
                 manifest["provenance"] = {}
-            manifest["provenance"][vol_id] = "pseudo_approved"
+            manifest["provenance"][vol_id] = provenance_tag
             if vol_id not in manifest.get("labeled_ids", []):
                 manifest["labeled_ids"].append(vol_id)
             if vol_id in manifest.get("unlabeled_ids", []):

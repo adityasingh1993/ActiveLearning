@@ -1,7 +1,10 @@
+import logging
 import os
 from typing import Dict, Optional
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
 import torch.nn as nn
 import monai
 from monai.networks.nets import UNet, DynUNet, SwinUNETR
@@ -569,11 +572,31 @@ class HASSLTrainer:
                         nearest_interp=True,
                         to_tensor=True,
                     )
+                    from monai.data import MetaTensor
+                    # Wrap predictions as MetaTensors carrying the input's transform trace.
+                    # Without this, Invertd has no applied_operations to invert and returns
+                    # the tensor unchanged (the silent no-op identified in round 13).
+                    pred_mt = MetaTensor(
+                        preds_binary[b].clone(),
+                        meta=inputs[b].meta if hasattr(inputs[b], 'meta') else {},
+                        applied_operations=(
+                            inputs[b].applied_operations
+                            if hasattr(inputs[b], 'applied_operations') else []
+                        ),
+                    )
+                    pred_lcc_mt = MetaTensor(
+                        preds_binary_lcc[b].clone(),
+                        meta=inputs[b].meta if hasattr(inputs[b], 'meta') else {},
+                        applied_operations=(
+                            inputs[b].applied_operations
+                            if hasattr(inputs[b], 'applied_operations') else []
+                        ),
+                    )
                     sample = {
                         "image": inputs[b],
                         "label": targets[b].clone(),
-                        "pred": preds_binary[b].clone(),
-                        "pred_lcc": preds_binary_lcc[b].clone(),
+                        "pred": pred_mt,
+                        "pred_lcc": pred_lcc_mt,
                     }
                     if 'image_meta_dict' in batch_data:
                         sample["image_meta_dict"] = {
@@ -602,7 +625,11 @@ class HASSLTrainer:
                     pv_mm3 = float(inv_pred.sum().item()) * orig_voxel_vol
                     pv_mm3_lcc = float(inv_pred_lcc.sum().item()) * orig_voxel_vol
                     gv_mm3 = float(inv_gt.sum().item()) * orig_voxel_vol
-                except Exception:
+                except Exception as e:
+                    logger.warning(
+                        "[HASSL] validate Invertd failed for sample %d, "
+                        "falling back to resized-space volume: %s", b, e
+                    )
                     voxel_vol = float(
                         self.config.spacing[0]
                         * self.config.spacing[1]

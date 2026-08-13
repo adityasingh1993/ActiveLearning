@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import glob
 import time
@@ -7,6 +8,8 @@ import torch
 import numpy as np
 
 from hassl.data.nrrd_utils import write_mask_with_spatial_geometry
+
+logger = logging.getLogger(__name__)
 
 
 class QueryEngine:
@@ -127,9 +130,11 @@ class QueryEngine:
                     to_tensor=True,
                 )
 
+                # pred_tensor[index] gives a 4-D tensor [C,D,H,W] — correct for Invertd.
+                # pred_tensor[index:index+1] gives 5-D [1,C,D,H,W] — raises RuntimeError.
                 sample = {
                     "image": image_tensor[index].detach().cpu(),
-                    "pred": pred_tensor[index:index + 1].detach().cpu(),
+                    "pred": pred_tensor[index].detach().cpu(),
                 }
                 if 'image_meta_dict' in batch_data:
                     sample["image_meta_dict"] = {
@@ -142,8 +147,10 @@ class QueryEngine:
                 if inv_pred.ndim == 4:
                     inv_pred = inv_pred[0]
                 return (inv_pred > 0.5).numpy().astype(np.uint8)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "[HASSL] _invert_prediction Invertd failed, returning resized-space mask: %s", e
+                )
 
         return (pred_tensor[index, 0] > 0.5).cpu().numpy().astype(np.uint8)
 
