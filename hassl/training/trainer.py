@@ -1,5 +1,5 @@
 import os
-from typing import Dict
+from typing import Dict, Optional
 import numpy as np
 import torch
 import torch.nn as nn
@@ -72,6 +72,31 @@ def compute_multiscale_loss(criterion, preds, target):
     else:
         l = criterion(preds, target)
         return l.mean() if l.ndim > 0 else l
+
+
+def apply_keep_largest_cc(pred_tensor: torch.Tensor) -> torch.Tensor:
+    """Keep only the largest connected component in a binary prediction batch."""
+    try:
+        from monai.transforms import KeepLargestConnectedComponent
+        transform = KeepLargestConnectedComponent(applied_labels=None)
+        lcc_samples = [transform(pred_tensor[b]) for b in range(pred_tensor.size(0))]
+        return torch.stack(lcc_samples)
+    except Exception:
+        import scipy.ndimage as ndi
+        arr = pred_tensor.detach().cpu().numpy()
+        out = np.zeros_like(arr)
+        for b in range(arr.shape[0]):
+            for c in range(arr.shape[1]):
+                mask = arr[b, c] > 0.5
+                if not mask.any():
+                    continue
+                labeled_arr, num = ndi.label(mask)
+                if num > 0:
+                    counts = np.bincount(labeled_arr.ravel())
+                    counts[0] = 0
+                    max_lab = counts.argmax()
+                    out[b, c] = (labeled_arr == max_lab).astype(arr.dtype)
+        return torch.from_numpy(out).to(pred_tensor.device)
 
 
 class EarlyStopping:
@@ -465,14 +490,19 @@ class HASSLTrainer:
         self.dice_metric.reset()
 
         from monai.inferers import SlidingWindowInferer
-        from monai.metrics import ConfusionMatrixMetric, HausdorffDistanceMetric
+        from monai.metrics import ConfusionMatrixMetric, HausdorffDistanceMetric, DiceMetric
 
+        dice_metric_lcc = DiceMetric(include_background=False if self.num_classes > 1 else True, reduction="mean")
         confusion_metric = ConfusionMatrixMetric(
             include_background=False if self.num_classes > 1 else True,
             metric_name=["precision", "recall"],
             reduction="mean"
         )
-        # V-6 fix: Pass physical spacing to HD95 metric
+        confusion_metric_lcc = ConfusionMatrixMetric(
+            include_background=False if self.num_classes > 1 else True,
+            metric_name=["precision", "recall"],
+            reduction="mean"
+        )
         hd95_metric = HausdorffDistanceMetric(
             include_background=False if self.num_classes > 1 else True,
             percentile=95,
@@ -480,6 +510,7 @@ class HASSLTrainer:
         )
 
         pred_vols_mm3 = []
+        pred_vols_mm3_lcc = []
         gt_vols_mm3 = []
         first_batch_sample = None
 
@@ -501,16 +532,23 @@ class HASSLTrainer:
                 else:
                     preds_binary = torch.argmax(preds, dim=1, keepdim=True).float()
 
+            preds_binary_lcc = apply_keep_largest_cc(preds_binary)
+
             if first_batch_sample is None and should_log_image:
-                first_batch_sample = (inputs[0].detach().cpu(), targets[0].detach().cpu(), preds_binary[0].detach().cpu())
+                first_batch_sample = (
+                    inputs[0].detach().cpu(),
+                    targets[0].detach().cpu(),
+                    preds_binary[0].detach().cpu(),
+                    preds_binary_lcc[0].detach().cpu(),
+                )
 
             self.dice_metric(y_pred=preds_binary, y=targets)
-            confusion_metric(y_pred=preds_binary, y=targets)
+            dice_metric_lcc(y_pred=preds_binary_lcc, y=targets)
 
-            # Volume in original space: invert Resized⁻¹ → Spacingd⁻¹ on the binary
-            # prediction mask so voxel counts reflect the native scan resolution.
+            confusion_metric(y_pred=preds_binary, y=targets)
+            confusion_metric_lcc(y_pred=preds_binary_lcc, y=targets)
+
             for b in range(inputs.size(0)):
-                # --- original affine (written by LoadImaged) ---
                 orig_affine = None
                 if hasattr(inputs, 'meta'):
                     orig_affine = inputs.meta.get('original_affine', None)
@@ -521,17 +559,14 @@ class HASSLTrainer:
                     if orig_affine is None and 'original_affine' in meta:
                         orig_affine = meta['original_affine'][b]
 
-                # --- Invertd: warp prediction back to original voxel space ---
                 try:
                     from monai.transforms import Invertd
-                    # Temporarily attach the prediction into a meta-dict so
-                    # Invertd can trace the stored transform parameters.
                     inv_transform = Invertd(
-                        keys=["pred", "label"],
+                        keys=["pred", "pred_lcc", "label"],
                         transform=self.val_transform,
-                        orig_keys=["image", "label"],
-                        meta_keys=["pred_meta_dict", "label_meta_dict"],
-                        orig_meta_keys=["image_meta_dict", "label_meta_dict"],
+                        orig_keys=["image", "image", "label"],
+                        meta_keys=["pred_meta_dict", "pred_lcc_meta_dict", "label_meta_dict"],
+                        orig_meta_keys=["image_meta_dict", "image_meta_dict", "label_meta_dict"],
                         nearest_interp=True,
                         to_tensor=True,
                     )
@@ -539,6 +574,7 @@ class HASSLTrainer:
                         "image": inputs[b],
                         "label": targets[b].clone(),
                         "pred": preds_binary[b].clone(),
+                        "pred_lcc": preds_binary_lcc[b].clone(),
                     }
                     if 'image_meta_dict' in batch_data:
                         sample["image_meta_dict"] = {
@@ -550,6 +586,7 @@ class HASSLTrainer:
                         }
                     inv_out = inv_transform(sample)
                     inv_pred = inv_out["pred"]
+                    inv_pred_lcc = inv_out["pred_lcc"]
                     inv_gt = inv_out["label"]
 
                     if orig_affine is not None and torch.is_tensor(orig_affine):
@@ -564,29 +601,18 @@ class HASSLTrainer:
                         )
 
                     pv_mm3 = float(inv_pred.sum().item()) * orig_voxel_vol
+                    pv_mm3_lcc = float(inv_pred_lcc.sum().item()) * orig_voxel_vol
                     gv_mm3 = float(inv_gt.sum().item()) * orig_voxel_vol
-                except Exception as inv_err:
-                    # Invertd unavailable or MetaTensor trace missing — fall
-                    # back to post-resize affine (same behaviour as before).
+                except Exception:
                     voxel_vol = float(
                         self.config.spacing[0]
                         * self.config.spacing[1]
                         * self.config.spacing[2]
                     )
-                    affine_b = None
-                    if hasattr(inputs, 'meta') and 'affine' in inputs.meta:
-                        affine_b = inputs.meta['affine'][b]
-                    elif 'image_meta_dict' in batch_data and 'affine' in batch_data['image_meta_dict']:
-                        affine_b = batch_data['image_meta_dict']['affine'][b]
-                    if affine_b is not None and torch.is_tensor(affine_b):
-                        try:
-                            voxel_vol = float(torch.abs(torch.det(affine_b[:3, :3])).item())
-                        except Exception:
-                            pass
                     pv_mm3 = float(preds_binary[b].sum().item()) * voxel_vol
+                    pv_mm3_lcc = float(preds_binary_lcc[b].sum().item()) * voxel_vol
                     gv_mm3 = float(targets[b].sum().item()) * voxel_vol
 
-                # HD95 still runs on the resized-space tensors (dimensionless overlap metric)
                 spacing_b = self.config.spacing
                 if hasattr(inputs, 'meta') and 'affine' in inputs.meta:
                     try:
@@ -602,16 +628,23 @@ class HASSLTrainer:
                     pass
 
                 pred_vols_mm3.append(pv_mm3)
+                pred_vols_mm3_lcc.append(pv_mm3_lcc)
                 gt_vols_mm3.append(gv_mm3)
 
         val_dice = self.dice_metric.aggregate().item()
-        val_dice = float('nan') if torch.isnan(torch.tensor(val_dice)) else float(val_dice)  # V6-8: propagate NaN
+        val_dice = float('nan') if torch.isnan(torch.tensor(val_dice)) else float(val_dice)
+
+        val_dice_lcc = dice_metric_lcc.aggregate().item()
+        val_dice_lcc = float('nan') if torch.isnan(torch.tensor(val_dice_lcc)) else float(val_dice_lcc)
 
         cm_res = confusion_metric.aggregate()
-        val_prec = float('nan') if torch.isnan(cm_res[0]).any() else float(cm_res[0].item())  # V6-8: propagate NaN
-        val_rec  = float('nan') if torch.isnan(cm_res[1]).any() else float(cm_res[1].item())  # V6-8: propagate NaN
+        val_prec = float('nan') if torch.isnan(cm_res[0]).any() else float(cm_res[0].item())
+        val_rec  = float('nan') if torch.isnan(cm_res[1]).any() else float(cm_res[1].item())
 
-        # V-7 fix: Propagate float('nan') when metric aggregation fails or produces NaN
+        cm_res_lcc = confusion_metric_lcc.aggregate()
+        val_prec_lcc = float('nan') if torch.isnan(cm_res_lcc[0]).any() else float(cm_res_lcc[0].item())
+        val_rec_lcc  = float('nan') if torch.isnan(cm_res_lcc[1]).any() else float(cm_res_lcc[1].item())
+
         try:
             raw_hd95 = hd95_metric.aggregate().item()
             val_hd95 = float('nan') if torch.isnan(torch.tensor(raw_hd95)) else float(raw_hd95)
@@ -619,36 +652,59 @@ class HASSLTrainer:
             val_hd95 = float('nan')
 
         pred_arr = np.array(pred_vols_mm3)
+        pred_arr_lcc = np.array(pred_vols_mm3_lcc)
         gt_arr = np.array(gt_vols_mm3)
 
         rve_list = np.abs(pred_arr - gt_arr) / (gt_arr + 1e-8) * 100.0
         val_rve_pct = float(np.mean(rve_list)) if len(rve_list) > 0 else 0.0
 
+        rve_list_lcc = np.abs(pred_arr_lcc - gt_arr) / (gt_arr + 1e-8) * 100.0
+        val_rve_pct_lcc = float(np.mean(rve_list_lcc)) if len(rve_list_lcc) > 0 else 0.0
+
         if len(gt_arr) > 1 and np.var(gt_arr) > 1e-6:
             ss_res = np.sum((gt_arr - pred_arr) ** 2)
+            ss_res_lcc = np.sum((gt_arr - pred_arr_lcc) ** 2)
             ss_tot = np.sum((gt_arr - np.mean(gt_arr)) ** 2)
             val_volume_r2 = float(1.0 - (ss_res / (ss_tot + 1e-8)))
+            val_volume_r2_lcc = float(1.0 - (ss_res_lcc / (ss_tot + 1e-8)))
         else:
             val_volume_r2 = 1.0 if np.allclose(pred_arr, gt_arr) else 0.0
+            val_volume_r2_lcc = 1.0 if np.allclose(pred_arr_lcc, gt_arr) else 0.0
 
         if should_log_image and first_batch_sample is not None:
             self.log_validation_samples(epoch, *first_batch_sample)
 
         return {
             'val_dice': val_dice,
+            'val_dice_lcc': val_dice_lcc,
             'val_precision': val_prec,
+            'val_precision_lcc': val_prec_lcc,
             'val_recall': val_rec,
+            'val_recall_lcc': val_rec_lcc,
             'val_rve_pct': val_rve_pct,
+            'val_rve_pct_lcc': val_rve_pct_lcc,
             'val_volume_r2': val_volume_r2,
+            'val_volume_r2_lcc': val_volume_r2_lcc,
             'val_hd95': val_hd95,
+            'val_pred_vol_mm3_mean': float(np.mean(pred_arr)) if len(pred_arr) > 0 else 0.0,
+            'val_pred_vol_mm3_mean_lcc': float(np.mean(pred_arr_lcc)) if len(pred_arr_lcc) > 0 else 0.0,
+            'val_gt_vol_mm3_mean': float(np.mean(gt_arr)) if len(gt_arr) > 0 else 0.0,
         }
 
-    def log_validation_samples(self, epoch: int, img_t: torch.Tensor, gt_t: torch.Tensor, pred_t: torch.Tensor):
-        """Generate and log 4-panel slice preview grid (Image | GT | Pred | Error Map)."""
+    def log_validation_samples(
+        self,
+        epoch: int,
+        img_t: torch.Tensor,
+        gt_t: torch.Tensor,
+        pred_t: torch.Tensor,
+        pred_lcc_t: Optional[torch.Tensor] = None,
+    ):
+        """Generate and log 5-panel slice preview grid (Image | GT | Raw Pred | Postprocessed LCC Pred | Error Map)."""
         try:
             img_np = img_t[0].numpy()
             gt_np = gt_t[0].numpy()
             pred_np = pred_t[0].numpy()
+            pred_lcc_np = pred_lcc_t[0].numpy() if pred_lcc_t is not None else pred_np
 
             gt_sums = gt_np.sum(axis=(1, 2))
             slice_idx = int(gt_sums.argmax()) if gt_sums.max() > 0 else img_np.shape[0] // 2
@@ -656,6 +712,7 @@ class HASSLTrainer:
             slice_img = img_np[slice_idx]
             slice_gt = (gt_np[slice_idx] > 0.5).astype(np.float32)
             slice_pred = (pred_np[slice_idx] > 0.5).astype(np.float32)
+            slice_lcc = (pred_lcc_np[slice_idx] > 0.5).astype(np.float32)
 
             p_min, p_max = slice_img.min(), slice_img.max()
             slice_norm = (slice_img - p_min) / (p_max - p_min + 1e-8)
@@ -669,28 +726,37 @@ class HASSLTrainer:
             p2 = base_rgb.copy()
             p2[slice_gt > 0, 1] = np.clip(p2[slice_gt > 0, 1].astype(np.int32) + 120, 0, 255).astype(np.uint8)
 
-            # Panel 3: Prediction (Cyan overlay)
+            # Panel 3: Raw Model Prediction (Cyan overlay - without Keep Largest CC)
             p3 = base_rgb.copy()
             p3[slice_pred > 0, 0] = np.clip(p3[slice_pred > 0, 0].astype(np.int32) + 120, 0, 255).astype(np.uint8)
             p3[slice_pred > 0, 2] = np.clip(p3[slice_pred > 0, 2].astype(np.int32) + 120, 0, 255).astype(np.uint8)
 
-            # Panel 4: Composite Error (Green=TP, Red=FP, Blue=FN)
+            # Panel 4: Cleaned Model Prediction (Magenta overlay - WITH Keep Largest CC)
             p4 = base_rgb.copy()
-            tp = (slice_gt > 0) & (slice_pred > 0)
-            fp = (slice_gt == 0) & (slice_pred > 0)
-            fn = (slice_gt > 0) & (slice_pred == 0)
+            p4[slice_lcc > 0, 0] = np.clip(p4[slice_lcc > 0, 0].astype(np.int32) + 140, 0, 255).astype(np.uint8)
+            p4[slice_lcc > 0, 1] = np.clip(p4[slice_lcc > 0, 1].astype(np.int32) + 40, 0, 255).astype(np.uint8)
+            p4[slice_lcc > 0, 2] = np.clip(p4[slice_lcc > 0, 2].astype(np.int32) + 140, 0, 255).astype(np.uint8)
 
-            p4[tp, 1] = 255  # Green for True Positive
-            p4[fp, 0] = 255  # Red for False Positive
-            p4[fn, 2] = 255  # Blue for False Negative
+            # Panel 5: Composite Error Map after Keep Largest CC (Green=TP, Red=FP, Blue=FN)
+            p5 = base_rgb.copy()
+            tp = (slice_gt > 0) & (slice_lcc > 0)
+            fp = (slice_gt == 0) & (slice_lcc > 0)
+            fn = (slice_gt > 0) & (slice_lcc == 0)
 
-            grid_img = np.concatenate([p1, p2, p3, p4], axis=1)
+            p5[tp, 1] = 255  # Green for True Positive
+            p5[fp, 0] = 255  # Red for False Positive
+            p5[fn, 2] = 255  # Blue for False Negative
+
+            grid_img = np.concatenate([p1, p2, p3, p4, p5], axis=1)
 
             self.tracker.log_image(
                 grid_img,
                 name="val_slice_preview",
                 step=epoch,
-                caption=f"Epoch {epoch} Slice {slice_idx} (Image | GT | Pred | Error: TP-Green, FP-Red, FN-Blue)",
+                caption=(
+                    f"Epoch {epoch} Slice {slice_idx} "
+                    "(Image | GT-Green | RawPred-Cyan | LCCPred-Magenta | Error: TP-Green FP-Red FN-Blue)"
+                ),
                 save_local_dir=os.path.join(self.config.log_dir, "val_previews")
             )
         except Exception as e:
