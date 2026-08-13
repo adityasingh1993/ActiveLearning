@@ -193,9 +193,16 @@ class QueryEngine:
                                 'ref_path': image_paths[i] if i < len(image_paths) else None,
                             })
 
+        # Deduplicate candidates by volume ID, keeping the highest confidence entry per volume
+        best_candidates = {}
+        for cand in candidates:
+            vid = cand['id']
+            if vid not in best_candidates or cand['confidence'] > best_candidates[vid]['confidence']:
+                best_candidates[vid] = cand
+
         # Sort candidates by confidence score descending (C-2 fix)
-        candidates.sort(key=lambda c: c['confidence'], reverse=True)
-        top_k_candidates = candidates[:k]
+        sorted_candidates = sorted(best_candidates.values(), key=lambda c: c['confidence'], reverse=True)
+        top_k_candidates = sorted_candidates[:k]
 
         promoted_ids = []
         for cand in top_k_candidates:
@@ -207,10 +214,12 @@ class QueryEngine:
             # W-1 fix: Preserve spatial geometry (origin, spacing, direction matrix)
             write_mask_with_spatial_geometry(output_path, pred_vol, reference_image_path=ref_path)
 
-            self.state['unlabeled_ids'].remove(vid)
+            if vid in self.state['unlabeled_ids']:
+                self.state['unlabeled_ids'].remove(vid)
             if 'pseudo_ids' not in self.state:
                 self.state['pseudo_ids'] = []
-            self.state['pseudo_ids'].append(vid)
+            if vid not in self.state['pseudo_ids']:
+                self.state['pseudo_ids'].append(vid)
             self.state['provenance'][vid] = "pseudo_unreviewed"
             promoted_ids.append(vid)
 
