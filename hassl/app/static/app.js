@@ -58,6 +58,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             case '4': setDrawTool('fill'); break;
             case '5': setDrawTool('winlevel'); break;
             case '6': setDrawTool('ruler'); break;
+            case '7': keepLargestIsland(); break;
+            case '8': setDrawTool('lasso'); break;
+            case '9': fillHoles(); break;
             case 'a': acceptVolume(); break;
             case 'r': rejectVolume(); break;
             case 'n': loadNextVolume(); break;
@@ -250,6 +253,87 @@ function floodFill(axis, startX, startY) {
             stack.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
         }
     }
+    renderViewportCanvas(axis);
+}
+
+// ─── 3D Slicer Segment Processing Tools ──────────────────────────────
+
+function keepLargestIsland(axis = state.activeViewport) {
+    const mask = state.masks2D[axis];
+    const shape = state.maskShapes[axis];
+    if (!mask || !shape[0]) return;
+    const [h, w] = shape;
+    const visited = Array.from({ length: h }, () => new Uint8Array(w));
+    let maxComponent = [];
+
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            if (mask[y][x] === 1 && !visited[y][x]) {
+                const component = [];
+                const stack = [[x, y]];
+                visited[y][x] = 1;
+                while (stack.length > 0) {
+                    const [cx, cy] = stack.pop();
+                    component.push([cx, cy]);
+                    const neighbors = [[cx + 1, cy], [cx - 1, cy], [cx, cy + 1], [cx, cy - 1]];
+                    for (const [nx, ny] of neighbors) {
+                        if (nx >= 0 && nx < w && ny >= 0 && ny < h && mask[ny][nx] === 1 && !visited[ny][nx]) {
+                            visited[ny][nx] = 1;
+                            stack.push([nx, ny]);
+                        }
+                    }
+                }
+                if (component.length > maxComponent.length) {
+                    maxComponent = component;
+                }
+            }
+        }
+    }
+
+    for (let y = 0; y < h; y++) mask[y].fill(0);
+    for (const [cx, cy] of maxComponent) {
+        mask[cy][cx] = 1;
+    }
+    showToast(`Kept largest island (${maxComponent.length} voxels), removed noise`);
+    renderViewportCanvas(axis);
+}
+
+function fillHoles(axis = state.activeViewport) {
+    const mask = state.masks2D[axis];
+    const shape = state.maskShapes[axis];
+    if (!mask || !shape[0]) return;
+    const [h, w] = shape;
+    const bg = Array.from({ length: h }, () => new Uint8Array(w));
+    const stack = [];
+
+    for (let x = 0; x < w; x++) {
+        if (mask[0][x] === 0) stack.push([x, 0]);
+        if (mask[h - 1][x] === 0) stack.push([x, h - 1]);
+    }
+    for (let y = 0; y < h; y++) {
+        if (mask[y][0] === 0) stack.push([0, y]);
+        if (mask[y][w - 1] === 0) stack.push([w - 1, y]);
+    }
+
+    while (stack.length > 0) {
+        const [cx, cy] = stack.pop();
+        if (cx < 0 || cx >= w || cy < 0 || cy >= h) continue;
+        if (mask[cy][cx] === 0 && !bg[cy][cx]) {
+            bg[cy][cx] = 1;
+            stack.push([cx + 1, cy], [cx - 1, cy], [cx, cy + 1], [cx, cy - 1]);
+        }
+    }
+
+    let filledCount = 0;
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            if (mask[y][x] === 0 && bg[y][x] === 0) {
+                mask[y][x] = 1;
+                filledCount++;
+            }
+        }
+    }
+    showToast(`Sealed ${filledCount} hollow voxels inside segment`);
     renderViewportCanvas(axis);
 }
 

@@ -69,6 +69,21 @@
         <div class="tool-divider"></div>
 
         <div class="tool-section">
+            <span class="section-title">SEGMENT FILTERS</span>
+            <button id="tool-island" class="btn-tool" onclick="keepLargestIsland()" title="Keep Largest Island (remove floating noise blobs)">
+                🏝️ Largest Island
+            </button>
+            <button id="tool-lasso" class="btn-tool" onclick="setDrawTool('lasso')" title="Lasso / Scissors Cut (freehand polygon selection)">
+                ✂️ Lasso Cut
+            </button>
+            <button id="tool-holes" class="btn-tool" onclick="fillHoles()" title="Fill Holes (seal interior hollow cavities)">
+                🕳️ Fill Holes
+            </button>
+        </div>
+
+        <div class="tool-divider"></div>
+
+        <div class="tool-section">
             <span class="section-title">SETTINGS</span>
             <div class="setting-item">
                 <label for="brush-radius">Radius: <span id="radius-val">8</span>px</label>
