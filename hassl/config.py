@@ -63,11 +63,19 @@ class HASSLConfig:
     ssl_mask_cube_size: int = 16  # Size of each masked sub-cube
     ssl_contrastive_temp: float = 0.07  # InfoNCE temperature
     ssl_embedding_dim: int = 128  # Projection head output dim
+    ssl_use_early_stopping: bool = True
+    ssl_early_stopping_patience: int = 20
 
     # ─── Semi-Supervised Training (Phase 3) ──────────────────────────────
     train_epochs: int = 200  # Per AL round
     train_lr: float = 1e-4
     train_weight_decay: float = 1e-5
+    lr_scheduler: str = "cosine"  # "cosine", "plateau", or "none"
+    min_lr: float = 1e-6
+    lr_warmup_epochs: int = 5
+    use_early_stopping: bool = True
+    early_stopping_patience: int = 30
+    early_stopping_min_delta: float = 1e-4
     lambda_unsup: float = 1.0  # Max weight for unsupervised loss
     ema_decay: float = 0.999  # EMA teacher momentum
     flexmatch_threshold: float = 0.95  # Initial pseudo-label confidence threshold

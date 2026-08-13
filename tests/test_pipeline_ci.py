@@ -246,3 +246,41 @@ def test_full_pipeline_synthetic_end_to_end(tmp_path):
 
     ckpt_file = Path(config.checkpoint_dir) / "round0_latest.pth"
     assert ckpt_file.exists(), f"Expected checkpoint file {ckpt_file} was not generated during end-to-end run"
+
+
+def test_early_stopping_and_lr_scheduler():
+    """Verify EarlyStopping monitors performance and Cosine Annealing decays LR as expected."""
+    try:
+        import torch
+        from hassl.config import HASSLConfig
+        from hassl.training.trainer import EarlyStopping, HASSLTrainer
+    except ImportError:
+        pytest.skip("PyTorch or MONAI not installed")
+
+    # 1. Test EarlyStopping helper class directly
+    es = EarlyStopping(patience=3, min_delta=1e-4, mode='max')
+    scores = [0.80, 0.81, 0.81, 0.81, 0.81]
+    stopped_at = None
+    for idx, score in enumerate(scores):
+        if es(score):
+            stopped_at = idx
+            break
+    assert stopped_at == 3, f"Early stopping should trigger at index 3 (after 3 non-improvements), triggered at {stopped_at}"
+
+    # 2. Test HASSLTrainer LR scheduler initialization and step
+    config = HASSLConfig()
+    config.device = "cpu"
+    config.compute_mode = "prototype"
+    config.unet_backbone = "unet"
+    config.lr_scheduler = "cosine"
+    config.train_lr = 1e-3
+    config.min_lr = 1e-5
+    config.train_epochs = 100
+
+    trainer = HASSLTrainer(config=config, labeled_loader=[], unlabeled_loader=[], val_loader=[], tracker=None)
+    initial_lr = trainer.optimizer.param_groups[0]['lr']
+    assert abs(initial_lr - 1e-3) < 1e-7
+
+    trainer.scheduler.step()
+    stepped_lr = trainer.optimizer.param_groups[0]['lr']
+    assert stepped_lr < initial_lr, f"Cosine scheduler should decay learning rate on step: {stepped_lr} < {initial_lr}"

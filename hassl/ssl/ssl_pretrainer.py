@@ -60,6 +60,17 @@ class SSLPretrainer:
             weight_decay=getattr(config, 'ssl_weight_decay', 1e-5)
         )
 
+        ssl_epochs = getattr(config, 'ssl_epochs', 100)
+        min_lr = getattr(config, 'min_lr', 1e-6)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=ssl_epochs, eta_min=min_lr
+        )
+
+        from ..training.trainer import EarlyStopping
+        use_es = getattr(config, 'ssl_use_early_stopping', True)
+        patience = getattr(config, 'ssl_early_stopping_patience', 20)
+        self.early_stopper = EarlyStopping(patience=patience, min_delta=1e-4, mode='min') if use_es else None
+
         if self.device_type == 'cuda':
             self.scaler = torch.amp.GradScaler('cuda')
         else:
@@ -211,18 +222,27 @@ class SSLPretrainer:
             avg_rot = epoch_rot / N
             avg_cont = epoch_cont / N
 
+            current_lr = self.optimizer.param_groups[0]['lr']
+            if getattr(self, 'scheduler', None) is not None:
+                self.scheduler.step()
+
             print(f"  [SSL Pre-train] Epoch {epoch + 1:3d}/{num_epochs} | "
-                  f"Loss: {avg_loss:.4f} (Inp: {avg_inp:.4f}, Rot: {avg_rot:.4f}, Cont: {avg_cont:.4f})")
+                  f"Loss: {avg_loss:.4f} (Inp: {avg_inp:.4f}, Rot: {avg_rot:.4f}, Cont: {avg_cont:.4f}) | LR: {current_lr:.6f}")
 
             self.tracker.log_metrics({
                 'ssl_loss': avg_loss,
                 'ssl_loss_inpainting': avg_inp,
                 'ssl_loss_rotation': avg_rot,
                 'ssl_loss_contrastive': avg_cont,
+                'ssl_learning_rate': current_lr,
             }, step=epoch)
 
             if should_log_image and first_batch_sample is not None:
                 self.log_ssl_inpainting_samples(epoch, *first_batch_sample)
+
+            if getattr(self, 'early_stopper', None) is not None and self.early_stopper(avg_loss):
+                print(f"  [SSL Early Stopping] SSL loss did not improve for {self.early_stopper.patience} consecutive epochs. Early stopping at epoch {epoch + 1}.")
+                break
 
         ckpt_dir = getattr(self.config, 'checkpoint_dir', './experiments/checkpoints')
         os.makedirs(ckpt_dir, exist_ok=True)

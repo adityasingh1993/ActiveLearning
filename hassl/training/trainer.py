@@ -70,6 +70,53 @@ def compute_multiscale_loss(criterion, preds, target):
         return l.mean() if l.ndim > 0 else l
 
 
+class EarlyStopping:
+    """Early stopping monitor for validation metric plateaus."""
+
+    def __init__(self, patience: int = 30, min_delta: float = 1e-4, mode: str = 'max'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def __call__(self, val_score: float) -> bool:
+        if np.isnan(val_score):
+            return False
+
+        if self.best_score is None:
+            self.best_score = val_score
+            return False
+
+        if self.mode == 'max':
+            improved = val_score > (self.best_score + self.min_delta)
+        else:
+            improved = val_score < (self.best_score - self.min_delta)
+
+        if improved:
+            self.best_score = val_score
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+        return self.early_stop
+
+    def state_dict(self) -> dict:
+        return {
+            'counter': self.counter,
+            'best_score': self.best_score,
+            'early_stop': self.early_stop,
+        }
+
+    def load_state_dict(self, state: dict):
+        self.counter = state.get('counter', 0)
+        self.best_score = state.get('best_score', None)
+        self.early_stop = state.get('early_stop', False)
+
+
 class HASSLTrainer:
     """Unified trainer supporting UA-Mean Teacher (prototype) and CPS (full) modes."""
 
@@ -102,6 +149,7 @@ class HASSLTrainer:
             self.optimizer = torch.optim.AdamW(
                 self.net_A.parameters(), lr=config.train_lr, weight_decay=config.train_weight_decay
             )
+            self.scheduler = self._build_scheduler(self.optimizer)
         else:
             self.net_A = build_network(config.unet_backbone, self.num_classes, config.dropout).to(self.device)
             self.net_B = build_network('swinunetr', self.num_classes, 0.0).to(self.device)
@@ -111,7 +159,14 @@ class HASSLTrainer:
             self.optimizer_B = torch.optim.AdamW(
                 self.net_B.parameters(), lr=config.train_lr, weight_decay=config.train_weight_decay
             )
+            self.scheduler_A = self._build_scheduler(self.optimizer_A)
+            self.scheduler_B = self._build_scheduler(self.optimizer_B)
             self.flex_match = FlexMatchThreshold(self.num_classes)
+
+        use_es = getattr(config, 'use_early_stopping', True)
+        patience = getattr(config, 'early_stopping_patience', 30)
+        min_delta = getattr(config, 'early_stopping_min_delta', 1e-4)
+        self.early_stopper = EarlyStopping(patience=patience, min_delta=min_delta, mode='max') if use_es else None
 
         self.criterion = CombinedSegLoss(self.num_classes, include_boundary=False)
         self.masked_criterion = UncertaintyMaskedLoss(self.criterion)
@@ -127,6 +182,23 @@ class HASSLTrainer:
         # Load pre-trained SSL weights if available
         if pretrained_weights and os.path.exists(pretrained_weights):
             self._load_pretrained(pretrained_weights)
+
+    def _build_scheduler(self, optimizer):
+        """Construct learning rate scheduler based on config."""
+        scheduler_type = getattr(self.config, 'lr_scheduler', 'cosine')
+        min_lr = getattr(self.config, 'min_lr', 1e-6)
+        train_epochs = getattr(self.config, 'train_epochs', 200)
+
+        if scheduler_type == 'cosine':
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=train_epochs, eta_min=min_lr
+            )
+        elif scheduler_type == 'plateau':
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='max', factor=0.5, patience=10, min_lr=min_lr
+            )
+        else:
+            return None
 
     def _make_unlabeled_views(self, inputs_u: torch.Tensor):
         """Generate spatially aligned teacher and student views (V7-1, V8-1, V8-5 fix)."""
@@ -532,11 +604,26 @@ class HASSLTrainer:
             val_metrics = self.validate(epoch=epoch, should_log_image=should_log_image)
             val_dice = val_metrics['val_dice']
 
+            # Step LR scheduler and get current learning rate
+            current_lr = self.config.train_lr
+            if self.mode == 'prototype' and getattr(self, 'scheduler', None) is not None:
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.step(val_dice)
+                else:
+                    self.scheduler.step()
+                current_lr = self.optimizer.param_groups[0]['lr']
+            elif self.mode == 'full':
+                if getattr(self, 'scheduler_A', None) is not None:
+                    self.scheduler_A.step(val_dice) if isinstance(self.scheduler_A, torch.optim.lr_scheduler.ReduceLROnPlateau) else self.scheduler_A.step()
+                if getattr(self, 'scheduler_B', None) is not None:
+                    self.scheduler_B.step(val_dice) if isinstance(self.scheduler_B, torch.optim.lr_scheduler.ReduceLROnPlateau) else self.scheduler_B.step()
+                current_lr = self.optimizer_A.param_groups[0]['lr']
+
             metrics = {
                 'train_loss': train_loss,
                 'supervised_loss': sup_loss,
                 'unsupervised_loss': unsup_loss,
-                'learning_rate': self.config.train_lr,
+                'learning_rate': current_lr,
                 'uncertainty_mean': uncert,
                 'epoch': epoch,
                 **val_metrics
@@ -549,7 +636,7 @@ class HASSLTrainer:
                   f"Loss: {train_loss:.4f} | Dice: {val_dice:.4f} | "
                   f"Prec: {val_metrics['val_precision']:.4f} | Rec: {val_metrics['val_recall']:.4f} | "
                   f"RVE: {val_metrics['val_rve_pct']:.1f}% | R²: {val_metrics['val_volume_r2']:.3f} | "
-                  f"HD95: {hd95_str}")
+                  f"HD95: {hd95_str} | LR: {current_lr:.6f}")
 
             if val_dice > self.best_dice:
                 self.best_dice = val_dice
@@ -563,6 +650,15 @@ class HASSLTrainer:
                     os.path.join(self.config.checkpoint_dir, f'checkpoint_epoch{epoch}.pth'),
                     epoch=epoch,
                 )
+
+            # Early Stopping Check
+            if self.early_stopper and self.early_stopper(val_dice):
+                print(f"  [HASSL Early Stopping] Validation Dice did not improve for {self.early_stopper.patience} consecutive epochs. Early stopping at epoch {epoch + 1}.")
+                self.save_checkpoint(
+                    os.path.join(self.config.checkpoint_dir, f'checkpoint_epoch{epoch}.pth'),
+                    epoch=epoch,
+                )
+                break
 
         print(f"  Best validation Dice: {self.best_dice:.4f}")
 
@@ -586,7 +682,7 @@ class HASSLTrainer:
         print(f"  Resumed from checkpoint: {path} at epoch {self.start_epoch} (best_dice={self.best_dice:.4f})")
 
     def save_checkpoint(self, path: str, epoch: int = 0):
-        """Save training checkpoint including current epoch (M-9 fix)."""
+        """Save training checkpoint including current epoch, scheduler, and early stopper (M-9 fix)."""
         state = {
             'net_A': self.net_A.state_dict(),
             'best_dice': self.best_dice,
@@ -596,17 +692,26 @@ class HASSLTrainer:
         if self.mode == 'prototype':
             state['teacher'] = self.teacher.state_dict()
             state['optimizer'] = self.optimizer.state_dict()
+            if getattr(self, 'scheduler', None) is not None:
+                state['scheduler'] = self.scheduler.state_dict()
         else:
             state['net_B'] = self.net_B.state_dict()
             state['optimizer_A'] = self.optimizer_A.state_dict()
             state['optimizer_B'] = self.optimizer_B.state_dict()
+            if getattr(self, 'scheduler_A', None) is not None:
+                state['scheduler_A'] = self.scheduler_A.state_dict()
+            if getattr(self, 'scheduler_B', None) is not None:
+                state['scheduler_B'] = self.scheduler_B.state_dict()
+
+        if getattr(self, 'early_stopper', None) is not None:
+            state['early_stopper'] = self.early_stopper.state_dict()
 
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(state, path)
         self.tracker.log_artifact(path, 'checkpoint')
 
     def load_checkpoint(self, path: str):
-        """Load training checkpoint and restore start_epoch (M-9 fix)."""
+        """Load training checkpoint and restore state (M-9 fix)."""
         if not os.path.exists(path): return
         state = torch.load(path, map_location=self.device, weights_only=False)
         self.net_A.load_state_dict(state['net_A'])
@@ -618,6 +723,8 @@ class HASSLTrainer:
                 self.teacher.load_state_dict(state['teacher'])
             if 'optimizer' in state:
                 self.optimizer.load_state_dict(state['optimizer'])
+            if 'scheduler' in state and getattr(self, 'scheduler', None) is not None:
+                self.scheduler.load_state_dict(state['scheduler'])
         elif self.mode == 'full':
             if 'net_B' in state:
                 self.net_B.load_state_dict(state['net_B'])
@@ -625,6 +732,13 @@ class HASSLTrainer:
                 self.optimizer_A.load_state_dict(state['optimizer_A'])
             if 'optimizer_B' in state:
                 self.optimizer_B.load_state_dict(state['optimizer_B'])
+            if 'scheduler_A' in state and getattr(self, 'scheduler_A', None) is not None:
+                self.scheduler_A.load_state_dict(state['scheduler_A'])
+            if 'scheduler_B' in state and getattr(self, 'scheduler_B', None) is not None:
+                self.scheduler_B.load_state_dict(state['scheduler_B'])
+
+        if 'early_stopper' in state and getattr(self, 'early_stopper', None) is not None:
+            self.early_stopper.load_state_dict(state['early_stopper'])
 
     def get_models(self):
         """Return trained models for active learning query."""
