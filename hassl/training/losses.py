@@ -110,7 +110,7 @@ class BoundaryLoss(nn.Module):
 
 
 class CombinedSegLoss(nn.Module):
-    def __init__(self, num_classes: int, include_boundary: bool = False, boundary_weight: float = 0.5):
+    def __init__(self, num_classes: int, include_boundary: bool = False, boundary_weight: float = 0.5, reduction: str = 'mean'):
         super().__init__()
         self.num_classes = num_classes
         self.include_boundary = include_boundary
@@ -119,10 +119,13 @@ class CombinedSegLoss(nn.Module):
         sigmoid = num_classes == 1
         softmax = num_classes > 1
 
+        # MONAI DiceCELoss only accepts 'mean' or 'sum'
+        monai_reduction = reduction if reduction in ('mean', 'sum') else 'mean'
+
         self.dice_ce = DiceCELoss(
             include_background=False if num_classes > 1 else True,
             sigmoid=sigmoid, softmax=softmax,
-            reduction='mean'
+            reduction=monai_reduction
         )
 
         if include_boundary:
