@@ -537,11 +537,48 @@ class HASSLTrainer:
             preds_binary_lcc = apply_keep_largest_cc(preds_binary)
 
             if first_batch_sample is None and should_log_image:
+                # Compute MC Dropout epistemic variance & TTA aleatoric variance 3D maps for sample 0
+                mc_var_t = torch.zeros_like(preds_binary[0])
+                tta_var_t = torch.zeros_like(preds_binary[0])
+                try:
+                    from hassl.active.query_strategies import TTAUncertaintyScorer
+                    from hassl.training.ema import enable_dropout
+
+                    # 1. MC Dropout variance
+                    enable_dropout(self.net_A)
+                    with torch.no_grad():
+                        mc_preds = []
+                        for _ in range(min(5, getattr(self.config, 'mc_dropout_passes', 5))):
+                            p = inferer(inputs[0:1], self.net_A)
+                            if isinstance(p, (list, tuple)): p = p[0]
+                            elif p.ndim == 6: p = p[:, 0]
+                            p_prob = torch.sigmoid(p) if self.num_classes == 1 else torch.softmax(p, dim=1)
+                            mc_preds.append(p_prob)
+                        mc_var_t = torch.stack(mc_preds, dim=0).var(dim=0)[0]
+
+                    # 2. TTA Aleatoric variance
+                    self.net_A.eval()
+                    tta_scorer = TTAUncertaintyScorer(self.net_A, num_passes=4)
+                    with torch.no_grad():
+                        tta_preds = []
+                        for _ in range(4):
+                            aug_in = tta_scorer._augment(inputs[0:1])
+                            p = inferer(aug_in, self.net_A)
+                            if isinstance(p, (list, tuple)): p = p[0]
+                            elif p.ndim == 6: p = p[:, 0]
+                            p_prob = torch.sigmoid(p) if self.num_classes == 1 else torch.softmax(p, dim=1)
+                            tta_preds.append(p_prob)
+                        tta_var_t = torch.stack(tta_preds, dim=0).var(dim=0)[0]
+                except Exception as e:
+                    logger.warning("[HASSL] Could not compute validation uncertainty maps: %s", e)
+
                 first_batch_sample = (
                     inputs[0].detach().cpu(),
                     targets[0].detach().cpu(),
                     preds_binary[0].detach().cpu(),
                     preds_binary_lcc[0].detach().cpu(),
+                    mc_var_t.detach().cpu(),
+                    tta_var_t.detach().cpu(),
                 )
 
             self.dice_metric(y_pred=preds_binary, y=targets)
@@ -724,9 +761,13 @@ class HASSLTrainer:
         gt_t: torch.Tensor,
         pred_t: torch.Tensor,
         pred_lcc_t: Optional[torch.Tensor] = None,
+        mc_var_t: Optional[torch.Tensor] = None,
+        tta_var_t: Optional[torch.Tensor] = None,
     ):
-        """Generate and log 5-panel slice preview grid (Image | GT | Raw Pred | Postprocessed LCC Pred | Error Map)."""
+        """Generate and log 5-panel slice preview grid and 6-panel uncertainty heatmap preview grid."""
         try:
+            from hassl.utils.visualization import render_uncertainty_slice_grid
+
             img_np = img_t[0].numpy()
             gt_np = gt_t[0].numpy()
             pred_np = pred_t[0].numpy()
@@ -785,8 +826,33 @@ class HASSLTrainer:
                 ),
                 save_local_dir=os.path.join(self.config.log_dir, "val_previews")
             )
+
+            # Log 6-panel uncertainty preview if MC/TTA variance maps exist
+            if mc_var_t is not None and tta_var_t is not None:
+                slice_mc = mc_var_t[0, slice_idx].numpy()
+                slice_tta = tta_var_t[0, slice_idx].numpy()
+
+                grid_uncert = render_uncertainty_slice_grid(
+                    slice_img=slice_img,
+                    slice_gt=slice_gt,
+                    slice_pred=slice_pred,
+                    slice_mc_var=slice_mc,
+                    slice_tta_var=slice_tta,
+                    slice_lcc=slice_lcc,
+                )
+
+                self.tracker.log_image(
+                    grid_uncert,
+                    name="val_uncertainty_preview",
+                    step=epoch,
+                    caption=(
+                        f"Epoch {epoch} Slice {slice_idx} "
+                        "(Image | GT | RawPred | MC Epistemic Heatmap | TTA Aleatoric Heatmap | Error Map)"
+                    ),
+                    save_local_dir=os.path.join(self.config.log_dir, "val_uncertainty_previews")
+                )
         except Exception as e:
-            print(f"  [Warning] Failed to generate validation slice preview: {e}")
+            logger.warning("[HASSL] Failed to generate validation slice preview: %s", e)
 
     def train(self, num_epochs: int):
         end_epoch = self.start_epoch + num_epochs

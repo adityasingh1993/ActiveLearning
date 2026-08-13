@@ -69,12 +69,82 @@ def plot_al_scores(scores_dict, round_num):
     plt.tight_layout()
     return fig
 
-def save_figure_as_array(fig):
+def render_thermal_heatmap(map_2d: np.ndarray, max_val: float = None) -> np.ndarray:
+    """Render a 2D float uncertainty/variance map as a thermal RGB heatmap [H, W, 3].
+
+    Colormap: Blue (0.0 = low/certain) -> Green/Yellow (0.5 = moderate) -> Red (1.0 = high/uncertain).
     """
-    Converts a matplotlib figure to an RGB numpy array.
+    if max_val is None or max_val <= 0:
+        max_val = float(map_2d.max()) + 1e-8
+    norm = np.clip(map_2d / max_val, 0.0, 1.0)
+
+    r = np.clip(2.0 * norm - 0.5, 0.0, 1.0)
+    g = np.clip(1.0 - np.abs(2.0 * norm - 1.0), 0.0, 1.0)
+    b = np.clip(1.0 - 2.0 * norm, 0.0, 1.0)
+
+    rgb = (np.stack([r, g, b], axis=-1) * 255.0).astype(np.uint8)
+    return rgb
+
+
+def render_uncertainty_slice_grid(
+    slice_img: np.ndarray,
+    slice_gt: np.ndarray,
+    slice_pred: np.ndarray,
+    slice_mc_var: np.ndarray,
+    slice_tta_var: np.ndarray,
+    slice_lcc: np.ndarray = None,
+) -> np.ndarray:
+    """Generate a 6-panel composite preview grid.
+
+    Panels:
+        1. Original Grayscale Image
+        2. Ground Truth (Green overlay)
+        3. Raw Model Prediction (Cyan overlay)
+        4. MC Dropout Epistemic Uncertainty Heatmap (Blue=Low, Red=High)
+        5. TTA Aleatoric Uncertainty Heatmap (Blue=Low, Red=High)
+        6. Error Map (Green=TP, Red=FP, Blue=FN)
+
+    Returns:
+        RGB numpy array of shape [H, W * 6, 3] ready for WandB/MLflow image logging.
     """
-    fig.canvas.draw()
-    data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    plt.close(fig)
-    return data
+    slice_lcc = slice_lcc if slice_lcc is not None else slice_pred
+
+    # Grayscale base image normalized to [0, 255]
+    p_min, p_max = slice_img.min(), slice_img.max()
+    slice_norm = (slice_img - p_min) / (p_max - p_min + 1e-8)
+    base_gray = (slice_norm * 255.0).astype(np.uint8)
+    base_rgb = np.stack([base_gray] * 3, axis=-1)
+
+    # Panel 1: Original Image
+    p1 = base_rgb.copy()
+
+    # Panel 2: Ground Truth (Green overlay)
+    p2 = base_rgb.copy()
+    p2[slice_gt > 0, 1] = np.clip(p2[slice_gt > 0, 1].astype(np.int32) + 120, 0, 255).astype(np.uint8)
+
+    # Panel 3: Raw Model Prediction (Cyan overlay)
+    p3 = base_rgb.copy()
+    p3[slice_pred > 0, 0] = np.clip(p3[slice_pred > 0, 0].astype(np.int32) + 120, 0, 255).astype(np.uint8)
+    p3[slice_pred > 0, 2] = np.clip(p3[slice_pred > 0, 2].astype(np.int32) + 120, 0, 255).astype(np.uint8)
+
+    # Panel 4: MC Epistemic Uncertainty Heatmap blended with base image
+    mc_rgb = render_thermal_heatmap(slice_mc_var)
+    p4 = (base_rgb * 0.4 + mc_rgb * 0.6).astype(np.uint8)
+
+    # Panel 5: TTA Aleatoric Uncertainty Heatmap blended with base image
+    tta_rgb = render_thermal_heatmap(slice_tta_var)
+    p5 = (base_rgb * 0.4 + tta_rgb * 0.6).astype(np.uint8)
+
+    # Panel 6: Error Map (Green=TP, Red=FP, Blue=FN)
+    p6 = base_rgb.copy()
+    tp = (slice_gt > 0) & (slice_lcc > 0)
+    fp = (slice_gt == 0) & (slice_lcc > 0)
+    fn = (slice_gt > 0) & (slice_lcc == 0)
+
+    p6[tp, 1] = 255  # Green = TP
+    p6[fp, 0] = 255  # Red = FP
+    p6[fn, 2] = 255  # Blue = FN
+
+    grid_img = np.concatenate([p1, p2, p3, p4, p5, p6], axis=1)
+    return grid_img
+
