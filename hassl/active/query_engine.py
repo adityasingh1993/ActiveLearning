@@ -144,6 +144,19 @@ class QueryEngine:
 
                 inv_out = inv_transform(sample)
                 inv_pred = inv_out["pred"]
+
+                if (
+                    self.config
+                    and hasattr(self.config, 'spatial_size')
+                    and tuple(inv_pred.shape[-3:]) == tuple(self.config.spatial_size)
+                ):
+                    logger.warning(
+                        "[HASSL] _invert_prediction: Invertd output shape %s equals resized grid %s. "
+                        "Prediction may have lacked transform trace metadata.",
+                        tuple(inv_pred.shape[-3:]),
+                        tuple(self.config.spatial_size),
+                    )
+
                 if inv_pred.ndim == 4:
                     inv_pred = inv_pred[0]
                 return (inv_pred > 0.5).numpy().astype(np.uint8)

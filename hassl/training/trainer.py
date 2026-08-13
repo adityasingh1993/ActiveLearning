@@ -562,11 +562,13 @@ class HASSLTrainer:
                     with torch.no_grad():
                         tta_preds = []
                         for _ in range(4):
-                            aug_in = tta_scorer._augment(inputs[0:1])
+                            aug_in, flipped_dims = tta_scorer._augment(inputs[0:1])
                             p = inferer(aug_in, self.net_A)
                             if isinstance(p, (list, tuple)): p = p[0]
                             elif p.ndim == 6: p = p[:, 0]
                             p_prob = torch.sigmoid(p) if self.num_classes == 1 else torch.softmax(p, dim=1)
+                            if flipped_dims:
+                                p_prob = torch.flip(p_prob, dims=flipped_dims)
                             tta_preds.append(p_prob)
                         tta_var_t = torch.stack(tta_preds, dim=0).var(dim=0)[0]
                 except Exception as e:

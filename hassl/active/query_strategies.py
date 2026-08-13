@@ -103,18 +103,24 @@ class TTAUncertaintyScorer:
         self.intensity_std = intensity_std
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    def _augment(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply random spatial + intensity augmentation for a single TTA pass."""
+    def _augment(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[int]]:
+        """Apply random spatial + intensity augmentation for a single TTA pass.
+
+        Returns:
+            Tuple of (augmented_tensor, list_of_flipped_dim_indices).
+        """
         import random
         aug = x.clone()
+        flipped_dims = []
         if self.flip:
             # Randomly flip along D (dim 2), H (dim 3), W (dim 4) axes
             for dim in [2, 3, 4]:
                 if random.random() > 0.5:
                     aug = torch.flip(aug, dims=[dim])
+                    flipped_dims.append(dim)
         if self.intensity_std > 0.0:
             aug = aug + torch.randn_like(aug) * self.intensity_std
-        return aug
+        return aug, flipped_dims
 
     def score(self, x: torch.Tensor) -> np.ndarray:
         """Return mean voxel-wise variance across TTA passes per volume.
@@ -130,13 +136,18 @@ class TTAUncertaintyScorer:
         with torch.no_grad():
             preds = []
             for _ in range(self.T):
-                aug_x = self._augment(x.to(self.device))
+                aug_x, flipped_dims = self._augment(x.to(self.device))
                 out = self.model(aug_x)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
                 elif out.ndim == 6:
                     out = out[:, 0]
                 prob = torch.sigmoid(out) if out.shape[1] == 1 else torch.softmax(out, dim=1)
+
+                # Un-flip the prediction spatially back to native coordinates
+                if flipped_dims:
+                    prob = torch.flip(prob, dims=flipped_dims)
+
                 preds.append(prob)
 
             preds = torch.stack(preds, dim=0)          # [T, B, C, D, H, W]

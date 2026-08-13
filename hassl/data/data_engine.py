@@ -195,7 +195,7 @@ def build_unlabeled_dataset(data_dir: str, image_suffix: str, labeled_ids: set,
         return Dataset(data=data_dicts, transform=transform)
 
 
-def get_base_transforms(config, keys=["image", "label"], is_training: bool = False):
+def get_base_transforms(config, keys=["image", "label"], is_training: bool = False, apply_strong_aug: bool = True):
     """Build MONAI preprocessing transform chain.
 
     Supports two strategies controlled by config.preprocessing_mode:
@@ -253,7 +253,7 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
         # "resize" mode (default), or validation in any mode
         transforms.append(Resized(keys=keys, spatial_size=config.spatial_size, mode=resize_mode))
 
-    if is_training:
+    if is_training and apply_strong_aug:
         transforms.append(get_strong_augmentation(keys=keys))
 
     return Compose(transforms)
@@ -276,8 +276,11 @@ def build_dataloaders(config):
     train_transforms = get_base_transforms(config, keys=["image", "label"], is_training=True)
     val_transforms = get_base_transforms(config, keys=["image", "label"], is_training=False)
 
-    # N-5 & M-1 fix: Pass is_training=True so patch-mode RandSpatialCropd is applied to unlabeled stream
-    unlabeled_transforms = get_base_transforms(config, keys=["image"], is_training=True)
+    # R12 H-2 fix: Pass apply_strong_aug=False for unlabeled stream dataloader
+    # Strong augmentations are applied on-the-fly in trainer.py (_make_unlabeled_views).
+    unlabeled_transforms = get_base_transforms(
+        config, keys=["image"], is_training=True, apply_strong_aug=False
+    )
 
     cache_dir = getattr(config, 'cache_dir', None)
 

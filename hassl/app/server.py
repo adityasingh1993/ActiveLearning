@@ -93,7 +93,20 @@ _state = {
     "cached_images": None,   # LRUCache populated at startup
     "cached_labels": {},
     "cached_presegs": None,  # LRUCache populated at startup
+    "edited_volumes": set(), # Set of vol_ids modified by human edits (H-2 fix)
+    "undo_stacks": {},       # {vol_id: [mask_copy, ...]} max 10 steps (R12 H-1 fix)
 }
+
+
+def _push_undo(vol_id: str, mask_3d: np.ndarray):
+    """Record a copy of mask_3d onto the undo stack and mark volume as edited."""
+    _state.setdefault("edited_volumes", set()).add(vol_id)
+    stacks = _state.setdefault("undo_stacks", {})
+    if vol_id not in stacks:
+        stacks[vol_id] = []
+    if len(stacks[vol_id]) >= 10:
+        stacks[vol_id].pop(0)  # Evict oldest undo step
+    stacks[vol_id].append(mask_3d.copy())
 
 
 def _load_volume(path: str) -> np.ndarray:
@@ -426,6 +439,9 @@ async def edit_mask_slice(vol_id: str, payload: dict):
     ax = axis_map[axis]
     index = max(0, min(index, image.shape[ax] - 1))
 
+    # Push current state to undo stack before mutating
+    _push_undo(vol_id, mask_3d)
+
     if ax == 0:
         mask_3d[index, :, :] = edited_2d
     elif ax == 1:
@@ -504,6 +520,9 @@ async def lasso_cut_3d(vol_id: str, body: dict):
     if mask_3d is None:
         mask_3d = np.zeros_like(image, dtype=np.uint8)
 
+    # Push state to undo stack before mutating
+    _push_undo(vol_id, mask_3d)
+
     axis_map = {"axial": 0, "coronal": 1, "sagittal": 2}
     ax = axis_map[axis]
     num_slices = image.shape[ax]
@@ -576,6 +595,9 @@ async def segment_op(vol_id: str, body: dict):
     if mask_3d is None:
         mask_3d = np.zeros_like(image, dtype=np.uint8)
 
+    # Push state to undo stack before mutating
+    _push_undo(vol_id, mask_3d)
+
     if op == "largest_island":
         try:
             from scipy.ndimage import label as ndi_label
@@ -645,9 +667,22 @@ async def segment_op(vol_id: str, body: dict):
     raise HTTPException(status_code=400, detail=f"Unknown segment operation {op}")
 
 
+@app.post("/api/volume/{vol_id}/undo")
+async def undo_volume_op(vol_id: str):
+    """Revert the 3D volume mask to the previous state on the undo stack (R12 H-1 fix)."""
+    stack = _state.get("undo_stacks", {}).get(vol_id, [])
+    if not stack:
+        raise HTTPException(status_code=400, detail=f"No undo history available for volume {vol_id}")
+    prev_mask = stack.pop()
+    _state["cached_presegs"][vol_id] = prev_mask
+    if len(stack) == 0:
+        _state.get("edited_volumes", set()).discard(vol_id)
+    return {"message": f"Undid last edit on {vol_id}", "remaining_undo_steps": len(stack)}
+
+
 @app.post("/api/volume/{vol_id}/accept")
 async def accept_volume(vol_id: str):
-    """Accept the pre-segmentation as a label (moves preseg -> labels directory & updates provenance C-1 fix)."""
+    """Accept the pre-segmentation as a label (moves preseg -> labels directory & updates provenance C-1 & H-2 fix)."""
     if vol_id not in _state["volumes"]:
         raise HTTPException(status_code=404, detail=f"Volume {vol_id} not found")
 
@@ -662,12 +697,12 @@ async def accept_volume(vol_id: str):
     os.makedirs(approved_dir, exist_ok=True)
 
     dest_approved = os.path.join(approved_dir, f"{vol_id}{config.label_suffix}")
-    provenance_tag = "pseudo_approved"
 
-    # C-1 fix: prefer the in-memory edited mask over the raw preseg file.
-    # Any 3D lasso / island / hole edits live in cached_presegs; copying the
-    # preseg file directly discards all annotator work silently.
-    edited_mask = _state["cached_presegs"].get(vol_id) if _state["cached_presegs"] else None
+    # H-2 fix: ONLY tag as human_corrected if the volume was explicitly edited in this session.
+    # Opening/viewing a volume caches the preseg but does NOT count as a human correction.
+    was_edited = vol_id in _state.get("edited_volumes", set())
+    edited_mask = _state["cached_presegs"].get(vol_id) if (was_edited and _state.get("cached_presegs")) else None
+
     if edited_mask is not None:
         # Write the edited in-memory mask with spatial metadata preserved.
         try:
@@ -682,10 +717,12 @@ async def accept_volume(vol_id: str):
             )
             import shutil
             shutil.copy2(preseg_path, dest_approved)
+            provenance_tag = "human_corrected"
     else:
-        # No in-memory edits — annotator accepted without changes.
+        # No human edits — user accepted raw presegmentation output without modification.
         import shutil
         shutil.copy2(preseg_path, dest_approved)
+        provenance_tag = "pseudo_approved"
 
     # Update state
     vol["label_path"] = dest_approved
