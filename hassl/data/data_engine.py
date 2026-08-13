@@ -16,7 +16,8 @@ from monai.transforms import (
     Resized,
     RandCropByPosNegLabeld,
     RandSpatialCropd,
-    ScaleIntensityRangePercentilesd
+    ScaleIntensityRangePercentilesd,
+    AsDiscreted
 )
 
 from .augmentations import get_strong_augmentation
@@ -213,6 +214,10 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
         Orientationd(keys=keys, axcodes="RAS"),
         Spacingd(keys=keys, pixdim=config.spacing, mode=mode),
     ]
+
+    # Normalize label values (e.g. 255 -> 1) to clean binary masks
+    if "label" in keys and getattr(config, 'num_classes', 1) == 1:
+        transforms.append(AsDiscreted(keys=["label"], threshold=0.5))
 
     # Intensity normalisation (image only) — placed before spatial crop so
     # crop statistics reflect the normalised distribution.
