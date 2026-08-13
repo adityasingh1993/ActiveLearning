@@ -469,6 +469,83 @@ async def edit_mask_slice(vol_id: str, payload: dict):
     return {"message": f"Slice {index} on {axis} axis saved successfully for {vol_id}", "path": out_mask_path}
 
 
+@app.post("/api/volume/{vol_id}/lasso_cut_3d")
+async def lasso_cut_3d(vol_id: str, body: dict):
+    """Extrude a 2D Lasso polygon across all slices along the specified axis in 3D volume."""
+    if vol_id not in _state["volumes"]:
+        raise HTTPException(status_code=404, detail=f"Volume {vol_id} not found")
+
+    vol = _state["volumes"][vol_id]
+    axis = body.get("axis", "axial")
+    pts = body.get("points", [])
+    action = body.get("action", "fill")
+
+    if len(pts) < 3:
+        raise HTTPException(status_code=400, detail="Lasso polygon requires at least 3 points")
+
+    if vol_id not in _state["cached_images"]:
+        _state["cached_images"][vol_id] = _load_volume(vol["image_path"])
+    image = _state["cached_images"][vol_id]
+
+    mask_path = vol.get("label_path") or vol.get("preseg_path")
+    if vol_id not in _state["cached_presegs"]:
+        if mask_path:
+            try:
+                _state["cached_presegs"][vol_id] = _load_mask(mask_path)
+            except Exception:
+                _state["cached_presegs"][vol_id] = np.zeros_like(image, dtype=np.uint8)
+        else:
+            _state["cached_presegs"][vol_id] = np.zeros_like(image, dtype=np.uint8)
+
+    mask_3d = _verify_and_align_shape(image, _state["cached_presegs"][vol_id], vol_id=vol_id)
+    if mask_3d is None:
+        mask_3d = np.zeros_like(image, dtype=np.uint8)
+
+    axis_map = {"axial": 0, "coronal": 1, "sagittal": 2}
+    ax = axis_map[axis]
+    num_slices = image.shape[ax]
+
+    # Target slice shape (H, W)
+    if ax == 0:
+        h, w = image.shape[1], image.shape[2]
+    elif ax == 1:
+        h, w = image.shape[0], image.shape[2]
+    else:
+        h, w = image.shape[0], image.shape[1]
+
+    # Rasterize 2D polygon using PIL
+    from PIL import Image, ImageDraw
+    poly_img = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(poly_img)
+    poly_pts = [(p["x"], p["y"]) if isinstance(p, dict) else (p[0], p[1]) for p in pts]
+    draw.polygon(poly_pts, fill=1)
+    poly_mask = np.array(poly_img, dtype=np.uint8)
+
+    # Extrude across all slices along the axis
+    val = 1 if action == "fill" else 0
+    if ax == 0:
+        for i in range(num_slices):
+            if action == "fill":
+                mask_3d[i, poly_mask > 0] = 1
+            else:
+                mask_3d[i, poly_mask > 0] = 0
+    elif ax == 1:
+        for i in range(num_slices):
+            if action == "fill":
+                mask_3d[:, i, :][poly_mask > 0] = 1
+            else:
+                mask_3d[:, i, :][poly_mask > 0] = 0
+    else:
+        for i in range(num_slices):
+            if action == "fill":
+                mask_3d[:, :, i][poly_mask > 0] = 1
+            else:
+                mask_3d[:, :, i][poly_mask > 0] = 0
+
+    _state["cached_presegs"][vol_id] = mask_3d
+    return {"message": f"3D Lasso Cut applied across all {num_slices} slices along {axis} axis", "slices_affected": num_slices}
+
+
 @app.post("/api/volume/{vol_id}/accept")
 async def accept_volume(vol_id: str):
     """Accept the pre-segmentation as a label (moves preseg -> labels directory & updates provenance C-1 fix)."""

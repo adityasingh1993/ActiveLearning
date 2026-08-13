@@ -95,6 +95,13 @@
         <div class="tool-section">
             <span class="section-title">SETTINGS</span>
             <div class="setting-item">
+                <label for="lasso-scope-select">Lasso Scope:</label>
+                <select id="lasso-scope-select" class="btn-tool" style="padding: 2px 6px;">
+                    <option value="single" selected>Single Slice (2D)</option>
+                    <option value="3d">All Slices (3D Extrusion)</option>
+                </select>
+            </div>
+            <div class="setting-item">
                 <label for="brush-radius">Radius: <span id="radius-val">8</span>px</label>
                 <input type="range" id="brush-radius" min="1" max="30" value="8" oninput="updateRadiusVal(this.value)">
             </div>

@@ -354,7 +354,7 @@ function floodFill(axis, startX, startY) {
     renderViewportCanvas(axis);
 }
 
-function finishLassoCut(axis) {
+async function finishLassoCut(axis) {
     const mask = state.masks2D[axis];
     const pts = state.lassoPoints;
     if (!mask || pts.length < 3) {
@@ -363,10 +363,31 @@ function finishLassoCut(axis) {
         return;
     }
 
+    const scopeSelect = document.getElementById('lasso-scope-select');
+    const scope = scopeSelect ? scopeSelect.value : 'single';
+
+    if (scope === '3d') {
+        try {
+            const res = await api(`/volume/${state.currentVolume}/lasso_cut_3d`, 'POST', {
+                axis: axis,
+                points: pts,
+                action: 'fill'
+            });
+            state.lassoPoints = [];
+            showToast(res.message || '3D Lasso Cut extruded across volume');
+            updateAllViewports();
+        } catch (err) {
+            showToast('Failed 3D Lasso Cut: ' + err.message, 'error');
+            state.lassoPoints = [];
+            renderViewportCanvas(axis);
+        }
+        return;
+    }
+
     const shape = state.maskShapes[axis];
     const [h, w] = shape;
 
-    // Use offscreen 2D canvas context for accurate polygon rasterization
+    // 2D Single Slice Rasterization
     const canvasOff = document.createElement('canvas');
     canvasOff.width = w;
     canvasOff.height = h;
@@ -389,14 +410,14 @@ function finishLassoCut(axis) {
         for (let x = 0; x < w; x++) {
             const idx = (y * w + x) * 4;
             if (data[idx + 3] > 128) {
-                mask[y][x] = 1;  // Fill polygon interior with mask label
+                mask[y][x] = 1;
                 filledCount++;
             }
         }
     }
 
     state.lassoPoints = [];
-    showToast(`Filled Lasso polygon (${filledCount} voxels)`);
+    showToast(`Filled 2D Lasso polygon (${filledCount} voxels on current slice)`);
     renderViewportCanvas(axis);
 }
 
