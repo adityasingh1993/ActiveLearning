@@ -75,28 +75,27 @@ def compute_multiscale_loss(criterion, preds, target):
 
 
 def apply_keep_largest_cc(pred_tensor: torch.Tensor) -> torch.Tensor:
-    """Keep only the largest connected component in a binary prediction batch."""
-    try:
-        from monai.transforms import KeepLargestConnectedComponent
-        transform = KeepLargestConnectedComponent(applied_labels=None)
-        lcc_samples = [transform(pred_tensor[b]) for b in range(pred_tensor.size(0))]
-        return torch.stack(lcc_samples)
-    except Exception:
-        import scipy.ndimage as ndi
-        arr = pred_tensor.detach().cpu().numpy()
-        out = np.zeros_like(arr)
-        for b in range(arr.shape[0]):
-            for c in range(arr.shape[1]):
-                mask = arr[b, c] > 0.5
-                if not mask.any():
-                    continue
-                labeled_arr, num = ndi.label(mask)
-                if num > 0:
-                    counts = np.bincount(labeled_arr.ravel())
-                    counts[0] = 0
+    """Keep only the largest connected component for each sample/channel in a binary/multiclass prediction batch."""
+    import scipy.ndimage as ndi
+
+    device = pred_tensor.device
+    arr = pred_tensor.detach().cpu().numpy()
+    out = np.zeros_like(arr)
+
+    for b in range(arr.shape[0]):
+        for c in range(arr.shape[1]):
+            mask = arr[b, c] > 0.5
+            if not mask.any():
+                continue
+            labeled_arr, num = ndi.label(mask)
+            if num > 0:
+                counts = np.bincount(labeled_arr.ravel())
+                counts[0] = 0  # Ignore background label
+                if counts.max() > 0:
                     max_lab = counts.argmax()
                     out[b, c] = (labeled_arr == max_lab).astype(arr.dtype)
-        return torch.from_numpy(out).to(pred_tensor.device)
+
+    return torch.from_numpy(out).to(device)
 
 
 class EarlyStopping:
