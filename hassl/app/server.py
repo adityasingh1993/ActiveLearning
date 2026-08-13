@@ -546,6 +546,100 @@ async def lasso_cut_3d(vol_id: str, body: dict):
     return {"message": f"3D Lasso Cut applied across all {num_slices} slices along {axis} axis", "slices_affected": num_slices}
 
 
+@app.post("/api/volume/{vol_id}/segment_op")
+async def segment_op(vol_id: str, body: dict):
+    """Execute 3D volume segment processing operations: largest_island, fill_holes, surface_cut."""
+    if vol_id not in _state["volumes"]:
+        raise HTTPException(status_code=404, detail=f"Volume {vol_id} not found")
+
+    vol = _state["volumes"][vol_id]
+    op = body.get("op", "largest_island")
+
+    if vol_id not in _state["cached_images"]:
+        _state["cached_images"][vol_id] = _load_volume(vol["image_path"])
+    image = _state["cached_images"][vol_id]
+
+    mask_path = vol.get("label_path") or vol.get("preseg_path")
+    if vol_id not in _state["cached_presegs"]:
+        if mask_path:
+            try:
+                _state["cached_presegs"][vol_id] = _load_mask(mask_path)
+            except Exception:
+                _state["cached_presegs"][vol_id] = np.zeros_like(image, dtype=np.uint8)
+        else:
+            _state["cached_presegs"][vol_id] = np.zeros_like(image, dtype=np.uint8)
+
+    mask_3d = _verify_and_align_shape(image, _state["cached_presegs"][vol_id], vol_id=vol_id)
+    if mask_3d is None:
+        mask_3d = np.zeros_like(image, dtype=np.uint8)
+
+    if op == "largest_island":
+        try:
+            from scipy.ndimage import label
+            labeled, num_features = label(mask_3d > 0)
+            if num_features > 0:
+                sizes = [np.sum(labeled == i) for i in range(1, num_features + 1)]
+                largest_label = np.argmax(sizes) + 1
+                mask_3d = (labeled == largest_label).astype(np.uint8)
+        except Exception:
+            pass  # Fallback if scipy unavailable
+        _state["cached_presegs"][vol_id] = mask_3d
+        return {"message": f"Kept largest 3D component in {vol_id}"}
+
+    elif op == "fill_holes":
+        try:
+            from scipy.ndimage import binary_fill_holes
+            mask_3d = binary_fill_holes(mask_3d > 0).astype(np.uint8)
+        except Exception:
+            pass
+        _state["cached_presegs"][vol_id] = mask_3d
+        return {"message": f"Filled all 3D interior holes in {vol_id}"}
+
+    elif op == "surface_cut":
+        axis = body.get("axis", "axial")
+        pts = body.get("points", [])
+        action = body.get("action", "fill_inside")  # "fill_inside", "cut_inside", "cut_outside"
+
+        if len(pts) < 3:
+            raise HTTPException(status_code=400, detail="Surface cut polygon requires at least 3 points")
+
+        axis_map = {"axial": 0, "coronal": 1, "sagittal": 2}
+        ax = axis_map[axis]
+        num_slices = image.shape[ax]
+
+        if ax == 0: h, w = image.shape[1], image.shape[2]
+        elif ax == 1: h, w = image.shape[0], image.shape[2]
+        else: h, w = image.shape[0], image.shape[1]
+
+        from PIL import Image, ImageDraw
+        poly_img = Image.new("L", (w, h), 0)
+        draw = ImageDraw.Draw(poly_img)
+        poly_pts = [(p["x"], p["y"]) if isinstance(p, dict) else (p[0], p[1]) for p in pts]
+        draw.polygon(poly_pts, fill=1)
+        poly_mask = np.array(poly_img, dtype=np.uint8)
+
+        for i in range(num_slices):
+            if ax == 0: s = mask_3d[i, :, :]
+            elif ax == 1: s = mask_3d[:, i, :]
+            else: s = mask_3d[:, :, i]
+
+            if action == "fill_inside":
+                s[poly_mask > 0] = 1
+            elif action == "cut_inside":
+                s[poly_mask > 0] = 0
+            elif action == "cut_outside":
+                s[poly_mask == 0] = 0
+
+            if ax == 0: mask_3d[i, :, :] = s
+            elif ax == 1: mask_3d[:, i, :] = s
+            else: mask_3d[:, :, i] = s
+
+        _state["cached_presegs"][vol_id] = mask_3d
+        return {"message": f"Surface Cut ({action}) applied across 3D volume ({num_slices} slices)"}
+
+    raise HTTPException(status_code=400, detail=f"Unknown segment operation {op}")
+
+
 @app.post("/api/volume/{vol_id}/accept")
 async def accept_volume(vol_id: str):
     """Accept the pre-segmentation as a label (moves preseg -> labels directory & updates provenance C-1 fix)."""

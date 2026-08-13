@@ -366,28 +366,33 @@ async function finishLassoCut(axis) {
     const scopeSelect = document.getElementById('lasso-scope-select');
     const scope = scopeSelect ? scopeSelect.value : 'single';
 
+    const actionSelect = document.getElementById('surface-cut-action');
+    const action = actionSelect ? actionSelect.value : 'fill_inside';
+
     if (scope === '3d') {
         try {
-            const res = await api(`/volume/${state.currentVolume}/lasso_cut_3d`, 'POST', {
+            const res = await api(`/volume/${state.currentVolume}/segment_op`, 'POST', {
+                op: 'surface_cut',
                 axis: axis,
                 points: pts,
-                action: 'fill'
+                action: action
             });
             state.lassoPoints = [];
-            showToast(res.message || '3D Lasso Cut extruded across volume');
+            showToast(res.message || '3D Surface Cut applied across volume');
             updateAllViewports();
         } catch (err) {
-            showToast('Failed 3D Lasso Cut: ' + err.message, 'error');
+            showToast('Failed 3D Surface Cut: ' + err.message, 'error');
             state.lassoPoints = [];
             renderViewportCanvas(axis);
         }
         return;
     }
 
+    // 2D Single Slice Surface Cut
+    pushHistory(axis);
     const shape = state.maskShapes[axis];
     const [h, w] = shape;
 
-    // 2D Single Slice Rasterization
     const canvasOff = document.createElement('canvas');
     canvasOff.width = w;
     canvasOff.height = h;
@@ -405,25 +410,44 @@ async function finishLassoCut(axis) {
     const imgData = ctxOff.getImageData(0, 0, w, h);
     const data = imgData.data;
 
-    let filledCount = 0;
+    let modifiedCount = 0;
     for (let y = 0; y < h; y++) {
         for (let x = 0; x < w; x++) {
             const idx = (y * w + x) * 4;
-            if (data[idx + 3] > 128) {
-                mask[y][x] = 1;
-                filledCount++;
+            const inside = data[idx + 3] > 128;
+
+            if (action === 'fill_inside') {
+                if (inside && mask[y][x] === 0) { mask[y][x] = 1; modifiedCount++; }
+            } else if (action === 'cut_inside') {
+                if (inside && mask[y][x] === 1) { mask[y][x] = 0; modifiedCount++; }
+            } else if (action === 'cut_outside') {
+                if (!inside && mask[y][x] === 1) { mask[y][x] = 0; modifiedCount++; }
             }
         }
     }
 
     state.lassoPoints = [];
-    showToast(`Filled 2D Lasso polygon (${filledCount} voxels on current slice)`);
+    showToast(`Surface Cut (${action}) applied (${modifiedCount} voxels modified)`);
     renderViewportCanvas(axis);
 }
 
 // ─── 3D Slicer Segment Processing Tools ──────────────────────────────
 
-function keepLargestIsland(axis = state.activeViewport) {
+async function keepLargestIsland(axis = state.activeViewport) {
+    const scopeSelect = document.getElementById('lasso-scope-select');
+    const scope = scopeSelect ? scopeSelect.value : 'single';
+
+    if (scope === '3d' && state.currentVolume) {
+        try {
+            const res = await api(`/volume/${state.currentVolume}/segment_op`, 'POST', { op: 'largest_island' });
+            showToast(res.message || 'Kept largest 3D component across volume');
+            updateAllViewports();
+        } catch (err) {
+            showToast('Failed 3D Largest Island: ' + err.message, 'error');
+        }
+        return;
+    }
+
     const mask = state.masks2D[axis];
     const shape = state.maskShapes[axis];
     if (!mask || !shape[0]) return;
@@ -461,11 +485,25 @@ function keepLargestIsland(axis = state.activeViewport) {
     for (const [cx, cy] of maxComponent) {
         mask[cy][cx] = 1;
     }
-    showToast(`Kept largest island (${maxComponent.length} voxels), removed noise`);
+    showToast(`Kept largest island (${maxComponent.length} voxels on current slice), removed noise`);
     renderViewportCanvas(axis);
 }
 
-function fillHoles(axis = state.activeViewport) {
+async function fillHoles(axis = state.activeViewport) {
+    const scopeSelect = document.getElementById('lasso-scope-select');
+    const scope = scopeSelect ? scopeSelect.value : 'single';
+
+    if (scope === '3d' && state.currentVolume) {
+        try {
+            const res = await api(`/volume/${state.currentVolume}/segment_op`, 'POST', { op: 'fill_holes' });
+            showToast(res.message || 'Filled all 3D interior holes across volume');
+            updateAllViewports();
+        } catch (err) {
+            showToast('Failed 3D Fill Holes: ' + err.message, 'error');
+        }
+        return;
+    }
+
     const mask = state.masks2D[axis];
     const shape = state.maskShapes[axis];
     if (!mask || !shape[0]) return;
@@ -502,7 +540,7 @@ function fillHoles(axis = state.activeViewport) {
             }
         }
     }
-    showToast(`Sealed ${filledCount} hollow voxels inside segment`);
+    showToast(`Sealed ${filledCount} hollow voxels inside 2D slice segment`);
     renderViewportCanvas(axis);
 }
 

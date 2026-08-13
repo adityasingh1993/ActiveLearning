@@ -102,6 +102,14 @@
                 </select>
             </div>
             <div class="setting-item">
+                <label for="surface-cut-action">Cut Action:</label>
+                <select id="surface-cut-action" class="btn-tool" style="padding: 2px 6px;">
+                    <option value="fill_inside" selected>Fill Inside 🟩</option>
+                    <option value="cut_inside">Cut / Erase Inside 🔴</option>
+                    <option value="cut_outside">Cut / Erase Outside 🧹</option>
+                </select>
+            </div>
+            <div class="setting-item">
                 <label for="brush-radius">Radius: <span id="radius-val">8</span>px</label>
                 <input type="range" id="brush-radius" min="1" max="30" value="8" oninput="updateRadiusVal(this.value)">
             </div>
