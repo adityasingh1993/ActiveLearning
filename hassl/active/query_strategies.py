@@ -71,8 +71,83 @@ class BALDStrategy:
         return sorted_ids[:k], scores_dict
 
 
+class TTAUncertaintyScorer:
+    """Aleatoric Uncertainty via Test-Time Augmentation (TTA).
+
+    Runs N augmented forward passes (random flips + intensity jitter) and
+    measures the voxel-wise variance of the sigmoid/softmax probability maps.
+    High variance = data-inherent ambiguity (aleatoric uncertainty).
+
+    Unlike MC Dropout (which captures *model* uncertainty), TTA captures
+    *data* uncertainty — e.g. blurry boundaries or probe-angle noise in
+    ultrasound that the model would behave differently on regardless of
+    dropout masks.
+
+    Args:
+        model: Trained segmentation network (eval mode, no dropout needed).
+        num_passes: Number of augmented forward passes (default 8).
+        flip: Whether to include random axis-flips in augmentation (default True).
+        intensity_std: Standard deviation of additive Gaussian intensity jitter (default 0.02).
+    """
+
+    def __init__(
+        self,
+        model,
+        num_passes: int = 8,
+        flip: bool = True,
+        intensity_std: float = 0.02,
+    ):
+        self.model = model
+        self.T = num_passes
+        self.flip = flip
+        self.intensity_std = intensity_std
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    def _augment(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply random spatial + intensity augmentation for a single TTA pass."""
+        import random
+        aug = x.clone()
+        if self.flip:
+            # Randomly flip along D (dim 2), H (dim 3), W (dim 4) axes
+            for dim in [2, 3, 4]:
+                if random.random() > 0.5:
+                    aug = torch.flip(aug, dims=[dim])
+        if self.intensity_std > 0.0:
+            aug = aug + torch.randn_like(aug) * self.intensity_std
+        return aug
+
+    def score(self, x: torch.Tensor) -> np.ndarray:
+        """Return mean voxel-wise variance across TTA passes per volume.
+
+        Args:
+            x: Input image tensor of shape [B, C, D, H, W].
+
+        Returns:
+            np.ndarray of shape [B] — mean voxel variance per volume.
+            Lower = less aleatoric uncertainty = safer to auto-promote.
+        """
+        self.model.eval()
+        with torch.no_grad():
+            preds = []
+            for _ in range(self.T):
+                aug_x = self._augment(x.to(self.device))
+                out = self.model(aug_x)
+                if isinstance(out, (tuple, list)):
+                    out = out[0]
+                elif out.ndim == 6:
+                    out = out[:, 0]
+                prob = torch.sigmoid(out) if out.shape[1] == 1 else torch.softmax(out, dim=1)
+                preds.append(prob)
+
+            preds = torch.stack(preds, dim=0)          # [T, B, C, D, H, W]
+            variance = preds.var(dim=0)                # [B, C, D, H, W]
+            volume_variance = variance.mean(dim=(1, 2, 3, 4))   # [B] — scalar per volume
+            return volume_variance.cpu().numpy()
+
+
 class CoreSetStrategy:
     """CoreSet Selection via Greedy k-Center in SSL Embedding Space (M-4 fix)."""
+
 
     def __init__(self, embeddings_dict: Dict[str, np.ndarray]):
         self.embeddings = embeddings_dict

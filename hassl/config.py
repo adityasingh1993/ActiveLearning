@@ -95,6 +95,15 @@ class HASSLConfig:
     al_strategy: str = "hybrid"  # "bald", "coreset", "disagreement", "hybrid"
     al_hybrid_weights: Tuple[float, float, float] = (0.4, 0.3, 0.3)  # BALD, CoreSet, Disagreement
 
+    # ─── Pseudo-Label Promotion Quality Gates ────────────────────────────
+    pseudo_confidence_threshold: float = 0.85   # Min foreground certainty to promote
+    pseudo_mc_passes: int = 5                   # MC Dropout passes for epistemic gate
+    pseudo_mc_var_threshold: float = 0.05       # Max allowed MC Dropout variance (epistemic)
+    pseudo_tta_passes: int = 8                  # TTA passes for aleatoric gate
+    pseudo_tta_var_threshold: float = 0.02      # Max allowed TTA variance (aleatoric)
+    pseudo_tta_flip: bool = True                # Random flips during TTA
+    pseudo_tta_intensity_std: float = 0.02      # Gaussian intensity jitter std during TTA
+
     # ─── Experiment Tracking (Phase 5) ───────────────────────────────────
     tracker: str = "wandb"  # "wandb", "mlflow", or "none"
     project_name: str = "hassl-ultrasound"

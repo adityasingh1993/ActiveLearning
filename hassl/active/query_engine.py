@@ -147,15 +147,64 @@ class QueryEngine:
 
         return (pred_tensor[index, 0] > 0.5).cpu().numpy().astype(np.uint8)
 
-    def auto_promote_pseudo_labels(self, model, dataloader, k=10, confidence_threshold=0.85):
-        """Rank, filter, and promote top K high-confidence pseudo-labels to data/pseudo/ (C-1, C-2 & N-1 fix)."""
+    def auto_promote_pseudo_labels(
+        self,
+        model,
+        dataloader,
+        k: int = 10,
+        confidence_threshold: float = 0.85,
+        mc_passes: int = 5,
+        mc_var_threshold: float = 0.05,
+        tta_passes: int = 8,
+        tta_var_threshold: float = 0.02,
+        tta_flip: bool = True,
+        tta_intensity_std: float = 0.02,
+    ):
+        """Rank and promote top-K high-quality pseudo-labels using three quality gates.
+
+        Gate 1 — Foreground Confidence (existing):
+            Mean probability of foreground-predicted voxels must be >= confidence_threshold.
+
+        Gate 2 — Epistemic (MC Dropout) Variance:
+            Voxel-wise prediction variance across mc_passes MC Dropout forward passes
+            must be < mc_var_threshold. High variance = model is uncertain.
+
+        Gate 3 — Aleatoric (TTA) Variance:
+            Voxel-wise prediction variance across tta_passes augmented forward passes
+            must be < tta_var_threshold. High variance = data is inherently ambiguous.
+
+        Only volumes passing ALL THREE gates are promoted to data/pseudo_unreviewed/.
+        All thresholds are configurable and can be set via HASSLConfig fields.
+        """
         if model is None or dataloader is None:
             raise ValueError("model and dataloader are required for pseudo-label promotion.")
+
+        # Pull thresholds from config if available (config values take priority)
+        if self.config is not None:
+            confidence_threshold = getattr(self.config, 'pseudo_confidence_threshold', confidence_threshold)
+            mc_passes           = getattr(self.config, 'pseudo_mc_passes', mc_passes)
+            mc_var_threshold    = getattr(self.config, 'pseudo_mc_var_threshold', mc_var_threshold)
+            tta_passes          = getattr(self.config, 'pseudo_tta_passes', tta_passes)
+            tta_var_threshold   = getattr(self.config, 'pseudo_tta_var_threshold', tta_var_threshold)
+            tta_flip            = getattr(self.config, 'pseudo_tta_flip', tta_flip)
+            tta_intensity_std   = getattr(self.config, 'pseudo_tta_intensity_std', tta_intensity_std)
+
+        from hassl.active.query_strategies import BALDStrategy, TTAUncertaintyScorer
+        mc_scorer  = BALDStrategy(model, num_passes=mc_passes)
+        tta_scorer = TTAUncertaintyScorer(
+            model,
+            num_passes=tta_passes,
+            flip=tta_flip,
+            intensity_std=tta_intensity_std,
+        )
 
         model.eval()
         candidates = []
 
-        output_pseudo_dir = os.path.join(self.config.data_dir, 'pseudo_unreviewed') if self.config else './data/pseudo_unreviewed'
+        output_pseudo_dir = (
+            os.path.join(self.config.data_dir, 'pseudo_unreviewed')
+            if self.config else './data/pseudo_unreviewed'
+        )
         os.makedirs(output_pseudo_dir, exist_ok=True)
 
         with torch.no_grad():
@@ -164,43 +213,66 @@ class QueryEngine:
                 vids = batch.get('id', batch.get('volume_id', []))
                 image_paths = batch.get('image_meta_dict', {}).get('filename_or_obj', [None] * len(vids))
 
+                # ── Gate 1: single-pass foreground confidence ──────────────
                 out = model(x)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
                 elif out.ndim == 6:
                     out = out[:, 0]
 
-                probs = torch.sigmoid(out) if getattr(self.config, 'num_classes', 1) == 1 else torch.softmax(out, dim=1)
+                probs = (
+                    torch.sigmoid(out)
+                    if getattr(self.config, 'num_classes', 1) == 1
+                    else torch.softmax(out, dim=1)
+                )
+
+                # ── Gate 2: MC Dropout epistemic variance ──────────────────
+                mc_vars = mc_scorer.score(x)   # [B]
+
+                # ── Gate 3: TTA aleatoric variance ─────────────────────────
+                tta_vars = tta_scorer.score(x)  # [B]
 
                 for i, vid in enumerate(vids):
-                    if vid in self.state['unlabeled_ids']:
-                        p_vol = probs[i, 0]
-                        fg_mask = p_vol > 0.5
-                        fg_count = fg_mask.sum().item()
+                    if vid not in self.state['unlabeled_ids']:
+                        continue
 
-                        # N-1 fix: Score confidence ONLY on foreground prediction + require >10 non-zero voxels
-                        if fg_count > 10:
-                            conf = float((p_vol[fg_mask] - 0.5).mean().item() * 2.0)
-                        else:
-                            conf = 0.0  # Empty background prediction has zero confidence
+                    p_vol = probs[i, 0]
+                    fg_mask = p_vol > 0.5
+                    fg_count = fg_mask.sum().item()
 
-                        if conf >= confidence_threshold:
-                            inverted_pred = self._invert_prediction(probs, x, batch, i)
-                            candidates.append({
-                                'id': vid,
-                                'confidence': conf,
-                                'pred_vol': inverted_pred,
-                                'ref_path': image_paths[i] if i < len(image_paths) else None,
-                            })
+                    # Gate 1 — Foreground confidence
+                    if fg_count > 10:
+                        conf = float((p_vol[fg_mask] - 0.5).mean().item() * 2.0)
+                    else:
+                        conf = 0.0  # Empty/background prediction
+
+                    mc_var  = float(mc_vars[i])
+                    tta_var = float(tta_vars[i])
+
+                    # All three gates must pass
+                    if (
+                        conf >= confidence_threshold
+                        and mc_var < mc_var_threshold
+                        and tta_var < tta_var_threshold
+                    ):
+                        inverted_pred = self._invert_prediction(probs, x, batch, i)
+                        candidates.append({
+                            'id': vid,
+                            'confidence': conf,
+                            'mc_var': mc_var,
+                            'tta_var': tta_var,
+                            'pred_vol': inverted_pred,
+                            'ref_path': image_paths[i] if i < len(image_paths) else None,
+                        })
 
         # Deduplicate candidates by volume ID, keeping the highest confidence entry per volume
-        best_candidates = {}
+        best_candidates: dict = {}
         for cand in candidates:
             vid = cand['id']
             if vid not in best_candidates or cand['confidence'] > best_candidates[vid]['confidence']:
                 best_candidates[vid] = cand
 
-        # Sort candidates by confidence score descending (C-2 fix)
+        # Sort by confidence descending and take top K
         sorted_candidates = sorted(best_candidates.values(), key=lambda c: c['confidence'], reverse=True)
         top_k_candidates = sorted_candidates[:k]
 
@@ -209,9 +281,9 @@ class QueryEngine:
             vid = cand['id']
             pred_vol = cand['pred_vol']
             ref_path = cand['ref_path']
-            output_path = os.path.join(output_pseudo_dir, f'{vid}{self.config.label_suffix if self.config else ".seg.nrrd"}')
+            label_sfx = self.config.label_suffix if self.config else '.seg.nrrd'
+            output_path = os.path.join(output_pseudo_dir, f'{vid}{label_sfx}')
 
-            # W-1 fix: Preserve spatial geometry (origin, spacing, direction matrix)
             write_mask_with_spatial_geometry(output_path, pred_vol, reference_image_path=ref_path)
 
             if vid in self.state['unlabeled_ids']:
@@ -224,11 +296,19 @@ class QueryEngine:
             promoted_ids.append(vid)
 
         self._save_manifest()
-        if self.tracker:
+
+        if self.tracker and top_k_candidates:
             self.tracker.log_metrics({
                 'auto_promoted_pseudo_labels': len(promoted_ids),
-                'mean_pseudo_confidence': float(np.mean([c['confidence'] for c in top_k_candidates])) if top_k_candidates else 0.0,
+                'mean_pseudo_confidence':
+                    float(np.mean([c['confidence'] for c in top_k_candidates])),
+                'mean_pseudo_mc_var':
+                    float(np.mean([c['mc_var'] for c in top_k_candidates])),
+                'mean_pseudo_tta_var':
+                    float(np.mean([c['tta_var'] for c in top_k_candidates])),
             }, step=0)
+        elif self.tracker:
+            self.tracker.log_metrics({'auto_promoted_pseudo_labels': 0}, step=0)
 
         return promoted_ids
 
