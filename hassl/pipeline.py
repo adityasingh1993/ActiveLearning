@@ -21,6 +21,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 import numpy as np
@@ -114,19 +115,14 @@ def run_pretrain(config: HASSLConfig) -> None:
     print("\n✓ SSL pre-training complete. Embeddings saved.")
 
 
-def run_train(config: HASSLConfig, round_num: int = 0) -> None:
-    """Phase 3: Semi-supervised training.
+def run_train(config: HASSLConfig, round_num: int = 0, pretrained_weights: Optional[str] = None) -> None:
+    """Phase 3: Semi-supervised training for round N.
 
-    Trains using UA-Mean Teacher (prototype) or CPS (full mode)
-    on labeled + unlabeled data.
-
-    Args:
-        config: HASSL configuration.
-        round_num: Active learning round number (0 = initial training).
+    UA-Mean Teacher (prototype) or CPS (full).
     """
-    from hassl.tracking import ExperimentTracker
-    from hassl.data.data_engine import build_dataloaders
     from hassl.training.trainer import HASSLTrainer
+    from hassl.data.data_engine import build_dataloaders
+    from hassl.tracking import ExperimentTracker
 
     print("=" * 60)
     print(f"HASSL Phase 3: Semi-Supervised Training (Round {round_num})")
@@ -152,9 +148,14 @@ def run_train(config: HASSLConfig, round_num: int = 0) -> None:
     print(f"  Unlabeled volumes: {len(unlabeled_loader.dataset)}")
     print(f"  Validation volumes: {len(val_loader.dataset)}")
 
-    # Load SSL pre-trained weights if available
-    ssl_checkpoint = Path(config.checkpoint_dir) / "ssl_pretrained.pth"
-    pretrained_weights = str(ssl_checkpoint) if ssl_checkpoint.exists() else None
+    # Load SSL pre-trained weights if available or explicitly passed
+    if pretrained_weights is None:
+        ssl_checkpoint = Path(config.checkpoint_dir) / "ssl_pretrained.pth"
+        if ssl_checkpoint.exists():
+            pretrained_weights = str(ssl_checkpoint)
+
+    if pretrained_weights:
+        print(f"  Using pre-trained weights: {pretrained_weights}")
 
     # Train
     trainer = HASSLTrainer(
@@ -358,7 +359,7 @@ def run_export_preseg(config: HASSLConfig) -> None:
     print(f"  Saved to: {config.preseg_dir}/")
 
 
-def run_auto_loop(config: HASSLConfig) -> None:
+def run_auto_loop(config: HASSLConfig, start_round: int = 0, pretrained_weights: Optional[str] = None) -> None:
     """Run fully automated iterative self-training (Zero Slicer / Zero Manual Labor).
 
     Pre-trains on all volumes (SSL), trains initial model, and then automatically
@@ -374,19 +375,25 @@ def run_auto_loop(config: HASSLConfig) -> None:
     print(f"  Compute mode: {config.compute_mode}")
     print(f"  Backbone: {config.unet_backbone}")
     print(f"  Automated Rounds: {config.al_rounds}")
+    print(f"  Start Round: {start_round}")
     print("=" * 60)
 
-    # 1. Pre-train (SSL)
-    run_pretrain(config)
+    # 1. Pre-train (SSL) if starting at round 0 and no pretrained_weights passed
+    if start_round == 0:
+        if pretrained_weights is None:
+            ssl_ckpt = Path(config.checkpoint_dir) / "ssl_pretrained.pth"
+            if not ssl_ckpt.exists():
+                run_pretrain(config)
+            else:
+                pretrained_weights = str(ssl_ckpt)
+        run_train(config, round_num=0, pretrained_weights=pretrained_weights)
 
-    # 2. Initial Training on 50 labels
-    run_train(config, round_num=0)
-
-    # 3. Automated Pseudo-Labeling & Retraining Rounds
+    # 2. Automated Pseudo-Labeling & Retraining Rounds
     engine = QueryEngine(config=config)
     engine.initialize_pool()
 
-    for r in range(1, config.al_rounds + 1):
+    start_r = max(1, start_round)
+    for r in range(start_r, config.al_rounds + 1):
         print(f"\n{'=' * 60}")
         print(f"  Automated Self-Training Round {r}/{config.al_rounds}")
         print(f"{'=' * 60}")
@@ -439,57 +446,29 @@ def run_all(config: HASSLConfig) -> None:
     Phase 3: Initial semi-supervised training
     Phase 4: Active learning query (Round 1)
     """
-    start_time = time.time()
-
-    print("=" * 60)
-    print("HASSL: Full Pipeline Execution")
-    print(f"  Compute mode: {config.compute_mode}")
-    print(f"  Backbone: {config.unet_backbone}")
-    print("=" * 60)
-
-    # Phase 2
     run_pretrain(config)
-
-    # Phase 3: Initial training
     run_train(config, round_num=0)
-
-    # Phase 4: First AL query
     run_query(config, round_num=1)
 
-    elapsed = time.time() - start_time
-    print(f"\n{'=' * 60}")
-    print(f"HASSL Pipeline Complete! Total time: {elapsed/60:.1f} minutes")
-    print(f"{'=' * 60}")
-    print(f"\nNext steps:")
-    print(f"  1. Open queried volumes in 3D Slicer with AI pre-segmentation")
-    print(f"  2. Correct predictions and save to {config.data_dir}/labels/")
-    print(f"  3. Run: python -m hassl.pipeline --phase al-round --round 1")
 
-
-def main():
+def main() -> None:
     """CLI entry point for the HASSL pipeline."""
     parser = argparse.ArgumentParser(
-        description="HASSL: Hybrid Active Semi-Supervised Learning Pipeline",
+        description="HASSL: Hybrid Active Semi-Supervised Learning Framework for 3D Ultrasound",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Full pipeline (prototype mode)
-  python -m hassl.pipeline --config config.yaml
+  # Run full pipeline
+  python -m hassl.pipeline --config config.yaml --phase all
 
-  # Individual phases
-  python -m hassl.pipeline --config config.yaml --phase pretrain
-  python -m hassl.pipeline --config config.yaml --phase train
-  python -m hassl.pipeline --config config.yaml --phase query
-  python -m hassl.pipeline --config config.yaml --phase export-preseg
+  # Run SSL pre-training only
+  python -m hassl.pipeline --config config.yaml --phase ssl-pretrain
 
-  # Active learning round (after annotating queried volumes)
-  python -m hassl.pipeline --config config.yaml --phase al-round --round 1
+  # Train initial model (Round 0) using pre-trained weights
+  python -m hassl.pipeline --config config.yaml --phase train --start-round 0 --pretrained experiments/checkpoints/ssl_pretrained.pth
 
-  # Switch to 24GB full mode
-  python -m hassl.pipeline --config config_full.yaml --phase train
-
-  # Override compute mode from CLI
-  python -m hassl.pipeline --config config.yaml --compute-mode full
+  # Run auto-loop starting from Round 0 using pre-trained weights
+  python -m hassl.pipeline --config config.yaml --phase auto-loop --start-round 0 --pretrained experiments/checkpoints/ssl_pretrained.pth
         """,
     )
 
@@ -499,7 +478,7 @@ Examples:
     )
     parser.add_argument(
         "--phase", type=str, default="all",
-        choices=["all", "pretrain", "train", "query", "export-preseg", "al-round", "auto-loop", "serve"],
+        choices=["all", "pretrain", "ssl-pretrain", "train", "query", "export-preseg", "al-round", "auto-loop", "serve"],
         help="Pipeline phase to run (default: all)",
     )
     parser.add_argument(
@@ -510,6 +489,14 @@ Examples:
     parser.add_argument(
         "--round", type=int, default=1,
         help="Active learning round number (for al-round and query phases)",
+    )
+    parser.add_argument(
+        "--start-round", type=int, default=None,
+        help="Starting active learning round number (for train, al-round, or auto-loop)",
+    )
+    parser.add_argument(
+        "--pretrained", type=str, default=None,
+        help="Path to pre-trained weights checkpoint (e.g. experiments/checkpoints/ssl_pretrained.pth)",
     )
     parser.add_argument(
         "--compute-mode", type=str, choices=["prototype", "full"],
@@ -551,15 +538,18 @@ Examples:
         print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
     print()
 
+    start_r = args.start_round if args.start_round is not None else (args.round if args.phase == "al-round" else 0)
+
     # Dispatch to phase
     phase_dispatch = {
         "all": lambda: run_all(config),
         "pretrain": lambda: run_pretrain(config),
-        "train": lambda: run_train(config, round_num=args.round if args.phase == "al-round" else 0),
+        "ssl-pretrain": lambda: run_pretrain(config),
+        "train": lambda: run_train(config, round_num=start_r, pretrained_weights=args.pretrained),
         "query": lambda: run_query(config, round_num=args.round),
         "export-preseg": lambda: run_export_preseg(config),
         "al-round": lambda: run_al_round(config, round_num=args.round),
-        "auto-loop": lambda: run_auto_loop(config),
+        "auto-loop": lambda: run_auto_loop(config, start_round=start_r, pretrained_weights=args.pretrained),
         "serve": lambda: run_serve(config, port=args.port),
     }
 
