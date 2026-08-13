@@ -41,13 +41,16 @@ def build_network(backbone: str, num_classes: int, dropout: float) -> nn.Module:
 
 def compute_multiscale_loss(criterion, preds, target):
     """Compute deep-supervision loss if network outputs multi-scale heads (H-8 fix)."""
+    import torch.nn.functional as F
+
     if isinstance(preds, (list, tuple)):
         # Handle list of multi-scale outputs
         loss = 0.0
         weights = [1.0 / (2 ** i) for i in range(len(preds))]
         total_w = sum(weights)
         for p, w in zip(preds, weights):
-            l = criterion(p, target)
+            t_down = F.interpolate(target.float(), size=p.shape[2:], mode='nearest') if p.shape[2:] != target.shape[2:] else target
+            l = criterion(p, t_down)
             if l.ndim > 0:
                 l = l.mean()
             loss += (w / total_w) * l
@@ -60,7 +63,8 @@ def compute_multiscale_loss(criterion, preds, target):
         total_w = sum(weights)
         for i in range(num_heads):
             p = preds[:, i]
-            l = criterion(p, target)
+            t_down = F.interpolate(target.float(), size=p.shape[2:], mode='nearest') if p.shape[2:] != target.shape[2:] else target
+            l = criterion(p, t_down)
             if l.ndim > 0:
                 l = l.mean()
             loss += (weights[i] / total_w) * l
@@ -523,28 +527,30 @@ class HASSLTrainer:
                     # Temporarily attach the prediction into a meta-dict so
                     # Invertd can trace the stored transform parameters.
                     inv_transform = Invertd(
-                        keys=["pred"],
+                        keys=["pred", "label"],
                         transform=self.val_transform,
-                        orig_keys=["image"],
-                        meta_keys=["pred_meta_dict"],
-                        orig_meta_keys=["image_meta_dict"],
+                        orig_keys=["image", "label"],
+                        meta_keys=["pred_meta_dict", "label_meta_dict"],
+                        orig_meta_keys=["image_meta_dict", "label_meta_dict"],
                         nearest_interp=True,
                         to_tensor=True,
                     )
-                    # Build a per-sample dict carrying the MetaTensor image
-                    # (needed so Invertd can read its stored transform trace).
                     sample = {
                         "image": inputs[b],
+                        "label": targets[b].clone(),
                         "pred": preds_binary[b].clone(),
                     }
-                    # image_meta_dict is required by Invertd when inputs carry
-                    # transform metadata as a separate dict (non-MetaTensor path).
                     if 'image_meta_dict' in batch_data:
                         sample["image_meta_dict"] = {
                             k: v[b] for k, v in batch_data['image_meta_dict'].items()
                         }
+                    if 'label_meta_dict' in batch_data:
+                        sample["label_meta_dict"] = {
+                            k: v[b] for k, v in batch_data['label_meta_dict'].items()
+                        }
                     inv_out = inv_transform(sample)
                     inv_pred = inv_out["pred"]
+                    inv_gt = inv_out["label"]
 
                     if orig_affine is not None and torch.is_tensor(orig_affine):
                         orig_voxel_vol = float(
@@ -558,7 +564,7 @@ class HASSLTrainer:
                         )
 
                     pv_mm3 = float(inv_pred.sum().item()) * orig_voxel_vol
-                    gv_mm3 = float(targets[b].sum().item()) * orig_voxel_vol
+                    gv_mm3 = float(inv_gt.sum().item()) * orig_voxel_vol
                 except Exception as inv_err:
                     # Invertd unavailable or MetaTensor trace missing — fall
                     # back to post-resize affine (same behaviour as before).
