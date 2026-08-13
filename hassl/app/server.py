@@ -250,44 +250,16 @@ async def get_volume_info(vol_id: str):
         _state["cached_images"][vol_id] = _load_volume(vol["image_path"])
 
     shape = _state["cached_images"][vol_id].shape
+    config = _state["config"]
+    spacing = getattr(config, 'spacing', (1.0, 1.0, 1.0)) if config else (1.0, 1.0, 1.0)
     return {
         "id": vol_id,
         "status": vol["status"],
         "shape": shape,
+        "spacing": list(spacing),
         "num_slices": {"axial": shape[0], "coronal": shape[1], "sagittal": shape[2]},
     }
 
-
-@app.get("/api/volume/{vol_id}/slice")
-async def get_slice(
-    vol_id: str,
-    axis: str = Query("axial", regex="^(axial|sagittal|coronal)$"),
-    index: int = Query(0),
-    overlay: bool = Query(True),
-    alpha: float = Query(0.4),
-):
-    """Get a 2D slice as PNG image, optionally with mask overlay."""
-    if vol_id not in _state["volumes"]:
-        raise HTTPException(status_code=404, detail=f"Volume {vol_id} not found")
-
-    vol = _state["volumes"][vol_id]
-
-    # Load and cache image
-    if vol_id not in _state["cached_images"]:
-        _state["cached_images"][vol_id] = _load_volume(vol["image_path"])
-    image = _state["cached_images"][vol_id]
-
-    # Load mask (label or preseg)
-    mask = None
-    mask_path = vol.get("label_path") or vol.get("preseg_path")
-    if mask_path and overlay:
-        cache_key = vol_id
-        if cache_key not in _state["cached_presegs"]:
-            try:
-                _state["cached_presegs"][cache_key] = _load_mask(mask_path)
-            except Exception:
-                _state["cached_presegs"][cache_key] = None
-        mask = _state["cached_presegs"].get(cache_key)
 
 def _verify_and_align_shape(image: np.ndarray, mask: Optional[np.ndarray], vol_id: Optional[str] = None) -> Optional[np.ndarray]:
     """Ensure mask shape matches image shape, re-orienting if transposed (A-3, V7-4 fix)."""
@@ -313,7 +285,7 @@ def _verify_and_align_shape(image: np.ndarray, mask: Optional[np.ndarray], vol_i
 @app.get("/api/volume/{vol_id}/slice")
 async def get_slice(
     vol_id: str,
-    axis: str = Query("axial", regex="^(axial|sagittal|coronal)$"),
+    axis: str = Query("axial", pattern="^(axial|sagittal|coronal)$"),
     index: int = Query(0),
     overlay: bool = Query(True),
     alpha: float = Query(0.4),
@@ -374,7 +346,7 @@ async def get_slice(
 @app.get("/api/volume/{vol_id}/mask_slice")
 async def get_mask_slice(
     vol_id: str,
-    axis: str = Query("axial", regex="^(axial|sagittal|coronal)$"),
+    axis: str = Query("axial", pattern="^(axial|sagittal|coronal)$"),
     index: int = Query(0),
 ):
     """Get raw 2D uint8 mask slice for interactive canvas editing."""

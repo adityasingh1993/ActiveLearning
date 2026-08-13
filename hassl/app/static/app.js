@@ -1,141 +1,95 @@
+/**
+ * 3D Slicer HASSL Multi-Planar Annotation Studio (app.js)
+ *
+ * Implements 4-quadrant synchronized MPR viewports (Axial, Coronal, Sagittal)
+ * with 3D crosshair navigation, flood fill, window/level contrast control,
+ * distance measurement ruler in mm, brush, eraser, and active learning save workflow.
+ */
+
 const state = {
     volumes: [],
     currentVolume: null,
-    currentAxis: 'axial',
-    currentSlice: 0,
-    maxSlices: { axial: 0, coronal: 0, sagittal: 0 },
+    status: 'unloaded',
+    cursor: { z: 0, y: 0, x: 0 },          // 3D Voxel Coordinate (Axial=Z, Coronal=Y, Sagittal=X)
+    maxSlices: { axial: 128, coronal: 128, sagittal: 128 },
+    spacing: [1.0, 1.0, 1.0],               // [sp_z, sp_y, sp_x] in mm
     filter: 'all',
-    currentTool: 'brush',  // 'brush' or 'eraser'
+    currentTool: 'crosshair',               // 'crosshair', 'brush', 'eraser', 'fill', 'winlevel', 'ruler'
     brushRadius: 8,
+    opacity: 0.4,
+    showCrosshairs: true,
+    winLevel: { window: 255, level: 128 },  // WW / WL contrast
+    masks2D: { axial: null, coronal: null, sagittal: null },
+    maskShapes: { axial: [0, 0], coronal: [0, 0], sagittal: [0, 0] },
+    rulerPoints: [],                        // [{x, y}, {x, y}] for distance tool
     isDrawing: false,
-    mask2D: null,          // 2D uint8 matrix [H, W]
-    maskShape: [0, 0],
+    activeViewport: 'axial',
 };
 
-// ─── API Helpers ─────────────────────────────────────────
+// ─── API Client ──────────────────────────────────────────────────────
 
 async function api(endpoint, method = 'GET', body = null) {
     const opts = { method, headers: { 'Content-Type': 'application/json' } };
     if (body) opts.body = JSON.stringify(body);
     const res = await fetch(`/api${endpoint}`, opts);
     if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: 'Unknown error' }));
+        const err = await res.json().catch(() => ({ detail: 'API Error' }));
         throw new Error(err.detail || 'API Error');
     }
     return res.json();
 }
 
-// ─── Initialization ──────────────────────────────────────
+// ─── Initialization ──────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', async () => {
     await loadVolumes();
     await loadMetrics();
-    initCanvas();
+    initViewportCanvas('axial');
+    initViewportCanvas('coronal');
+    initViewportCanvas('sagittal');
 
-    // Keyboard shortcuts
+    // Global Hotkeys
     document.addEventListener('keydown', (e) => {
         if (!state.currentVolume) return;
         switch (e.key) {
-            case 'ArrowUp':
-            case 'ArrowRight':
-                e.preventDefault();
-                changeSlice(1);
-                break;
-            case 'ArrowDown':
-            case 'ArrowLeft':
-                e.preventDefault();
-                changeSlice(-1);
-                break;
-            case 'a':
-                acceptVolume();
-                break;
-            case 'r':
-                rejectVolume();
-                break;
-            case 'n':
-                loadNextVolume();
-                break;
-            case 'b':
-                setDrawTool('brush');
-                break;
-            case 'e':
-                setDrawTool('eraser');
-                break;
+            case '1': setDrawTool('crosshair'); break;
+            case '2': setDrawTool('brush'); break;
+            case '3': setDrawTool('eraser'); break;
+            case '4': setDrawTool('fill'); break;
+            case '5': setDrawTool('winlevel'); break;
+            case '6': setDrawTool('ruler'); break;
+            case 'a': acceptVolume(); break;
+            case 'r': rejectVolume(); break;
+            case 'n': loadNextVolume(); break;
             case 's':
                 if (e.ctrlKey || e.metaKey) {
                     e.preventDefault();
                     saveSliceEdit();
                 }
                 break;
-            case '1':
-                switchAxis('axial', document.querySelector('[data-axis="axial"]'));
-                break;
-            case '2':
-                switchAxis('coronal', document.querySelector('[data-axis="coronal"]'));
-                break;
-            case '3':
-                switchAxis('sagittal', document.querySelector('[data-axis="sagittal"]'));
-                break;
         }
     });
-
-    // Mouse wheel scroll on canvas & image
-    const canvas = document.getElementById('draw-canvas');
-    if (canvas) {
-        canvas.addEventListener('wheel', (e) => {
-            e.preventDefault();
-            changeSlice(e.deltaY > 0 ? 1 : -1);
-        }, { passive: false });
-    }
 });
 
-// ─── Canvas & Interactive Drawing ────────────────────────
-
-function initCanvas() {
-    const canvas = document.getElementById('draw-canvas');
-    if (!canvas) return;
-
-    const getCanvasCoords = (e) => {
-        const rect = canvas.getBoundingClientRect();
-        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-        const scaleX = canvas.width / rect.width;
-        const scaleY = canvas.height / rect.height;
-        return {
-            x: Math.floor((clientX - rect.left) * scaleX),
-            y: Math.floor((clientY - rect.top) * scaleY)
-        };
-    };
-
-    const startDraw = (e) => {
-        if (!state.currentVolume || !state.mask2D) return;
-        state.isDrawing = true;
-        drawStroke(getCanvasCoords(e));
-    };
-
-    const drawMove = (e) => {
-        if (!state.isDrawing || !state.mask2D) return;
-        drawStroke(getCanvasCoords(e));
-    };
-
-    const stopDraw = () => {
-        state.isDrawing = false;
-    };
-
-    canvas.addEventListener('mousedown', startDraw);
-    canvas.addEventListener('mousemove', drawMove);
-    canvas.addEventListener('mouseup', stopDraw);
-    canvas.addEventListener('mouseleave', stopDraw);
-
-    canvas.addEventListener('touchstart', (e) => { e.preventDefault(); startDraw(e); }, { passive: false });
-    canvas.addEventListener('touchmove', (e) => { e.preventDefault(); drawMove(e); }, { passive: false });
-    canvas.addEventListener('touchend', stopDraw);
-}
+// ─── Slicer Tool Selection ──────────────────────────────────────────
 
 function setDrawTool(tool) {
     state.currentTool = tool;
-    document.getElementById('tool-brush').classList.toggle('active', tool === 'brush');
-    document.getElementById('tool-eraser').classList.toggle('active', tool === 'eraser');
+    state.rulerPoints = [];
+    document.querySelectorAll('.btn-tool').forEach(btn => btn.classList.remove('active'));
+    const activeBtn = document.getElementById(`tool-${tool}`);
+    if (activeBtn) activeBtn.classList.add('active');
+
+    const names = {
+        crosshair: '🎯 3D Crosshair Navigation',
+        brush: '🖌️ Paint Brush',
+        eraser: '🧹 Erase Brush',
+        fill: '🪣 Flood Fill',
+        winlevel: '🌗 Window / Level Contrast',
+        ruler: '📏 Physical Distance Ruler (mm)'
+    };
+    document.getElementById('hud-tool-name').textContent = names[tool] || tool;
+    updateAllViewports();
 }
 
 function updateRadiusVal(val) {
@@ -143,9 +97,121 @@ function updateRadiusVal(val) {
     document.getElementById('radius-val').textContent = val;
 }
 
-function drawStroke(pt) {
-    if (!state.mask2D || !state.maskShape[0]) return;
-    const [h, w] = state.maskShape;
+// ─── Viewport Interaction & Canvas Handling ─────────────────────────
+
+function initViewportCanvas(axis) {
+    const canvas = document.getElementById(`canvas-${axis}`);
+    if (!canvas) return;
+
+    let dragStartWW = null;
+
+    const getCoords = (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        return {
+            x: Math.floor((clientX - rect.left) * scaleX),
+            y: Math.floor((clientY - rect.top) * scaleY),
+            clientX, clientY
+        };
+    };
+
+    const handlePointerDown = (e) => {
+        if (!state.currentVolume) return;
+        state.activeViewport = axis;
+        const pt = getCoords(e);
+
+        if (state.currentTool === 'crosshair') {
+            update3DCursorFromViewport(axis, pt.x, pt.y);
+        } else if (state.currentTool === 'fill') {
+            floodFill(axis, pt.x, pt.y);
+        } else if (state.currentTool === 'ruler') {
+            addRulerPoint(axis, pt);
+        } else if (state.currentTool === 'winlevel') {
+            dragStartWW = { x: pt.clientX, y: pt.clientY, ww: state.winLevel.window, wl: state.winLevel.level };
+        } else if (state.currentTool === 'brush' || state.currentTool === 'eraser') {
+            state.isDrawing = true;
+            applyBrushStroke(axis, pt);
+        }
+    };
+
+    const handlePointerMove = (e) => {
+        if (!state.currentVolume) return;
+        const pt = getCoords(e);
+
+        if (state.currentTool === 'crosshair' && e.buttons === 1) {
+            update3DCursorFromViewport(axis, pt.x, pt.y);
+        } else if (state.currentTool === 'winlevel' && dragStartWW && e.buttons === 1) {
+            const dx = pt.clientX - dragStartWW.x;
+            const dy = pt.clientY - dragStartWW.y;
+            state.winLevel.window = Math.max(1, Math.min(500, dragStartWW.ww + dx));
+            state.winLevel.level = Math.max(0, Math.min(255, dragStartWW.wl - dy));
+            updateAllViewports();
+        } else if (state.isDrawing && (state.currentTool === 'brush' || state.currentTool === 'eraser')) {
+            applyBrushStroke(axis, pt);
+        }
+    };
+
+    const handlePointerUp = () => {
+        state.isDrawing = false;
+        dragStartWW = null;
+    };
+
+    canvas.addEventListener('mousedown', handlePointerDown);
+    canvas.addEventListener('mousemove', handlePointerMove);
+    canvas.addEventListener('mouseup', handlePointerUp);
+    canvas.addEventListener('mouseleave', handlePointerUp);
+
+    // Mousewheel slice stepping
+    canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        stepSlice(axis, e.deltaY > 0 ? 1 : -1);
+    }, { passive: false });
+}
+
+// ─── 3D Crosshair Navigation & MPR Sync ──────────────────────────────
+
+function update3DCursorFromViewport(axis, ptX, ptY) {
+    if (axis === 'axial') {
+        // Axial slice is (Z). ptX maps to Sagittal (X), ptY maps to Coronal (Y)
+        state.cursor.x = Math.max(0, Math.min(ptX, state.maxSlices.sagittal - 1));
+        state.cursor.y = Math.max(0, Math.min(ptY, state.maxSlices.coronal - 1));
+    } else if (axis === 'coronal') {
+        // Coronal slice is (Y). ptX maps to Sagittal (X), ptY maps to Axial (Z)
+        state.cursor.x = Math.max(0, Math.min(ptX, state.maxSlices.sagittal - 1));
+        state.cursor.z = Math.max(0, Math.min(ptY, state.maxSlices.axial - 1));
+    } else if (axis === 'sagittal') {
+        // Sagittal slice is (X). ptX maps to Coronal (Y), ptY maps to Axial (Z)
+        state.cursor.y = Math.max(0, Math.min(ptX, state.maxSlices.coronal - 1));
+        state.cursor.z = Math.max(0, Math.min(ptY, state.maxSlices.axial - 1));
+    }
+    updateAllViewports();
+}
+
+function stepSlice(axis, delta) {
+    const keyMap = { axial: 'z', coronal: 'y', sagittal: 'x' };
+    const key = keyMap[axis];
+    const maxVal = state.maxSlices[axis] || 128;
+    state.cursor[key] = Math.max(0, Math.min(state.cursor[key] + delta, maxVal - 1));
+    updateAllViewports();
+}
+
+function onViewportSliderChange(axis, value) {
+    const keyMap = { axial: 'z', coronal: 'y', sagittal: 'x' };
+    state.cursor[keyMap[axis]] = parseInt(value);
+    updateAllViewports();
+}
+
+// ─── Brush & Flood Fill ──────────────────────────────────────────────
+
+function applyBrushStroke(axis, pt) {
+    const mask = state.masks2D[axis];
+    const shape = state.maskShapes[axis];
+    if (!mask || !shape[0]) return;
+
+    const [h, w] = shape;
     const val = state.currentTool === 'brush' ? 1 : 0;
     const r = state.brushRadius;
 
@@ -155,51 +221,110 @@ function drawStroke(pt) {
                 const py = pt.y + dy;
                 const px = pt.x + dx;
                 if (py >= 0 && py < h && px >= 0 && px < w) {
-                    state.mask2D[py][px] = val;
+                    mask[py][px] = val;
                 }
             }
         }
     }
-    renderMaskToCanvas();
+    renderViewportCanvas(axis);
 }
 
-function renderMaskToCanvas() {
-    const canvas = document.getElementById('draw-canvas');
-    if (!canvas || !state.mask2D) return;
-    const ctx = canvas.getContext('2d');
-    const [h, w] = state.maskShape;
+function floodFill(axis, startX, startY) {
+    const mask = state.masks2D[axis];
+    const shape = state.maskShapes[axis];
+    if (!mask || !shape[0]) return;
 
-    if (canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
-    }
+    const [h, w] = shape;
+    if (startX < 0 || startX >= w || startY < 0 || startY >= h) return;
 
-    ctx.clearRect(0, 0, w, h);
-    const overlayChecked = document.getElementById('overlay-toggle').checked;
-    if (!overlayChecked) return;
+    const targetVal = mask[startY][startX];
+    const fillVal = targetVal === 1 ? 0 : 1;
+    if (targetVal === fillVal) return;
 
-    const alpha = document.getElementById('alpha-slider').value / 100;
-    const imgData = ctx.createImageData(w, h);
-    const data = imgData.data;
-
-    for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-            if (state.mask2D[y][x] > 0) {
-                const idx = (y * w + x) * 4;
-                data[idx] = 63;       // Red
-                data[idx + 1] = 185;  // Green (MONAI green overlay)
-                data[idx + 2] = 80;   // Blue
-                data[idx + 3] = Math.floor(alpha * 255);
-            }
+    const stack = [[startX, startY]];
+    while (stack.length > 0) {
+        const [x, y] = stack.pop();
+        if (x < 0 || x >= w || y < 0 || y >= h) continue;
+        if (mask[y][x] === targetVal) {
+            mask[y][x] = fillVal;
+            stack.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
         }
     }
-    ctx.putImageData(imgData, 0, 0);
+    renderViewportCanvas(axis);
 }
 
-/**
- * Decode a [[value, count], ...] RLE sequence into a 2D array of shape [h, w].
- * Row-major order matches the server's numpy ravel() C-order (V6-9 fix).
- */
+// ─── Distance Ruler Tool ──────────────────────────────────────────────
+
+function addRulerPoint(axis, pt) {
+    state.rulerPoints.push(pt);
+    if (state.rulerPoints.length > 2) state.rulerPoints = [pt];
+
+    if (state.rulerPoints.length === 2) {
+        const p1 = state.rulerPoints[0];
+        const p2 = state.rulerPoints[1];
+        const spY = state.spacing[1] || 1.0;
+        const spX = state.spacing[2] || 1.0;
+        const distMm = Math.sqrt(Math.pow((p2.x - p1.x) * spX, 2) + Math.pow((p2.y - p1.y) * spY, 2));
+        document.getElementById('hud-measurement').textContent = `${distMm.toFixed(2)} mm`;
+    } else {
+        document.getElementById('hud-measurement').textContent = 'Point 1 set...';
+    }
+    renderViewportCanvas(axis);
+}
+
+// ─── Rendering Viewports & Crosshairs ────────────────────────────────
+
+function updateAllViewports() {
+    if (!state.currentVolume) return;
+
+    // Update Sliders & HUD Text
+    document.getElementById('slider-axial').value = state.cursor.z;
+    document.getElementById('slider-coronal').value = state.cursor.y;
+    document.getElementById('slider-sagittal').value = state.cursor.x;
+
+    document.getElementById('info-axial').textContent = `Slice Z: ${state.cursor.z + 1} / ${state.maxSlices.axial}`;
+    document.getElementById('info-coronal').textContent = `Slice Y: ${state.cursor.y + 1} / ${state.maxSlices.coronal}`;
+    document.getElementById('info-sagittal').textContent = `Slice X: ${state.cursor.x + 1} / ${state.maxSlices.sagittal}`;
+
+    document.getElementById('hud-axial').textContent = `Z: ${state.cursor.z}`;
+    document.getElementById('hud-coronal').textContent = `Y: ${state.cursor.y}`;
+    document.getElementById('hud-sagittal').textContent = `X: ${state.cursor.x}`;
+
+    document.getElementById('coord-z').textContent = state.cursor.z;
+    document.getElementById('coord-y').textContent = state.cursor.y;
+    document.getElementById('coord-x').textContent = state.cursor.x;
+
+    state.showCrosshairs = document.getElementById('crosshair-toggle').checked;
+    state.opacity = parseInt(document.getElementById('alpha-slider').value) / 100;
+    document.getElementById('opacity-val').textContent = document.getElementById('alpha-slider').value;
+
+    fetchAndRenderSlice('axial', state.cursor.z);
+    fetchAndRenderSlice('coronal', state.cursor.y);
+    fetchAndRenderSlice('sagittal', state.cursor.x);
+}
+
+async function fetchAndRenderSlice(axis, index) {
+    if (!state.currentVolume) return;
+    const imgEl = document.getElementById(`img-${axis}`);
+    const url = `/api/volume/${state.currentVolume}/slice?axis=${axis}&index=${index}&overlay=false`;
+    imgEl.src = url;
+
+    // Fetch mask slice
+    try {
+        const data = await api(`/volume/${state.currentVolume}/mask_slice?axis=${axis}&index=${index}`);
+        if (data.encoding === 'rle' && data.mask_rle) {
+            state.masks2D[axis] = rle_decode(data.mask_rle, data.shape);
+        } else {
+            state.masks2D[axis] = data.mask;
+        }
+        state.maskShapes[axis] = data.shape;
+        renderViewportCanvas(axis);
+    } catch (err) {
+        state.masks2D[axis] = null;
+        renderViewportCanvas(axis);
+    }
+}
+
 function rle_decode(rle, shape) {
     const [h, w] = shape;
     const flat = new Uint8Array(h * w);
@@ -208,7 +333,6 @@ function rle_decode(rle, shape) {
         flat.fill(val, pos, pos + count);
         pos += count;
     }
-    // Reshape into 2D array [h][w]
     const out = [];
     for (let r = 0; r < h; r++) {
         out.push(Array.from(flat.subarray(r * w, (r + 1) * w)));
@@ -216,23 +340,80 @@ function rle_decode(rle, shape) {
     return out;
 }
 
-async function fetchMaskSlice() {
-    if (!state.currentVolume) return;
-    try {
-        const data = await api(`/volume/${state.currentVolume}/mask_slice?axis=${state.currentAxis}&index=${state.currentSlice}`);
-        if (data.encoding === 'rle' && data.mask_rle) {
-            state.mask2D = rle_decode(data.mask_rle, data.shape);
-        } else {
-            state.mask2D = data.mask;  // legacy fallback
+function renderViewportCanvas(axis) {
+    const canvas = document.getElementById(`canvas-${axis}`);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const mask = state.masks2D[axis];
+    const shape = state.maskShapes[axis];
+    if (!shape || !shape[0]) return;
+
+    const [h, w] = shape;
+    if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+    }
+
+    ctx.clearRect(0, 0, w, h);
+
+    // Draw Mask
+    if (mask) {
+        const alpha = state.opacity;
+        const imgData = ctx.createImageData(w, h);
+        const data = imgData.data;
+
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                if (mask[y][x] > 0) {
+                    const idx = (y * w + x) * 4;
+                    data[idx] = 63;       // Red
+                    data[idx + 1] = 185;  // Green (MONAI green overlay)
+                    data[idx + 2] = 80;   // Blue
+                    data[idx + 3] = Math.floor(alpha * 255);
+                }
+            }
         }
-        state.maskShape = data.shape;
-        renderMaskToCanvas();
-    } catch (err) {
-        state.mask2D = null;
+        ctx.putImageData(imgData, 0, 0);
+    }
+
+    // Draw 3D Crosshairs
+    if (state.showCrosshairs) {
+        ctx.lineWidth = 1;
+        let crossX = 0, crossY = 0;
+        if (axis === 'axial') { crossX = state.cursor.x; crossY = state.cursor.y; }
+        else if (axis === 'coronal') { crossX = state.cursor.x; crossY = state.cursor.z; }
+        else if (axis === 'sagittal') { crossX = state.cursor.y; crossY = state.cursor.z; }
+
+        ctx.strokeStyle = axis === 'axial' ? '#ff3b30' : (axis === 'coronal' ? '#34c759' : '#ffcc00');
+        ctx.beginPath();
+        ctx.moveTo(crossX, 0); ctx.lineTo(crossX, h);
+        ctx.moveTo(0, crossY); ctx.lineTo(w, crossY);
+        ctx.stroke();
+    }
+
+    // Draw Distance Ruler
+    if (state.currentTool === 'ruler' && state.rulerPoints.length > 0 && state.activeViewport === axis) {
+        ctx.strokeStyle = '#007aff';
+        ctx.fillStyle = '#007aff';
+        ctx.lineWidth = 2;
+
+        for (const pt of state.rulerPoints) {
+            ctx.beginPath();
+            ctx.arc(pt.x, pt.y, 4, 0, 2 * Math.PI);
+            ctx.fill();
+        }
+
+        if (state.rulerPoints.length === 2) {
+            const [p1, p2] = state.rulerPoints;
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.stroke();
+        }
     }
 }
 
-// ─── Volume List ─────────────────────────────────────────
+// ─── Volume Selection & Queue Management ────────────────────────────
 
 async function loadVolumes() {
     try {
@@ -240,7 +421,7 @@ async function loadVolumes() {
         state.volumes = data.volumes || [];
         renderVolumeList();
     } catch (err) {
-        showToast('Failed to load volumes: ' + err.message, 'error');
+        showToast('Failed to load volume queue: ' + err.message, 'error');
     }
 }
 
@@ -250,9 +431,8 @@ function renderVolumeList() {
         ? state.volumes
         : state.volumes.filter(v => v.status === state.filter);
 
-    list.innerHTML = filtered.map((vol, i) => `
+    list.innerHTML = filtered.map((vol) => `
         <div class="volume-item ${state.currentVolume === vol.id ? 'active' : ''}"
-             style="animation-delay: ${i * 30}ms"
              onclick="selectVolume('${vol.id}')">
             <div class="status-dot ${vol.status}"></div>
             <span class="vol-name">${vol.id}</span>
@@ -268,118 +448,72 @@ function filterVolumes(filter, btn) {
     renderVolumeList();
 }
 
-// ─── Volume Selection ────────────────────────────────────
-
 async function selectVolume(volId) {
     state.currentVolume = volId;
-    state.currentSlice = 0;
-
-    // Show viewer, hide placeholder
     document.getElementById('viewer-placeholder').style.display = 'none';
-    document.getElementById('viewer-container').style.display = 'flex';
+    document.getElementById('mpr-grid').style.display = 'grid';
 
     try {
         const info = await api(`/volume/${volId}/info`);
         state.maxSlices = info.num_slices;
+        state.spacing = info.spacing || [1.0, 1.0, 1.0];
+        state.status = info.status;
 
-        // Reset to middle slice
-        const maxForAxis = state.maxSlices[state.currentAxis] || 128;
-        state.currentSlice = Math.floor(maxForAxis / 2);
+        state.cursor = {
+            z: Math.floor(info.num_slices.axial / 2),
+            y: Math.floor(info.num_slices.coronal / 2),
+            x: Math.floor(info.num_slices.sagittal / 2)
+        };
 
-        const slider = document.getElementById('slice-slider');
-        slider.max = maxForAxis - 1;
-        slider.value = state.currentSlice;
+        document.getElementById('slider-axial').max = info.num_slices.axial - 1;
+        document.getElementById('slider-coronal').max = info.num_slices.coronal - 1;
+        document.getElementById('slider-sagittal').max = info.num_slices.sagittal - 1;
 
-        updateSlice();
+        document.getElementById('vol-id-display').textContent = volId;
+        document.getElementById('meta-dims').textContent = `${info.shape[0]} x ${info.shape[1]} x ${info.shape[2]}`;
+        document.getElementById('meta-spacing').textContent = `${state.spacing[0]} x ${state.spacing[1]} x ${state.spacing[2]} mm`;
+        document.getElementById('meta-status').textContent = info.status;
+
+        updateAllViewports();
         renderVolumeList();
     } catch (err) {
         showToast('Failed to load volume: ' + err.message, 'error');
     }
 }
 
-// ─── Slice Viewing ───────────────────────────────────────
-
-function updateSlice() {
-    if (!state.currentVolume) return;
-
-    const overlay = false;  // Canvas handles interactive mask drawing directly
-    const alpha = document.getElementById('alpha-slider').value / 100;
-
-    const url = `/api/volume/${state.currentVolume}/slice`
-        + `?axis=${state.currentAxis}`
-        + `&index=${state.currentSlice}`
-        + `&overlay=${overlay}`
-        + `&alpha=${alpha}`;
-
-    const img = document.getElementById('slice-image');
-    img.src = url;
-
-    const maxForAxis = state.maxSlices[state.currentAxis] || 0;
-    document.getElementById('slice-info').textContent =
-        `${state.currentAxis} — Slice ${state.currentSlice + 1} / ${maxForAxis}`;
-
-    fetchMaskSlice();
-}
-
-function onSliderChange(value) {
-    state.currentSlice = parseInt(value);
-    updateSlice();
-}
-
-function changeSlice(delta) {
-    const maxForAxis = state.maxSlices[state.currentAxis] || 128;
-    state.currentSlice = Math.max(0, Math.min(state.currentSlice + delta, maxForAxis - 1));
-
-    document.getElementById('slice-slider').value = state.currentSlice;
-    updateSlice();
-}
-
-function switchAxis(axis, btn) {
-    state.currentAxis = axis;
-
-    document.querySelectorAll('.axis-tab').forEach(t => t.classList.remove('active'));
-    if (btn) btn.classList.add('active');
-
-    const maxForAxis = state.maxSlices[axis] || 128;
-    state.currentSlice = Math.floor(maxForAxis / 2);
-
-    const slider = document.getElementById('slice-slider');
-    slider.max = maxForAxis - 1;
-    slider.value = state.currentSlice;
-
-    updateSlice();
-}
-
-// ─── Actions ─────────────────────────────────────────────
+// ─── Actions: Save, Accept, Reject, Retrain ──────────────────────────
 
 async function saveSliceEdit() {
-    if (!state.currentVolume || !state.mask2D) return;
+    if (!state.currentVolume) return;
+    const axis = state.activeViewport;
+    const mask = state.masks2D[axis];
+    if (!mask) return;
+
+    const sliceIdx = axis === 'axial' ? state.cursor.z : (axis === 'coronal' ? state.cursor.y : state.cursor.x);
+
     try {
-        const res = await api(`/volume/${state.currentVolume}/slice_edit`, 'POST', {
-            axis: state.currentAxis,
-            index: state.currentSlice,
-            mask_data: state.mask2D,
+        await api(`/volume/${state.currentVolume}/mask_slice`, 'POST', {
+            axis,
+            index: sliceIdx,
+            mask: mask
         });
-        showToast(`💾 Saved slice edit for ${state.currentVolume}`, 'success');
-        await loadVolumes();
-        await loadMetrics();
+        showToast(`Saved slice edit on ${axis.toUpperCase()} slice ${sliceIdx + 1}`);
+        updateAllViewports();
     } catch (err) {
         showToast('Failed to save slice edit: ' + err.message, 'error');
     }
 }
 
-// ─── Actions ─────────────────────────────────────────────
-
 async function acceptVolume() {
     if (!state.currentVolume) return;
     try {
-        const res = await api(`/volume/${state.currentVolume}/accept`, 'POST');
-        showToast(`✅ ${state.currentVolume} accepted!`, 'success');
+        await api(`/volume/${state.currentVolume}/accept`, 'POST');
+        showToast(`Accepted volume ${state.currentVolume}`);
         await loadVolumes();
         await loadMetrics();
         loadNextVolume();
     } catch (err) {
-        showToast('Failed: ' + err.message, 'error');
+        showToast('Failed to accept volume: ' + err.message, 'error');
     }
 }
 
@@ -387,60 +521,46 @@ async function rejectVolume() {
     if (!state.currentVolume) return;
     try {
         await api(`/volume/${state.currentVolume}/reject`, 'POST');
-        showToast(`❌ ${state.currentVolume} rejected`, 'error');
+        showToast(`Rejected volume ${state.currentVolume}`);
         await loadVolumes();
+        await loadMetrics();
         loadNextVolume();
     } catch (err) {
-        showToast('Failed: ' + err.message, 'error');
+        showToast('Failed to reject volume: ' + err.message, 'error');
     }
 }
 
 function loadNextVolume() {
-    const presegVolumes = state.volumes.filter(v => v.status === 'preseg');
-    if (presegVolumes.length > 0) {
-        const next = presegVolumes.find(v => v.id !== state.currentVolume) || presegVolumes[0];
-        selectVolume(next.id);
-    } else {
-        showToast('No more pre-segmented volumes to review!', 'success');
-    }
+    const list = state.volumes;
+    if (!list.length) return;
+    const curIdx = list.findIndex(v => v.id === state.currentVolume);
+    const nextVol = list[(curIdx + 1) % list.length];
+    if (nextVol) selectVolume(nextVol.id);
 }
 
 async function triggerRetrain() {
     try {
         const res = await api('/retrain', 'POST');
-        showToast('🔄 ' + res.message, 'success');
+        showToast(res.message || 'Retraining triggered');
     } catch (err) {
-        showToast('Failed: ' + err.message, 'error');
+        showToast('Failed to trigger retrain: ' + err.message, 'error');
     }
 }
-
-// ─── Metrics ─────────────────────────────────────────────
 
 async function loadMetrics() {
     try {
-        const metrics = await api('/metrics');
-        document.getElementById('count-labeled').textContent = metrics.labeled_count || 0;
-
-        const presegCount = state.volumes.filter(v => v.status === 'preseg').length;
-        const unlabeledCount = state.volumes.filter(v => v.status === 'unlabeled').length;
-        document.getElementById('count-preseg').textContent = presegCount;
-        document.getElementById('count-unlabeled').textContent = unlabeledCount;
+        const data = await api('/metrics');
+        document.getElementById('count-labeled').textContent = data.labeled_count || 0;
+        document.getElementById('count-preseg').textContent = data.unlabeled_count || 0;
+        document.getElementById('count-unlabeled').textContent = state.volumes.filter(v => v.status === 'unlabeled').length;
     } catch (err) {
-        // Silently fail metrics
+        // Silent metric fail fallback
     }
 }
 
-// ─── Toast Notifications ─────────────────────────────────
-
-function showToast(message, type = 'info') {
+function showToast(msg, type = 'info') {
     const toast = document.getElementById('toast');
-    toast.textContent = message;
+    toast.textContent = msg;
     toast.className = `toast ${type}`;
-
-    // Force reflow for animation
-    toast.offsetHeight;
-
-    setTimeout(() => {
-        toast.classList.add('hidden');
-    }, 3000);
+    setTimeout(() => toast.classList.add('hidden'), 3000);
 }

@@ -3,19 +3,20 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HASSL — 3D Annotation UI</title>
-    <meta name="description" content="Browser-based annotation tool for 3D BMode ultrasound segmentation">
+    <title>HASSL — 3D Slicer Multi-Planar Annotation Studio</title>
+    <meta name="description" content="3D Slicer-style multi-planar MPR annotation tool for active learning B-mode ultrasound segmentation">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/index.css">
 </head>
-<body>
-    <!-- Header -->
+<body class="slicer-theme">
+    <!-- Main Header -->
     <header id="main-header">
         <div class="header-left">
-            <h1 class="logo">HASSL</h1>
-            <span class="subtitle">3D Annotation UI</span>
+            <h1 class="logo"><span class="logo-accent">3D</span> Slicer<span class="logo-sub">HASSL</span></h1>
+            <span class="version-tag">MPR v2.0</span>
         </div>
+
         <div class="header-center" id="metrics-bar">
             <div class="metric-chip" id="chip-labeled">
                 <span class="metric-icon">✅</span>
@@ -33,16 +34,77 @@
                 <span class="metric-value" id="count-unlabeled">0</span>
             </div>
         </div>
+
         <div class="header-right">
             <button id="btn-retrain" class="btn btn-accent" onclick="triggerRetrain()">
-                🔄 Retrain Model
+                🔄 Retrain Active Learning Model
             </button>
         </div>
     </header>
 
-    <!-- Main Layout -->
+    <!-- Slicer3D Global Toolbar -->
+    <nav id="slicer-toolbar">
+        <div class="tool-section">
+            <span class="section-title">TOOLS</span>
+            <button id="tool-crosshair" class="btn-tool active" onclick="setDrawTool('crosshair')" title="3D Crosshair Navigation (Click to inspect 3D voxel)">
+                🎯 Crosshair
+            </button>
+            <button id="tool-brush" class="btn-tool" onclick="setDrawTool('brush')" title="Paint Brush">
+                🖌️ Paint
+            </button>
+            <button id="tool-eraser" class="btn-tool" onclick="setDrawTool('eraser')" title="Erase Brush">
+                🧹 Erase
+            </button>
+            <button id="tool-fill" class="btn-tool" onclick="setDrawTool('fill')" title="Connected Component Flood Fill">
+                🪣 Fill
+            </button>
+            <button id="tool-winlevel" class="btn-tool" onclick="setDrawTool('winlevel')" title="Window / Level Brightness & Contrast">
+                🌗 Win/Level
+            </button>
+            <button id="tool-ruler" class="btn-tool" onclick="setDrawTool('ruler')" title="Physical Distance Ruler (mm)">
+                📏 Ruler
+            </button>
+        </div>
+
+        <div class="tool-divider"></div>
+
+        <div class="tool-section">
+            <span class="section-title">SETTINGS</span>
+            <div class="setting-item">
+                <label for="brush-radius">Radius: <span id="radius-val">8</span>px</label>
+                <input type="range" id="brush-radius" min="1" max="30" value="8" oninput="updateRadiusVal(this.value)">
+            </div>
+            <div class="setting-item">
+                <label for="alpha-slider">Opacity: <span id="opacity-val">40</span>%</label>
+                <input type="range" id="alpha-slider" min="0" max="100" value="40" oninput="updateAllViewports()">
+            </div>
+            <div class="setting-item checkbox-item">
+                <input type="checkbox" id="crosshair-toggle" checked onchange="updateAllViewports()">
+                <label for="crosshair-toggle">Show 3D Crosshairs</label>
+            </div>
+        </div>
+
+        <div class="tool-divider"></div>
+
+        <div class="tool-section actions-section">
+            <button id="btn-save-slice" class="btn btn-primary" onclick="saveSliceEdit()">
+                💾 Save Slice Edit
+            </button>
+            <button id="btn-accept" class="btn btn-accept" onclick="acceptVolume()">
+                ✅ Accept Label
+            </button>
+            <button id="btn-reject" class="btn btn-reject" onclick="rejectVolume()">
+                ❌ Reject
+            </button>
+            <button id="btn-next" class="btn btn-secondary" onclick="loadNextVolume()">
+                ➡️ Next Volume
+            </button>
+        </div>
+    </nav>
+
+    <!-- Main Workspace Layout -->
     <main id="app-layout">
-        <!-- Left Panel: Volume Queue -->
+        <!-- Left Sidebar: Volume Queue -->
         <aside id="volume-panel">
             <div class="panel-header">
                 <h2>Volume Queue</h2>
@@ -58,75 +120,100 @@
             </div>
         </aside>
 
-        <!-- Center: Slice Viewer -->
+        <!-- Right Workspace: 4-Quadrant Slicer3D Viewport Grid -->
         <section id="viewer-panel">
             <div id="viewer-placeholder" class="viewer-placeholder">
                 <div class="placeholder-content">
-                    <span class="placeholder-icon">🔬</span>
-                    <h3>Select a volume to start</h3>
-                    <p>Choose a volume from the left panel to view slices</p>
+                    <div class="slicer-icon">🔬</div>
+                    <h3>Select a 3D volume to load Slicer3D viewports</h3>
+                    <p>Choose any volume from the left queue to open synchronized Axial, Coronal, and Sagittal MPR views.</p>
                 </div>
             </div>
 
-            <div id="viewer-container" class="viewer-container" style="display:none;">
-                <!-- Axis Tabs -->
-                <div class="axis-tabs">
-                    <button class="axis-tab active" data-axis="axial" onclick="switchAxis('axial', this)">Axial</button>
-                    <button class="axis-tab" data-axis="coronal" onclick="switchAxis('coronal', this)">Coronal</button>
-                    <button class="axis-tab" data-axis="sagittal" onclick="switchAxis('sagittal', this)">Sagittal</button>
-                </div>
-
-                <!-- Canvas Wrapper -->
-                <div class="canvas-wrapper" id="canvas-wrapper">
-                    <img id="slice-image" class="slice-image" alt="Slice View" draggable="false">
-                    <canvas id="draw-canvas" class="draw-canvas"></canvas>
-                    <div class="slice-info" id="slice-info">Slice 0 / 0</div>
-                </div>
-
-                <!-- Slice Slider -->
-                <div class="slider-row">
-                    <button class="btn-icon" onclick="changeSlice(-1)">◀</button>
-                    <input type="range" id="slice-slider" class="slice-slider" min="0" max="100" value="50"
-                           oninput="onSliderChange(this.value)">
-                    <button class="btn-icon" onclick="changeSlice(1)">▶</button>
-                </div>
-
-                <!-- Controls & Drawing Toolbar -->
-                <div class="controls-row">
-                    <div class="control-group">
-                        <label for="overlay-toggle">Overlay</label>
-                        <input type="checkbox" id="overlay-toggle" checked onchange="updateSlice()">
+            <div id="mpr-grid" class="mpr-grid" style="display:none;">
+                <!-- Viewport 1: Axial (Red) -->
+                <div class="viewport viewport-axial" id="vp-axial">
+                    <div class="viewport-header axial-header">
+                        <span class="vp-label">AXIAL (Red)</span>
+                        <span class="vp-info" id="info-axial">Slice Z: 0 / 0</span>
                     </div>
-                    <div class="control-group">
-                        <label for="alpha-slider">Opacity</label>
-                        <input type="range" id="alpha-slider" min="0" max="100" value="40"
-                               oninput="updateSlice()">
+                    <div class="canvas-wrapper">
+                        <img id="img-axial" class="slice-img" draggable="false">
+                        <canvas id="canvas-axial" class="draw-canvas"></canvas>
+                        <div class="hud-overlay" id="hud-axial">Z: 0</div>
                     </div>
-                    <div class="control-group tool-group">
-                        <label>Tool:</label>
-                        <button id="tool-brush" class="btn-tool active" onclick="setDrawTool('brush')">🖌️ Brush</button>
-                        <button id="tool-eraser" class="btn-tool" onclick="setDrawTool('eraser')">🧹 Eraser</button>
-                    </div>
-                    <div class="control-group">
-                        <label for="brush-radius">Radius: <span id="radius-val">8</span>px</label>
-                        <input type="range" id="brush-radius" min="1" max="30" value="8" oninput="updateRadiusVal(this.value)">
+                    <div class="viewport-controls">
+                        <button class="btn-icon" onclick="stepSlice('axial', -1)">◀</button>
+                        <input type="range" id="slider-axial" class="slice-slider" min="0" max="100" value="50" oninput="onViewportSliderChange('axial', this.value)">
+                        <button class="btn-icon" onclick="stepSlice('axial', 1)">▶</button>
                     </div>
                 </div>
 
-                <!-- Action Buttons -->
-                <div class="action-row">
-                    <button id="btn-save-slice" class="btn btn-primary" onclick="saveSliceEdit()">
-                        💾 Save Slice Edit
-                    </button>
-                    <button id="btn-accept" class="btn btn-accept" onclick="acceptVolume()">
-                        ✅ Accept Label
-                    </button>
-                    <button id="btn-reject" class="btn btn-reject" onclick="rejectVolume()">
-                        ❌ Reject
-                    </button>
-                    <button id="btn-next" class="btn btn-secondary" onclick="loadNextVolume()">
-                        ➡️ Next Volume
-                    </button>
+                <!-- Viewport 2: Coronal (Green) -->
+                <div class="viewport viewport-coronal" id="vp-coronal">
+                    <div class="viewport-header coronal-header">
+                        <span class="vp-label">CORONAL (Green)</span>
+                        <span class="vp-info" id="info-coronal">Slice Y: 0 / 0</span>
+                    </div>
+                    <div class="canvas-wrapper">
+                        <img id="img-coronal" class="slice-img" draggable="false">
+                        <canvas id="canvas-coronal" class="draw-canvas"></canvas>
+                        <div class="hud-overlay" id="hud-coronal">Y: 0</div>
+                    </div>
+                    <div class="viewport-controls">
+                        <button class="btn-icon" onclick="stepSlice('coronal', -1)">◀</button>
+                        <input type="range" id="slider-coronal" class="slice-slider" min="0" max="100" value="50" oninput="onViewportSliderChange('coronal', this.value)">
+                        <button class="btn-icon" onclick="stepSlice('coronal', 1)">▶</button>
+                    </div>
+                </div>
+
+                <!-- Viewport 3: Sagittal (Yellow) -->
+                <div class="viewport viewport-sagittal" id="vp-sagittal">
+                    <div class="viewport-header sagittal-header">
+                        <span class="vp-label">SAGITTAL (Yellow)</span>
+                        <span class="vp-info" id="info-sagittal">Slice X: 0 / 0</span>
+                    </div>
+                    <div class="canvas-wrapper">
+                        <img id="img-sagittal" class="slice-img" draggable="false">
+                        <canvas id="canvas-sagittal" class="draw-canvas"></canvas>
+                        <div class="hud-overlay" id="hud-sagittal">X: 0</div>
+                    </div>
+                    <div class="viewport-controls">
+                        <button class="btn-icon" onclick="stepSlice('sagittal', -1)">◀</button>
+                        <input type="range" id="slider-sagittal" class="slice-slider" min="0" max="100" value="50" oninput="onViewportSliderChange('sagittal', this.value)">
+                        <button class="btn-icon" onclick="stepSlice('sagittal', 1)">▶</button>
+                    </div>
+                </div>
+
+                <!-- Viewport 4: 3D HUD & Metadata Panel (Blue) -->
+                <div class="viewport viewport-3d" id="vp-3d">
+                    <div class="viewport-header header-3d">
+                        <span class="vp-label">3D HUD & VOLUME METADATA</span>
+                        <span class="vp-info" id="vol-id-display">Volume: None</span>
+                    </div>
+                    <div class="hud-content">
+                        <div class="hud-card">
+                            <h4>3D Voxel Coordinate</h4>
+                            <div class="coord-display">
+                                <span class="coord-tag red">Z: <strong id="coord-z">0</strong></span>
+                                <span class="coord-tag green">Y: <strong id="coord-y">0</strong></span>
+                                <span class="coord-tag yellow">X: <strong id="coord-x">0</strong></span>
+                            </div>
+                        </div>
+
+                        <div class="hud-card">
+                            <h4>Physical Scan Properties</h4>
+                            <div class="hud-row"><span>Dimensions:</span> <strong id="meta-dims">0 x 0 x 0</strong></div>
+                            <div class="hud-row"><span>Voxel Spacing:</span> <strong id="meta-spacing">1.0 x 1.0 x 1.0 mm</strong></div>
+                            <div class="hud-row"><span>Volume Status:</span> <strong id="meta-status" class="status-badge">Unloaded</strong></div>
+                        </div>
+
+                        <div class="hud-card">
+                            <h4>Active Slicer Tool</h4>
+                            <div class="hud-row"><span>Selected Tool:</span> <strong id="hud-tool-name">🎯 Crosshair</strong></div>
+                            <div class="hud-row"><span>Measurement:</span> <strong id="hud-measurement">-- mm</strong></div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </section>
