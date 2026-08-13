@@ -33,4 +33,6 @@ def test_dynunet_forward_pass(sample_config, sample_volume):
         out = net(sample_volume)
         if isinstance(out, (list, tuple)):
             out = out[0]
+        elif out.ndim == 6:
+            out = out[:, 0]
     assert out.shape[1] == sample_config.num_classes

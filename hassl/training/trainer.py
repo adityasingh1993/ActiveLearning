@@ -32,7 +32,7 @@ def build_network(backbone: str, num_classes: int, dropout: float) -> nn.Module:
         )
     elif backbone == 'swinunetr':
         return SwinUNETR(
-            img_size=(128, 128, 128), in_channels=1, out_channels=num_classes,
+            in_channels=1, out_channels=num_classes,
             feature_size=48, use_checkpoint=True
         )
     else:
@@ -329,7 +329,7 @@ class HASSLTrainer:
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.net_A.parameters(), max_norm=12.0)  # V10-5 fix: Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.net_A.parameters(), max_norm=5.0)  # V10-5 fix: Gradient clipping
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -432,8 +432,8 @@ class HASSLTrainer:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer_A)
             self.scaler.unscale_(self.optimizer_B)
-            torch.nn.utils.clip_grad_norm_(self.net_A.parameters(), max_norm=12.0)  # V10-5 fix: Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.net_B.parameters(), max_norm=12.0)
+            torch.nn.utils.clip_grad_norm_(self.net_A.parameters(), max_norm=5.0)  # V10-5 fix: Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.net_B.parameters(), max_norm=5.0)
             self.scaler.step(self.optimizer_A)
             self.scaler.step(self.optimizer_B)
             self.scaler.update()

@@ -276,8 +276,8 @@ def build_dataloaders(config):
     train_transforms = get_base_transforms(config, keys=["image", "label"], is_training=True)
     val_transforms = get_base_transforms(config, keys=["image", "label"], is_training=False)
 
-    # N-5 fix: Base transforms for unlabeled stream; weak/strong views applied per-model in trainer
-    unlabeled_transforms = get_base_transforms(config, keys=["image"], is_training=False)
+    # N-5 & M-1 fix: Pass is_training=True so patch-mode RandSpatialCropd is applied to unlabeled stream
+    unlabeled_transforms = get_base_transforms(config, keys=["image"], is_training=True)
 
     cache_dir = getattr(config, 'cache_dir', None)
 

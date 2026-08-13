@@ -57,7 +57,7 @@ def test_hybrid_strategy():
     # Mock DataLoader-like dataset batch
     class DummyLoader:
         def __iter__(self):
-            yield {'image': torch.zeros(2, 1, 16, 16, 16), 'id': ['vol_0', 'vol_1']}
+            yield {'image': torch.zeros(2, 1, 64, 64, 64), 'id': ['vol_0', 'vol_1']}
 
     selected_ids, final_scores = hybrid.query(
         unlabeled_loader=DummyLoader(),

@@ -63,8 +63,8 @@ def main():
             print(f"  - {err}")
         sys.exit(1)
 
-    print("[HASSL Pre-Commit Hook] Running CI test suite (pytest tests/test_pipeline_ci.py -q)...")
-    pytest_res = subprocess.run([sys.executable, "-m", "pytest", "tests/test_pipeline_ci.py", "-q"], capture_output=True, text=True)
+    print("[HASSL Pre-Commit Hook] Running full test suite (pytest tests/ -q)...")
+    pytest_res = subprocess.run([sys.executable, "-m", "pytest", "tests/", "-q"], capture_output=True, text=True)
     if pytest_res.returncode != 0:
         print("[HASSL Pre-Commit Hook] FAILED! Pytest suite reported failures:")
         print(pytest_res.stdout)

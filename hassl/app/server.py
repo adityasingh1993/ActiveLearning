@@ -786,7 +786,7 @@ async def serve_ui():
 
 # ─── Server Startup ──────────────────────────────────────────────────
 
-def start_server(config, host: str = "0.0.0.0", port: int = 8000):
+def start_server(config, host: str = "127.0.0.1", port: int = 8000):
     """Start the HASSL web UI server."""
     _state["config"] = config
     _state["volumes"] = scan_volumes(config)
@@ -803,7 +803,7 @@ def start_server(config, host: str = "0.0.0.0", port: int = 8000):
     preseg = sum(1 for v in _state["volumes"].values() if v["status"] == "preseg")
     unlabeled = sum(1 for v in _state["volumes"].values() if v["status"] == "unlabeled")
     print(f"  Labeled: {labeled} | Pre-segmented: {preseg} | Unlabeled: {unlabeled}")
-    print(f"  Open: http://localhost:{port}")
+    print(f"  Open: http://{host}:{port}")
     print(f"{'=' * 60}\n")
 
     # Mount static files
@@ -817,7 +817,7 @@ def start_server(config, host: str = "0.0.0.0", port: int = 8000):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="HASSL Web Annotation UI")
     parser.add_argument("--config", type=str, default="config.yaml")
-    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 

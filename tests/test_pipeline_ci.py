@@ -171,7 +171,7 @@ def test_teacher_student_views_are_spatially_aligned():
     # Call production view generation method
     teacher_view, student_view = trainer._make_unlabeled_views(vol)
 
-    # V8-2 fix: Binarize views at threshold 0.5 (where Gaussian smoothing preserved boundary Dice is 0.92-1.00)
+    # Binarize views at threshold 0.5 (where Gaussian smoothing preserved boundary Dice is >= 0.80)
     t_mask = (teacher_view[0] > 0.5).float()
     s_mask = (student_view[0] > 0.5).float()
 

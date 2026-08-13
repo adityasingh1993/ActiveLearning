@@ -42,7 +42,7 @@ def load_seg_nrrd(filepath: str) -> Tuple[np.ndarray, Dict[int, Dict[str, Any]]]
 
     data, header = nrrd.read(filepath)
     segments = parse_nrrd_segments(header)
-    return data.astype(np.int32), segments
+    return data.astype(np.uint8), segments
 
 
 def write_mask_with_spatial_geometry(output_path: str, mask_arr: np.ndarray, reference_image_path: Optional[str] = None):
