@@ -109,6 +109,44 @@ class QueryEngine:
 
         return new_labeled
 
+    def _invert_prediction(self, pred_tensor: torch.Tensor, image_tensor: torch.Tensor, batch_data: dict, index: int) -> np.ndarray:
+        """Invert prediction back to original volume spatial orientation and shape (Orientationd + Resized inversion)."""
+        if self.config:
+            try:
+                from hassl.data.data_engine import get_base_transforms
+                from monai.transforms import Invertd
+
+                val_transform = get_base_transforms(self.config, keys=["image"], is_training=False)
+                inv_transform = Invertd(
+                    keys=["pred"],
+                    transform=val_transform,
+                    orig_keys=["image"],
+                    meta_keys=["pred_meta_dict"],
+                    orig_meta_keys=["image_meta_dict"],
+                    nearest_interp=True,
+                    to_tensor=True,
+                )
+
+                sample = {
+                    "image": image_tensor[index].detach().cpu(),
+                    "pred": pred_tensor[index:index + 1].detach().cpu(),
+                }
+                if 'image_meta_dict' in batch_data:
+                    sample["image_meta_dict"] = {
+                        k: (v[index] if isinstance(v, (list, tuple)) else v)
+                        for k, v in batch_data['image_meta_dict'].items()
+                    }
+
+                inv_out = inv_transform(sample)
+                inv_pred = inv_out["pred"]
+                if inv_pred.ndim == 4:
+                    inv_pred = inv_pred[0]
+                return (inv_pred > 0.5).numpy().astype(np.uint8)
+            except Exception:
+                pass
+
+        return (pred_tensor[index, 0] > 0.5).cpu().numpy().astype(np.uint8)
+
     def auto_promote_pseudo_labels(self, model, dataloader, k=10, confidence_threshold=0.85):
         """Rank, filter, and promote top K high-confidence pseudo-labels to data/pseudo/ (C-1, C-2 & N-1 fix)."""
         if model is None or dataloader is None:
@@ -133,7 +171,6 @@ class QueryEngine:
                     out = out[:, 0]
 
                 probs = torch.sigmoid(out) if getattr(self.config, 'num_classes', 1) == 1 else torch.softmax(out, dim=1)
-                preds = (probs > 0.5).cpu().numpy().astype(np.uint8)
 
                 for i, vid in enumerate(vids):
                     if vid in self.state['unlabeled_ids']:
@@ -148,10 +185,11 @@ class QueryEngine:
                             conf = 0.0  # Empty background prediction has zero confidence
 
                         if conf >= confidence_threshold:
+                            inverted_pred = self._invert_prediction(probs, x, batch, i)
                             candidates.append({
                                 'id': vid,
                                 'confidence': conf,
-                                'pred_vol': preds[i, 0],
+                                'pred_vol': inverted_pred,
                                 'ref_path': image_paths[i] if i < len(image_paths) else None,
                             })
 
@@ -239,11 +277,11 @@ class QueryEngine:
                 elif out.ndim == 6:
                     out = out[:, 0]
 
-                preds = (torch.sigmoid(out) > 0.5).cpu().numpy().astype(np.uint8)
+                probs = torch.sigmoid(out) if getattr(self.config, 'num_classes', 1) == 1 else torch.softmax(out, dim=1)
 
                 for i, vid in enumerate(vids):
                     if volume_ids is None or vid in volume_ids:
-                        pred_vol = preds[i, 0]
+                        pred_vol = self._invert_prediction(probs, x, batch, i)
                         ref_path = image_paths[i] if i < len(image_paths) else None
                         output_path = os.path.join(output_dir, f'{vid}.seg.nrrd')
 
