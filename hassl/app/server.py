@@ -242,7 +242,8 @@ def _verify_and_align_shape(image: np.ndarray, mask: Optional[np.ndarray], vol_i
             if vol_id and vol_id in _state["cached_presegs"]:
                 _state["cached_presegs"][vol_id] = mask
         elif mask.ndim == 4:
-            # Handle 4D multi-segment mask (V7-5 fix)
+            # Handle 4D multi-segment mask (V7-5, V8-3 fix)
+            print(f"[WebUI Warning] Multi-segment 4D mask (shape {mask.shape}) detected for {vol_id or 'volume'}; selecting segment 0.")
             mask = mask[0]
             if mask.shape == image.shape[::-1]:
                 mask = np.transpose(mask, (2, 1, 0))

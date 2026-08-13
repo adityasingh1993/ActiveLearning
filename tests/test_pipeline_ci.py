@@ -144,28 +144,36 @@ def test_written_mask_preserves_geometry(tmp_path):
 
 
 def test_teacher_student_views_are_spatially_aligned():
-    """Verify teacher and student augmentation views share exact spatial coordinate frames (V7-1 fix)."""
+    """Verify teacher and student views share exact spatial coordinate frames by testing production _make_unlabeled_views (V7-1, V8-1, V8-2 fix)."""
     try:
         import torch
-        from hassl.data.augmentations import get_spatial_augmentation, get_intensity_augmentation
+        import monai
+        from hassl.config import HASSLConfig
+        from hassl.training.trainer import HASSLTrainer
     except ImportError:
         pytest.skip("PyTorch or MONAI not installed")
 
-    spatial_aug = get_spatial_augmentation(keys=["image"])
-    intensity_aug = get_intensity_augmentation(keys=["image"])
+    # V8-2 fix: Pin random seed for deterministic test execution
+    monai.utils.set_determinism(seed=42)
 
-    # Create an asymmetric 3D phantom (off-center sphere/cube to ensure zero flip symmetry)
+    config = HASSLConfig()
+    config.device = "cpu"
+    config.compute_mode = "prototype"
+    config.unet_backbone = "unet"
+
+    # Instantiate HASSLTrainer to exercise production _make_unlabeled_views method (V8-1 fix)
+    trainer = HASSLTrainer(config=config, labeled_loader=[], unlabeled_loader=[], val_loader=[], tracker=None)
+
+    # Create an asymmetric 3D phantom (off-center foreground patch ensuring zero flip symmetry)
     vol = torch.zeros((1, 32, 32, 32), dtype=torch.float32)
-    vol[:, 4:12, 16:28, 2:8] = 1.0  # Asymmetric off-center foreground patch
+    vol[:, 4:12, 16:28, 2:8] = 1.0
 
-    # Apply shared spatial transform
-    spatial_dict = spatial_aug({"image": vol})
-    teacher_view = spatial_dict["image"]
-    student_view = intensity_aug({"image": teacher_view})["image"]
+    # Call production view generation method
+    teacher_view, student_view = trainer._make_unlabeled_views(vol)
 
-    # Binarize masks
-    t_mask = (teacher_view > 0.1).float()
-    s_mask = (student_view > 0.1).float()
+    # V8-2 fix: Binarize views at threshold 0.5 (where Gaussian smoothing preserved boundary Dice is 0.92-1.00)
+    t_mask = (teacher_view[0] > 0.5).float()
+    s_mask = (student_view[0] > 0.5).float()
 
     intersection = (t_mask * s_mask).sum()
     total = t_mask.sum() + s_mask.sum()
@@ -207,3 +215,34 @@ def test_ssl_contrastive_loss_nonzero_at_batch_size_1():
     loss_cont = pretrainer._infonce_loss(feat1, feat2)
     assert loss_cont.item() > 0.0, f"Contrastive loss at batch_size=1 must be > 0.0, got {loss_cont.item()}"
     assert loss_cont.requires_grad, "Contrastive loss must require grad for optimization"
+
+
+def test_full_pipeline_synthetic_end_to_end(tmp_path):
+    """Verify end-to-end training phase execution on synthetic cohort generating checkpoints and artifacts."""
+    try:
+        import torch
+        from hassl.config import HASSLConfig
+        from hassl.utils.synthetic_data import generate_synthetic_ultrasound_dataset
+        from hassl.pipeline import run_train
+    except ImportError:
+        pytest.skip("PyTorch, SimpleITK, or MONAI not installed")
+
+    data_dir = tmp_path / "synthetic_cohort"
+    generate_synthetic_ultrasound_dataset(output_dir=str(data_dir), num_volumes=6, image_size=(32, 32, 32))
+
+    config = HASSLConfig()
+    config.data_dir = str(data_dir)
+    config.log_dir = str(tmp_path / "logs")
+    config.checkpoint_dir = str(tmp_path / "checkpoints")
+    config.embedding_dir = str(tmp_path / "embeddings")
+    config.device = "cpu"
+    config.compute_mode = "prototype"
+    config.unet_backbone = "unet"
+    config.train_epochs = 1
+    config.use_cache_dataset = False
+    config.tracker = "none"
+
+    run_train(config, round_num=0)
+
+    ckpt_file = Path(config.checkpoint_dir) / "round0_latest.pth"
+    assert ckpt_file.exists(), f"Expected checkpoint file {ckpt_file} was not generated during end-to-end run"

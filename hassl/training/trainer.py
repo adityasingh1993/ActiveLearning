@@ -10,7 +10,6 @@ from monai.metrics import DiceMetric
 from .ema import EMATeacher
 from .losses import CombinedSegLoss, UncertaintyMaskedLoss, FlexMatchThreshold
 from ..tracking import ExperimentTracker
-from ..data.augmentations import get_weak_augmentation, get_strong_augmentation
 
 
 def build_network(backbone: str, num_classes: int, dropout: float) -> nn.Module:
@@ -120,16 +119,22 @@ class HASSLTrainer:
         self.dice_metric = DiceMetric(include_background=False if self.num_classes > 1 else True, reduction="mean")
         self.start_epoch = 0
 
-        # Pre-instantiate spatial and intensity augmentations for spatially aligned Mean Teacher view (V7-1 fix)
+        # Pre-instantiate spatial and intensity augmentations for spatially aligned Mean Teacher view (V7-1, V8-1 fix)
         from ..data.augmentations import get_spatial_augmentation, get_intensity_augmentation
         self.spatial_aug = get_spatial_augmentation(keys=["image"])
         self.intensity_aug = get_intensity_augmentation(keys=["image"])
-        self.weak_aug = get_weak_augmentation(keys=["image"])
-        self.strong_aug = get_strong_augmentation(keys=["image"])
 
         # Load pre-trained SSL weights if available
         if pretrained_weights and os.path.exists(pretrained_weights):
             self._load_pretrained(pretrained_weights)
+
+    def _make_unlabeled_views(self, inputs_u: torch.Tensor):
+        """Generate spatially aligned teacher and student views (V7-1, V8-1, V8-5 fix)."""
+        spatial_img = [self.spatial_aug({"image": inputs_u[b]})["image"] for b in range(inputs_u.size(0))]
+        spatial_tensor = torch.stack(spatial_img)
+        inputs_u_teacher = spatial_tensor.clone()  # Decouple teacher tensor memory from student intensity transforms (V8-5 fix)
+        inputs_u_student = torch.stack([self.intensity_aug({"image": spatial_tensor[b]})["image"] for b in range(spatial_tensor.size(0))])
+        return inputs_u_teacher, inputs_u_student
 
     def get_rampup_weight(self, epoch: int) -> float:
         if epoch < self.config.consistency_rampup_epochs:
@@ -185,12 +190,9 @@ class HASSLTrainer:
                 uncert_val = 0.0
 
                 if inputs_u is not None:
-                    # V7-1 fix: Share exact spatial transform between teacher and student, apply intensity transform to student only
+                    # V7-1 & V8-1 fix: Use production _make_unlabeled_views helper for shared spatial transform
                     try:
-                        spatial_img = [self.spatial_aug({"image": inputs_u[b]})["image"] for b in range(inputs_u.size(0))]
-                        spatial_tensor = torch.stack(spatial_img)
-                        inputs_u_teacher = spatial_tensor
-                        inputs_u_student = torch.stack([self.intensity_aug({"image": spatial_tensor[b]})["image"] for b in range(spatial_tensor.size(0))])
+                        inputs_u_teacher, inputs_u_student = self._make_unlabeled_views(inputs_u)
                     except Exception as e:
                         # V7-2 fix: Log explicit warning when augmentation fails instead of silent fallback
                         print(f"[HASSL Warning] Augmentation failed in train_one_epoch_uamt: {e}. Falling back to unaugmented inputs.")
