@@ -4,7 +4,7 @@ import numpy as np
 import SimpleITK as sitk
 import nrrd
 from scipy.ndimage import gaussian_filter
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Optional
 
 def generate_single_volume(volume_id: str, shape: Tuple[int, int, int], seed: int) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """
@@ -115,43 +115,53 @@ def write_seg_nrrd(filepath: str, label_array: np.ndarray, metadata: Dict[str, A
     
     nrrd.write(filepath, label_array_t, header=header)
 
-def generate_synthetic_dataset(output_dir: str, num_volumes: int = 20, num_labeled: int = 5, seed: int = 42) -> List[str]:
+def generate_synthetic_dataset(
+    output_dir: str,
+    num_volumes: int = 20,
+    num_labeled: int = 5,
+    seed: int = 42,
+    image_size: Optional[Tuple[int, int, int]] = None
+) -> List[str]:
     """
-    Generate synthetic dataset with labeled and unlabeled volumes.
+    Generate synthetic dataset with labeled and unlabeled volumes (V9-2, V9-3 fix).
     """
     np.random.seed(seed)
-    
+
     images_dir = os.path.join(output_dir, 'images')
     labels_dir = os.path.join(output_dir, 'labels')
-    
+
     os.makedirs(images_dir, exist_ok=True)
     os.makedirs(labels_dir, exist_ok=True)
-    
+
     volume_ids = []
-    
+
     for i in range(num_volumes):
-        volume_id = f"vol_{i:03d}"
+        # Patient-prefix volume ID format (e.g. US000_v1) so split('_')[0] yields US000 (V9-3 fix)
+        volume_id = f"US{i:03d}_v1"
         volume_ids.append(volume_id)
-        
-        # Random dimensions between 128x128x80 and 256x256x200 (Z, Y, X)
-        z = np.random.randint(80, 200)
-        y = np.random.randint(128, 256)
-        x = np.random.randint(128, 256)
-        shape = (z, y, x)
-        
+
+        if image_size is not None:
+            shape = image_size
+        else:
+            # Random dimensions between 128x128x80 and 256x256x200 (Z, Y, X)
+            z = np.random.randint(80, 200)
+            y = np.random.randint(128, 256)
+            x = np.random.randint(128, 256)
+            shape = (z, y, x)
+
         vol_seed = seed + i
         image_array, label_array, metadata = generate_single_volume(volume_id, shape, vol_seed)
-        
+
         img_path = os.path.join(images_dir, f"{volume_id}.mha")
         write_mha(img_path, image_array, metadata)
-        
+
         # Only save label for the first num_labeled volumes
         if i < num_labeled:
             lbl_path = os.path.join(labels_dir, f"{volume_id}.seg.nrrd")
             write_seg_nrrd(lbl_path, label_array, metadata)
-            
+
         print(f"Generated {volume_id} with shape {shape}")
-            
+
     return volume_ids
 
 def main():

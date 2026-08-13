@@ -14,6 +14,8 @@ from monai.transforms import (
     Orientationd,
     Spacingd,
     Resized,
+    RandCropByPosNegLabeld,
+    RandSpatialCropd,
     ScaleIntensityRangePercentilesd
 )
 
@@ -53,7 +55,7 @@ def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label
     n_total_p = len(patient_ids)
 
     # V-11 fix: Assert on patient grouping heuristic failure
-    if n_total_vols > 5:
+    if n_total_vols >= 5:
         if n_total_p == 1:
             raise ValueError(f"[DataEngine Error] Patient extraction collapsed all {n_total_vols} volumes into 1 single patient ID '{patient_ids[0]}'. Check filename structure or set config.patient_id_regex.")
         elif n_total_p == n_total_vols:
@@ -193,19 +195,58 @@ def build_unlabeled_dataset(data_dir: str, image_suffix: str, labeled_ids: set,
 
 
 def get_base_transforms(config, keys=["image", "label"], is_training: bool = False):
-    """Build MONAI preprocessing transform chain with ultrasound domain augmentations (W-3 fix)."""
+    """Build MONAI preprocessing transform chain.
+
+    Supports two strategies controlled by config.preprocessing_mode:
+    - "resize" (default): Spacingd → Resized(spatial_size). Whole-volume fixed-grid pipeline.
+    - "patch": Spacingd only, then RandCropByPosNegLabeld (labeled training) or
+      RandSpatialCropd (unlabeled/image-only training). Validation always uses
+      Resized regardless of mode for OOM-safe whole-volume inference.
+    """
     mode = tuple(["bilinear" if k == "image" else "nearest" for k in keys])
     resize_mode = tuple(["trilinear" if k == "image" else "nearest" for k in keys])
+    preprocessing_mode = getattr(config, 'preprocessing_mode', 'resize')
 
     transforms = [
-        LoadImaged(keys=keys, reader="ITKReader", image_only=False),
+        LoadImaged(keys=keys, image_only=False),
         EnsureChannelFirstd(keys=keys),
         Orientationd(keys=keys, axcodes="RAS"),
         Spacingd(keys=keys, pixdim=config.spacing, mode=mode),
-        Resized(keys=keys, spatial_size=config.spatial_size, mode=resize_mode),
     ]
+
+    # Intensity normalisation (image only) — placed before spatial crop so
+    # crop statistics reflect the normalised distribution.
     if "image" in keys:
-        transforms.append(ScaleIntensityRangePercentilesd(keys=["image"], lower=1, upper=99, b_min=0, b_max=1, clip=True))
+        transforms.append(ScaleIntensityRangePercentilesd(
+            keys=["image"], lower=1, upper=99, b_min=0, b_max=1, clip=True
+        ))
+
+    if preprocessing_mode == "patch" and is_training:
+        # Patch mode: random crop instead of resize.
+        # Validation always falls through to Resized (below) for consistent
+        # whole-volume inference with SlidingWindowInferer.
+        patch_size = getattr(config, 'patch_size', (96, 96, 96))
+        pos_neg_ratio = getattr(config, 'pos_neg_ratio', 1.0)
+        if "label" in keys:
+            # Labeled stream: crop centred on positive voxels
+            transforms.append(RandCropByPosNegLabeld(
+                keys=keys,
+                label_key="label",
+                spatial_size=patch_size,
+                pos=pos_neg_ratio,
+                neg=1.0,
+                num_samples=1,
+            ))
+        else:
+            # Unlabeled / image-only stream: random spatial crop
+            transforms.append(RandSpatialCropd(
+                keys=keys,
+                roi_size=patch_size,
+                random_size=False,
+            ))
+    else:
+        # "resize" mode (default), or validation in any mode
+        transforms.append(Resized(keys=keys, spatial_size=config.spatial_size, mode=resize_mode))
 
     if is_training:
         transforms.append(get_strong_augmentation(keys=keys))

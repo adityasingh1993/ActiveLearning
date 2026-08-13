@@ -49,6 +49,10 @@ class UncertaintyMaskedLoss(nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         base_loss_per_voxel = self.base_loss(pred, target)
 
+        if base_loss_per_voxel.ndim == 0:
+            # Base loss aggregated to scalar (e.g. DiceCELoss reduction='mean')
+            return base_loss_per_voxel * mask.mean()
+
         if mask.shape != base_loss_per_voxel.shape:
             mask = mask.view_as(base_loss_per_voxel)
 
@@ -118,7 +122,7 @@ class CombinedSegLoss(nn.Module):
         self.dice_ce = DiceCELoss(
             include_background=False if num_classes > 1 else True,
             sigmoid=sigmoid, softmax=softmax,
-            reduction='none'
+            reduction='mean'
         )
 
         if include_boundary:

@@ -22,6 +22,7 @@ import io
 import os
 import json
 import glob
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
@@ -51,14 +52,44 @@ except ImportError:
 
 app = FastAPI(title="HASSL Annotation UI", version="0.1.0")
 
+
+class LRUCache:
+    """Thread-safe Least-Recently-Used cache backed by OrderedDict (A-4 fix)."""
+
+    def __init__(self, maxsize: int = 20):
+        self._cache: OrderedDict = OrderedDict()
+        self.maxsize = maxsize
+
+    def get(self, key, default=None):
+        if key not in self._cache:
+            return default
+        self._cache.move_to_end(key)
+        return self._cache[key]
+
+    def __contains__(self, key):
+        return key in self._cache
+
+    def __setitem__(self, key, value):
+        self._cache[key] = value
+        self._cache.move_to_end(key)
+        if len(self._cache) > self.maxsize:
+            self._cache.popitem(last=False)  # evict oldest
+
+    def __getitem__(self, key):
+        return self.get(key)
+
+    def pop(self, key, *args):
+        return self._cache.pop(key, *args)
+
+
 # Global state (set during startup)
 _state = {
     "config": None,
     "volumes": {},       # {id: {"image_path": ..., "label_path": ..., "preseg_path": ...}}
     "current_volume": None,
-    "cached_images": {},  # {id: np.ndarray}
-    "cached_labels": {},  # {id: np.ndarray}
-    "cached_presegs": {}, # {id: np.ndarray}
+    "cached_images": None,   # LRUCache populated at startup
+    "cached_labels": {},
+    "cached_presegs": None,  # LRUCache populated at startup
 }
 
 
@@ -104,6 +135,30 @@ def _array_to_png(arr: np.ndarray) -> bytes:
     buf.seek(0)
     return buf.getvalue()
 
+def _rle_encode(mask: np.ndarray) -> list:
+    """Encode a 2D binary mask to [[value, count], ...] RLE pairs (V6-9 fix).
+
+    Row-major (C-order) flattening. Typical 128x128 binary mask compresses from
+    ~16 k integers to a few hundred pairs.
+    """
+    flat = mask.ravel()
+    if flat.size == 0:
+        return []
+    rle = []
+    cur_val = int(flat[0])
+    count = 0
+    for v in flat:
+        iv = int(v)
+        if iv == cur_val:
+            count += 1
+        else:
+            rle.append([cur_val, count])
+            cur_val = iv
+            count = 1
+    rle.append([cur_val, count])
+    return rle
+
+
 
 def _create_overlay(image_slice: np.ndarray, mask_slice: np.ndarray,
                     alpha: float = 0.4) -> np.ndarray:
@@ -124,11 +179,12 @@ def _create_overlay(image_slice: np.ndarray, mask_slice: np.ndarray,
 
 
 def scan_volumes(config):
-    """Scan data directory and build volume registry."""
+    """Scan data directory and build volume registry (A-2 fix: includes data/pseudo/ preseg candidates)."""
     data_dir = Path(config.data_dir)
     image_suffix = config.image_suffix
     label_suffix = config.label_suffix
     preseg_dir = Path(config.preseg_dir)
+    pseudo_dir = data_dir / "pseudo"  # A-2: auto-promoted masks from active learning
 
     image_files = sorted(glob.glob(str(data_dir / f"**/*{image_suffix}"), recursive=True))
 
@@ -146,11 +202,13 @@ def scan_volumes(config):
                 label_path = lbl_candidate
                 break
 
-        # Check for pre-segmentation
+        # Check for pre-segmentation: primary preseg_dir first, then data/pseudo/ (A-2 fix)
         preseg_path = None
         for preseg_candidate in [
             str(preseg_dir / f"{vol_id}.seg.nrrd"),
             str(preseg_dir / f"{vol_id}{label_suffix}"),
+            str(pseudo_dir / f"{vol_id}.seg.nrrd"),
+            str(pseudo_dir / f"{vol_id}{label_suffix}"),
         ]:
             if os.path.exists(preseg_candidate):
                 preseg_path = preseg_candidate
@@ -354,7 +412,7 @@ async def get_mask_slice(
     else:
         mask_slice = mask[:, :, index]
 
-    return {"axis": axis, "index": index, "shape": list(mask_slice.shape), "mask": mask_slice.tolist()}
+    return {"axis": axis, "index": index, "shape": list(mask_slice.shape), "mask_rle": _rle_encode(mask_slice), "encoding": "rle"}
 
 
 @app.post("/api/volume/{vol_id}/slice_edit")
@@ -493,12 +551,54 @@ async def accept_volume(vol_id: str):
 
 @app.post("/api/volume/{vol_id}/reject")
 async def reject_volume(vol_id: str):
-    """Reject the pre-segmentation (flags for full manual review)."""
+    """Reject the pre-segmentation, persist to manifest and move preseg to data/rejected/ (A-5 fix)."""
     if vol_id not in _state["volumes"]:
         raise HTTPException(status_code=404, detail=f"Volume {vol_id} not found")
 
     vol = _state["volumes"][vol_id]
     vol["status"] = "rejected"
+
+    config = _state["config"]
+
+    # A-5: Persist rejection in pool_manifest.json
+    manifest_path = os.path.join(config.log_dir, "pool_manifest.json")
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+            if "provenance" not in manifest:
+                manifest["provenance"] = {}
+            manifest["provenance"][vol_id] = "rejected"
+            rejected_ids = manifest.setdefault("rejected_ids", [])
+            if vol_id not in rejected_ids:
+                rejected_ids.append(vol_id)
+            # Remove from unlabeled / pseudo pools
+            for pool_key in ("unlabeled_ids", "pseudo_ids"):
+                pool = manifest.get(pool_key, [])
+                if vol_id in pool:
+                    pool.remove(vol_id)
+                    manifest[pool_key] = pool
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f, indent=4)
+        except Exception as e:
+            print(f"[WebUI Server] Warning: could not update manifest on reject: {e}")
+
+    # A-5: Move preseg file to data/rejected/ as audit trail
+    preseg_path = vol.get("preseg_path")
+    if preseg_path and os.path.exists(preseg_path):
+        import shutil
+        rejected_dir = os.path.join(config.data_dir, "rejected")
+        os.makedirs(rejected_dir, exist_ok=True)
+        dest = os.path.join(rejected_dir, os.path.basename(preseg_path))
+        try:
+            shutil.move(preseg_path, dest)
+            vol["preseg_path"] = dest
+        except Exception as e:
+            print(f"[WebUI Server] Warning: could not move preseg on reject: {e}")
+
+    # Evict mask cache for this volume
+    _state["cached_presegs"].pop(vol_id, None)
+
     return {"message": f"Volume {vol_id} rejected. Flagged for manual review."}
 
 
@@ -547,6 +647,11 @@ def start_server(config, host: str = "0.0.0.0", port: int = 8000):
     """Start the HASSL web UI server."""
     _state["config"] = config
     _state["volumes"] = scan_volumes(config)
+
+    # A-4: Initialise LRU caches with configured max size
+    max_vols = getattr(config, "server_cache_max_volumes", 20)
+    _state["cached_images"] = LRUCache(maxsize=max_vols)
+    _state["cached_presegs"] = LRUCache(maxsize=max_vols)
 
     print(f"\n{'=' * 60}")
     print(f"HASSL Web UI")

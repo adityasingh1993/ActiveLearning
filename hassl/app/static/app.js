@@ -196,11 +196,35 @@ function renderMaskToCanvas() {
     ctx.putImageData(imgData, 0, 0);
 }
 
+/**
+ * Decode a [[value, count], ...] RLE sequence into a 2D array of shape [h, w].
+ * Row-major order matches the server's numpy ravel() C-order (V6-9 fix).
+ */
+function rle_decode(rle, shape) {
+    const [h, w] = shape;
+    const flat = new Uint8Array(h * w);
+    let pos = 0;
+    for (const [val, count] of rle) {
+        flat.fill(val, pos, pos + count);
+        pos += count;
+    }
+    // Reshape into 2D array [h][w]
+    const out = [];
+    for (let r = 0; r < h; r++) {
+        out.push(Array.from(flat.subarray(r * w, (r + 1) * w)));
+    }
+    return out;
+}
+
 async function fetchMaskSlice() {
     if (!state.currentVolume) return;
     try {
         const data = await api(`/volume/${state.currentVolume}/mask_slice?axis=${state.currentAxis}&index=${state.currentSlice}`);
-        state.mask2D = data.mask;
+        if (data.encoding === 'rle' && data.mask_rle) {
+            state.mask2D = rle_decode(data.mask_rle, data.shape);
+        } else {
+            state.mask2D = data.mask;  // legacy fallback
+        }
         state.maskShape = data.shape;
         renderMaskToCanvas();
     } catch (err) {

@@ -29,11 +29,15 @@ class HASSLConfig:
     label_suffix: str = ".seg.nrrd"
     num_classes: int = 1  # 1 = binary (sigmoid), >1 = multi-class (softmax)
     spacing: Tuple[float, float, float] = (0.100, 0.0386, 0.0982)  # Spacingd pixdim (mm per voxel)
-    spatial_size: Tuple[int, int, int] = (128, 128, 128)  # Resize target
+    spatial_size: Tuple[int, int, int] = (128, 128, 128)  # Resize target (used in "resize" mode and for val/inference)
+    preprocessing_mode: str = "resize"  # "resize" (Spacingd+Resized) or "patch" (Spacingd+RandCropByPosNegLabeld)
+    patch_size: Tuple[int, int, int] = (96, 96, 96)  # Training crop size when preprocessing_mode == "patch"
+    pos_neg_ratio: float = 1.0  # Positive/negative sample ratio for RandCropByPosNegLabeld (patch mode only)
     val_split: int = 5  # Number of labeled volumes held out for validation
     cache_dir: str = "./cache"  # PersistentDataset cache
     use_cache_dataset: bool = True  # Cache preprocessed tensors in RAM/CacheDataset
     patient_id_regex: Optional[str] = None  # Custom regex for extracting patient ID prefix from volume filename
+    server_cache_max_volumes: int = 20  # Max volumes held in server LRU image/mask cache
 
     # ─── Compute ────────────────────────────────────────────────────────
     compute_mode: str = "prototype"  # "prototype" (8GB) or "full" (24GB)
@@ -139,7 +143,7 @@ class HASSLConfig:
             yaml_config = yaml.safe_load(f) or {}
 
         # Convert nested tuples from YAML lists
-        for key in ["spacing", "spatial_size", "unet_channels", "unet_strides", "al_hybrid_weights"]:
+        for key in ["spacing", "spatial_size", "patch_size", "unet_channels", "unet_strides", "al_hybrid_weights"]:
             if key in yaml_config and isinstance(yaml_config[key], list):
                 yaml_config[key] = tuple(yaml_config[key])
 

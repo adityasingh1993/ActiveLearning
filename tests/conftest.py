@@ -1,8 +1,14 @@
 import pytest
 import torch
 import numpy as np
-import SimpleITK as sitk
-import nrrd
+try:
+    import SimpleITK as sitk
+except ImportError:
+    sitk = None
+try:
+    import nrrd
+except ImportError:
+    nrrd = None
 from pathlib import Path
 from hassl.config import HASSLConfig
 

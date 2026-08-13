@@ -97,12 +97,20 @@ class EarlyStopping:
         if improved:
             self.best_score = val_score
             self.counter = 0
+            self.early_stop = False  # Clear sticky flag on improvement (V10-1 fix)
+            return False
         else:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
 
         return self.early_stop
+
+    def reset(self):
+        """Reset early stopping monitor for a new AL round (V10-1 fix)."""
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
 
     def state_dict(self) -> dict:
         return {
@@ -179,26 +187,47 @@ class HASSLTrainer:
         self.spatial_aug = get_spatial_augmentation(keys=["image"])
         self.intensity_aug = get_intensity_augmentation(keys=["image"])
 
+        # Build and store val transform for Invertd-based original-space volume calculation.
+        # Val always uses Resized (resize or patch mode) so Invertd is well-defined.
+        from ..data.data_engine import get_base_transforms
+        self.val_transform = get_base_transforms(config, keys=["image", "label"], is_training=False)
+
         # Load pre-trained SSL weights if available
         if pretrained_weights and os.path.exists(pretrained_weights):
             self._load_pretrained(pretrained_weights)
 
     def _build_scheduler(self, optimizer):
-        """Construct learning rate scheduler based on config."""
+        """Construct learning rate scheduler based on config with optional linear warmup (V10-4 fix)."""
         scheduler_type = getattr(self.config, 'lr_scheduler', 'cosine')
         min_lr = getattr(self.config, 'min_lr', 1e-6)
         train_epochs = getattr(self.config, 'train_epochs', 200)
+        warmup_epochs = getattr(self.config, 'lr_warmup_epochs', 0)
 
-        if scheduler_type == 'cosine':
-            return torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=train_epochs, eta_min=min_lr
-            )
-        elif scheduler_type == 'plateau':
+        if scheduler_type == 'none' or train_epochs <= 0:
+            return None
+
+        if scheduler_type == 'plateau':
             return torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer, mode='max', factor=0.5, patience=10, min_lr=min_lr
             )
-        else:
-            return None
+
+        if scheduler_type == 'cosine':
+            if warmup_epochs > 0 and warmup_epochs < train_epochs:
+                warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
+                )
+                main_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=max(1, train_epochs - warmup_epochs), eta_min=min_lr
+                )
+                return torch.optim.lr_scheduler.SequentialLR(
+                    optimizer, schedulers=[warmup_sched, main_sched], milestones=[warmup_epochs]
+                )
+            else:
+                return torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=train_epochs, eta_min=min_lr
+                )
+
+        return None
 
     def _make_unlabeled_views(self, inputs_u: torch.Tensor):
         """Generate spatially aligned teacher and student views (V7-1, V8-1, V8-5 fix)."""
@@ -298,7 +327,8 @@ class HASSLTrainer:
 
                 loss = loss_sup + unsup_weight * loss_unsup
 
-            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.net_A.parameters(), max_norm=12.0)  # V10-5 fix: Gradient clipping
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -398,7 +428,10 @@ class HASSLTrainer:
 
                 loss = loss_sup_A + loss_sup_B + unsup_weight * (loss_cps_A + loss_cps_B)
 
-            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer_A)
+            self.scaler.unscale_(self.optimizer_B)
+            torch.nn.utils.clip_grad_norm_(self.net_A.parameters(), max_norm=12.0)  # V10-5 fix: Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.net_B.parameters(), max_norm=12.0)
             self.scaler.step(self.optimizer_A)
             self.scaler.step(self.optimizer_B)
             self.scaler.update()
@@ -445,7 +478,6 @@ class HASSLTrainer:
         first_batch_sample = None
 
         inferer = SlidingWindowInferer(roi_size=self.config.spatial_size, sw_batch_size=2, overlap=0.25)
-        default_voxel_vol_mm3 = float(self.config.spacing[0] * self.config.spacing[1] * self.config.spacing[2])
 
         for batch_idx, batch_data in enumerate(self.val_loader):
             inputs = batch_data['image'].to(self.device)
@@ -469,41 +501,107 @@ class HASSLTrainer:
             self.dice_metric(y_pred=preds_binary, y=targets)
             confusion_metric(y_pred=preds_binary, y=targets)
 
-            # V-5 & V-6 fix: Extract physical voxel volume and spacing directly from current post-resize MetaTensor affine
+            # Volume in original space: invert Resized⁻¹ → Spacingd⁻¹ on the binary
+            # prediction mask so voxel counts reflect the native scan resolution.
             for b in range(inputs.size(0)):
-                voxel_vol = default_voxel_vol_mm3
+                # --- original affine (written by LoadImaged) ---
+                orig_affine = None
+                if hasattr(inputs, 'meta'):
+                    orig_affine = inputs.meta.get('original_affine', None)
+                    if orig_affine is not None and torch.is_tensor(orig_affine):
+                        orig_affine = orig_affine[b]
+                if 'image_meta_dict' in batch_data:
+                    meta = batch_data['image_meta_dict']
+                    if orig_affine is None and 'original_affine' in meta:
+                        orig_affine = meta['original_affine'][b]
+
+                # --- Invertd: warp prediction back to original voxel space ---
+                try:
+                    from monai.transforms import Invertd
+                    # Temporarily attach the prediction into a meta-dict so
+                    # Invertd can trace the stored transform parameters.
+                    inv_transform = Invertd(
+                        keys=["pred"],
+                        transform=self.val_transform,
+                        orig_keys=["image"],
+                        meta_keys=["pred_meta_dict"],
+                        orig_meta_keys=["image_meta_dict"],
+                        nearest_interp=True,
+                        to_tensor=True,
+                    )
+                    # Build a per-sample dict carrying the MetaTensor image
+                    # (needed so Invertd can read its stored transform trace).
+                    sample = {
+                        "image": inputs[b],
+                        "pred": preds_binary[b].clone(),
+                    }
+                    # image_meta_dict is required by Invertd when inputs carry
+                    # transform metadata as a separate dict (non-MetaTensor path).
+                    if 'image_meta_dict' in batch_data:
+                        sample["image_meta_dict"] = {
+                            k: v[b] for k, v in batch_data['image_meta_dict'].items()
+                        }
+                    inv_out = inv_transform(sample)
+                    inv_pred = inv_out["pred"]
+
+                    if orig_affine is not None and torch.is_tensor(orig_affine):
+                        orig_voxel_vol = float(
+                            torch.abs(torch.det(orig_affine[:3, :3].float())).item()
+                        )
+                    else:
+                        orig_voxel_vol = float(
+                            self.config.spacing[0]
+                            * self.config.spacing[1]
+                            * self.config.spacing[2]
+                        )
+
+                    pv_mm3 = float(inv_pred.sum().item()) * orig_voxel_vol
+                    gv_mm3 = float(targets[b].sum().item()) * orig_voxel_vol
+                except Exception as inv_err:
+                    # Invertd unavailable or MetaTensor trace missing — fall
+                    # back to post-resize affine (same behaviour as before).
+                    voxel_vol = float(
+                        self.config.spacing[0]
+                        * self.config.spacing[1]
+                        * self.config.spacing[2]
+                    )
+                    affine_b = None
+                    if hasattr(inputs, 'meta') and 'affine' in inputs.meta:
+                        affine_b = inputs.meta['affine'][b]
+                    elif 'image_meta_dict' in batch_data and 'affine' in batch_data['image_meta_dict']:
+                        affine_b = batch_data['image_meta_dict']['affine'][b]
+                    if affine_b is not None and torch.is_tensor(affine_b):
+                        try:
+                            voxel_vol = float(torch.abs(torch.det(affine_b[:3, :3])).item())
+                        except Exception:
+                            pass
+                    pv_mm3 = float(preds_binary[b].sum().item()) * voxel_vol
+                    gv_mm3 = float(targets[b].sum().item()) * voxel_vol
+
+                # HD95 still runs on the resized-space tensors (dimensionless overlap metric)
                 spacing_b = self.config.spacing
-
-                affine_b = None
                 if hasattr(inputs, 'meta') and 'affine' in inputs.meta:
-                    affine_b = inputs.meta['affine'][b]
-                elif 'image_meta_dict' in batch_data and 'affine' in batch_data['image_meta_dict']:
-                    affine_b = batch_data['image_meta_dict']['affine'][b]
-
-                if affine_b is not None and torch.is_tensor(affine_b):
                     try:
-                        voxel_vol = float(torch.abs(torch.det(affine_b[:3, :3])).item())
-                        spacing_b = tuple(float(torch.linalg.norm(affine_b[:3, i]).item()) for i in range(3))
+                        affine_b = inputs.meta['affine'][b]
+                        spacing_b = tuple(
+                            float(torch.linalg.norm(affine_b[:3, i]).item()) for i in range(3)
+                        )
                     except Exception:
                         pass
-
                 try:
-                    # Pass post-resize physical spacing to HD95 metric (V-6 fix)
                     hd95_metric(y_pred=preds_binary[b:b+1], y=targets[b:b+1], spacing=spacing_b)
                 except Exception:
                     pass
 
-                pv_mm3 = float(preds_binary[b].sum().item()) * voxel_vol
-                gv_mm3 = float(targets[b].sum().item()) * voxel_vol
                 pred_vols_mm3.append(pv_mm3)
                 gt_vols_mm3.append(gv_mm3)
 
         val_dice = self.dice_metric.aggregate().item()
-        val_dice = 0.0 if torch.isnan(torch.tensor(val_dice)) else float(val_dice)
+        val_dice = float('nan') if torch.isnan(torch.tensor(val_dice)) else float(val_dice)  # V6-8: propagate NaN
 
         cm_res = confusion_metric.aggregate()
-        val_prec = float(cm_res[0].item()) if not torch.isnan(cm_res[0]).any() else 0.0
-        val_rec = float(cm_res[1].item()) if not torch.isnan(cm_res[1]).any() else 0.0
+        val_prec = float('nan') if torch.isnan(cm_res[0]).any() else float(cm_res[0].item())  # V6-8: propagate NaN
+        val_rec  = float('nan') if torch.isnan(cm_res[1]).any() else float(cm_res[1].item())  # V6-8: propagate NaN
 
         # V-7 fix: Propagate float('nan') when metric aggregation fails or produces NaN
         try:
@@ -614,9 +712,15 @@ class HASSLTrainer:
                 current_lr = self.optimizer.param_groups[0]['lr']
             elif self.mode == 'full':
                 if getattr(self, 'scheduler_A', None) is not None:
-                    self.scheduler_A.step(val_dice) if isinstance(self.scheduler_A, torch.optim.lr_scheduler.ReduceLROnPlateau) else self.scheduler_A.step()
+                    if isinstance(self.scheduler_A, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        self.scheduler_A.step(val_dice)
+                    else:
+                        self.scheduler_A.step()
                 if getattr(self, 'scheduler_B', None) is not None:
-                    self.scheduler_B.step(val_dice) if isinstance(self.scheduler_B, torch.optim.lr_scheduler.ReduceLROnPlateau) else self.scheduler_B.step()
+                    if isinstance(self.scheduler_B, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        self.scheduler_B.step(val_dice)
+                    else:
+                        self.scheduler_B.step()
                 current_lr = self.optimizer_A.param_groups[0]['lr']
 
             metrics = {
@@ -631,10 +735,13 @@ class HASSLTrainer:
             self.tracker.log_metrics(metrics, step=epoch)
 
             hd95_str = f"{val_metrics['val_hd95']:.2f}mm" if not np.isnan(val_metrics['val_hd95']) else "N/A"
+            dice_str  = f"{val_dice:.4f}"                    if not np.isnan(val_dice)                    else "N/A"
+            prec_str  = f"{val_metrics['val_precision']:.4f}" if not np.isnan(val_metrics['val_precision']) else "N/A"
+            rec_str   = f"{val_metrics['val_recall']:.4f}"    if not np.isnan(val_metrics['val_recall'])    else "N/A"
 
             print(f"  Epoch {epoch:3d}/{end_epoch} | "
-                  f"Loss: {train_loss:.4f} | Dice: {val_dice:.4f} | "
-                  f"Prec: {val_metrics['val_precision']:.4f} | Rec: {val_metrics['val_recall']:.4f} | "
+                  f"Loss: {train_loss:.4f} | Dice: {dice_str} | "
+                  f"Prec: {prec_str} | Rec: {rec_str} | "
                   f"RVE: {val_metrics['val_rve_pct']:.1f}% | R²: {val_metrics['val_volume_r2']:.3f} | "
                   f"HD95: {hd95_str} | LR: {current_lr:.6f}")
 
@@ -673,12 +780,12 @@ class HASSLTrainer:
         self.net_A.load_state_dict(model_dict)
         print(f"  Loaded {len(pretrained_dict)}/{len(model_dict)} layers from pre-trained weights")
 
-    def resume(self, path: str):
-        """Resume training from a full checkpoint (M-9 fix)."""
+    def resume(self, path: str, weights_only: bool = False):
+        """Resume training from a checkpoint (M-9 fix, V10-1/V10-2 fix)."""
         if not os.path.exists(path):
             print(f"  No checkpoint found at {path}, training from scratch.")
             return
-        self.load_checkpoint(path)
+        self.load_checkpoint(path, weights_only=weights_only)
         print(f"  Resumed from checkpoint: {path} at epoch {self.start_epoch} (best_dice={self.best_dice:.4f})")
 
     def save_checkpoint(self, path: str, epoch: int = 0):
@@ -708,37 +815,57 @@ class HASSLTrainer:
 
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(state, path)
-        self.tracker.log_artifact(path, 'checkpoint')
+        if self.tracker is not None:
+            self.tracker.log_artifact(path, 'checkpoint')
 
-    def load_checkpoint(self, path: str):
-        """Load training checkpoint and restore state (M-9 fix)."""
+    def load_checkpoint(self, path: str, weights_only: bool = False):
+        """Load training checkpoint and restore state.
+
+        When weights_only=True (e.g. starting a new AL round or model query),
+        loads model weights and best_dice but resets optimizer, scheduler,
+        and early stopper so each AL round runs a fresh optimization cycle (V10-1, V10-2 fix).
+        """
         if not os.path.exists(path): return
         state = torch.load(path, map_location=self.device, weights_only=False)
         self.net_A.load_state_dict(state['net_A'])
         self.best_dice = state.get('best_dice', 0.0)
-        self.start_epoch = state.get('epoch', 0)  # Restore epoch numbering (M-9 fix)
 
         if self.mode == 'prototype':
             if 'teacher' in state:
                 self.teacher.load_state_dict(state['teacher'])
-            if 'optimizer' in state:
-                self.optimizer.load_state_dict(state['optimizer'])
-            if 'scheduler' in state and getattr(self, 'scheduler', None) is not None:
-                self.scheduler.load_state_dict(state['scheduler'])
         elif self.mode == 'full':
             if 'net_B' in state:
                 self.net_B.load_state_dict(state['net_B'])
-            if 'optimizer_A' in state:
-                self.optimizer_A.load_state_dict(state['optimizer_A'])
-            if 'optimizer_B' in state:
-                self.optimizer_B.load_state_dict(state['optimizer_B'])
-            if 'scheduler_A' in state and getattr(self, 'scheduler_A', None) is not None:
-                self.scheduler_A.load_state_dict(state['scheduler_A'])
-            if 'scheduler_B' in state and getattr(self, 'scheduler_B', None) is not None:
-                self.scheduler_B.load_state_dict(state['scheduler_B'])
 
-        if 'early_stopper' in state and getattr(self, 'early_stopper', None) is not None:
-            self.early_stopper.load_state_dict(state['early_stopper'])
+        if weights_only:
+            # Reset epoch numbering, scheduler, and early stopper for new AL round
+            self.start_epoch = 0
+            if self.mode == 'prototype':
+                self.scheduler = self._build_scheduler(self.optimizer)
+            else:
+                self.scheduler_A = self._build_scheduler(self.optimizer_A)
+                self.scheduler_B = self._build_scheduler(self.optimizer_B)
+            if self.early_stopper is not None:
+                self.early_stopper.reset()
+        else:
+            self.start_epoch = state.get('epoch', 0)
+            if self.mode == 'prototype':
+                if 'optimizer' in state:
+                    self.optimizer.load_state_dict(state['optimizer'])
+                if 'scheduler' in state and getattr(self, 'scheduler', None) is not None:
+                    self.scheduler.load_state_dict(state['scheduler'])
+            elif self.mode == 'full':
+                if 'optimizer_A' in state:
+                    self.optimizer_A.load_state_dict(state['optimizer_A'])
+                if 'optimizer_B' in state:
+                    self.optimizer_B.load_state_dict(state['optimizer_B'])
+                if 'scheduler_A' in state and getattr(self, 'scheduler_A', None) is not None:
+                    self.scheduler_A.load_state_dict(state['scheduler_A'])
+                if 'scheduler_B' in state and getattr(self, 'scheduler_B', None) is not None:
+                    self.scheduler_B.load_state_dict(state['scheduler_B'])
+
+            if 'early_stopper' in state and getattr(self, 'early_stopper', None) is not None:
+                self.early_stopper.load_state_dict(state['early_stopper'])
 
     def get_models(self):
         """Return trained models for active learning query."""

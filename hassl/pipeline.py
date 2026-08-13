@@ -166,16 +166,27 @@ def run_train(config: HASSLConfig, round_num: int = 0) -> None:
         pretrained_weights=pretrained_weights,
     )
 
-    # Resume from checkpoint if available for this round
+    # Resume from checkpoint if available for this round, or load weights from previous AL round
     resume_path = Path(config.checkpoint_dir) / f"round{round_num}_latest.pth"
     if resume_path.exists():
-        print(f"  Resuming from {resume_path}")
-        trainer.resume(str(resume_path))
+        print(f"  Resuming in-progress training round from {resume_path}")
+        trainer.resume(str(resume_path), weights_only=False)
+    elif round_num > 0:
+        prev_ckpt = Path(config.checkpoint_dir) / f"round{round_num - 1}_latest.pth"
+        if not prev_ckpt.exists():
+            prev_ckpt = Path(config.checkpoint_dir) / "best_checkpoint.pth"
+        if prev_ckpt.exists():
+            print(f"  Initializing round {round_num} from previous round weights: {prev_ckpt}")
+            trainer.load_checkpoint(str(prev_ckpt), weights_only=True)
 
     trainer.train(num_epochs=config.train_epochs)
 
+    # Save latest round checkpoint
+    round_ckpt = Path(config.checkpoint_dir) / f"round{round_num}_latest.pth"
+    trainer.save_checkpoint(str(round_ckpt), epoch=config.train_epochs - 1)
+
     tracker.finish()
-    print(f"\n✓ Training round {round_num} complete.")
+    print(f"\n\u2713 Training round {round_num} complete.")
 
 
 def run_query(config: HASSLConfig, round_num: int = 1) -> None:
@@ -220,7 +231,7 @@ def run_query(config: HASSLConfig, round_num: int = 1) -> None:
 
     best_ckpt = Path(config.checkpoint_dir) / "best_checkpoint.pth"
     if best_ckpt.exists():
-        trainer.load_checkpoint(str(best_ckpt))
+        trainer.load_checkpoint(str(best_ckpt), weights_only=True)
 
     model_A, model_B = trainer.get_models()
 
