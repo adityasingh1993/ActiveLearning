@@ -589,7 +589,21 @@ class HASSLTrainer:
             confusion_metric(y_pred=preds_binary, y=targets)
             confusion_metric_lcc(y_pred=preds_binary_lcc, y=targets)
 
-            for b in range(inputs.size(0)):
+            from monai.data import decollate_batch, MetaTensor
+            from monai.transforms import Invertd
+
+            decollated_samples = decollate_batch(batch_data)
+            inv_transform = Invertd(
+                keys=["pred", "pred_lcc", "label"],
+                transform=self.val_transform,
+                orig_keys=["image", "image", "label"],
+                meta_keys=["pred_meta_dict", "pred_lcc_meta_dict", "label_meta_dict"],
+                orig_meta_keys=["image_meta_dict", "image_meta_dict", "label_meta_dict"],
+                nearest_interp=True,
+                to_tensor=True,
+            )
+
+            for b, sample in enumerate(decollated_samples):
                 orig_affine = None
                 if hasattr(inputs, 'meta'):
                     orig_affine = inputs.meta.get('original_affine', None)
@@ -601,52 +615,28 @@ class HASSLTrainer:
                         orig_affine = meta['original_affine'][b]
 
                 try:
-                    from monai.transforms import Invertd
-                    # Pass self.val_transform directly so MONAI's Invertd matches the exact transform
-                    # object memory IDs recorded in inputs[b].applied_operations.
-                    inv_transform = Invertd(
-                        keys=["pred", "pred_lcc", "label"],
-                        transform=self.val_transform,
-                        orig_keys=["image", "image", "label"],
-                        meta_keys=["pred_meta_dict", "pred_lcc_meta_dict", "label_meta_dict"],
-                        orig_meta_keys=["image_meta_dict", "image_meta_dict", "label_meta_dict"],
-                        nearest_interp=True,
-                        to_tensor=True,
-                    )
-                    from monai.data import MetaTensor
                     # Wrap predictions as MetaTensors carrying the input's transform trace.
-                    # Without this, Invertd has no applied_operations to invert and returns
-                    # the tensor unchanged (the silent no-op identified in round 13).
                     pred_mt = MetaTensor(
                         preds_binary[b].clone(),
-                        meta=inputs[b].meta if hasattr(inputs[b], 'meta') else {},
+                        meta=sample['image'].meta if hasattr(sample['image'], 'meta') else {},
                         applied_operations=(
-                            inputs[b].applied_operations
-                            if hasattr(inputs[b], 'applied_operations') else []
+                            sample['image'].applied_operations
+                            if hasattr(sample['image'], 'applied_operations') else []
                         ),
                     )
                     pred_lcc_mt = MetaTensor(
                         preds_binary_lcc[b].clone(),
-                        meta=inputs[b].meta if hasattr(inputs[b], 'meta') else {},
+                        meta=sample['image'].meta if hasattr(sample['image'], 'meta') else {},
                         applied_operations=(
-                            inputs[b].applied_operations
-                            if hasattr(inputs[b], 'applied_operations') else []
+                            sample['image'].applied_operations
+                            if hasattr(sample['image'], 'applied_operations') else []
                         ),
                     )
-                    sample = {
-                        "image": inputs[b],
-                        "label": targets[b].clone(),
-                        "pred": pred_mt,
-                        "pred_lcc": pred_lcc_mt,
-                    }
-                    if 'image_meta_dict' in batch_data:
-                        sample["image_meta_dict"] = {
-                            k: v[b] for k, v in batch_data['image_meta_dict'].items()
-                        }
-                    if 'label_meta_dict' in batch_data:
-                        sample["label_meta_dict"] = {
-                            k: v[b] for k, v in batch_data['label_meta_dict'].items()
-                        }
+                    sample["pred"] = pred_mt
+                    sample["pred_lcc"] = pred_lcc_mt
+                    if "label" not in sample:
+                        sample["label"] = targets[b].clone()
+
                     inv_out = inv_transform(sample)
                     inv_pred = inv_out["pred"]
                     inv_pred_lcc = inv_out["pred_lcc"]
