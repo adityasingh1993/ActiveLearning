@@ -645,13 +645,28 @@ class HASSLTrainer:
             from monai.data import decollate_batch, MetaTensor
 
             decollated_samples = decollate_batch(batch_data)
+
+            # Metrics inversion: pred, pred_lcc, label only — nearest_interp=True (scalar, all MONAI versions)
+            # nearest_interp as a list is not universally supported; keep it scalar here.
             inv_transform = build_invertd(
-                keys=["image", "pred", "pred_lcc", "label"],
+                keys=["pred", "pred_lcc", "label"],
                 transform=self.val_transform,
-                orig_keys=["image", "image", "image", "label"],
-                nearest_interp=[False, True, True, True],  # image=cubic, masks=nearest
+                orig_keys=["image", "image", "label"],
+                nearest_interp=True,
                 to_tensor=True,
             )
+
+            # Image-only inversion for native-space visualization preview (built once per batch,
+            # used only for sample 0 on image-logging epochs). Separate call to avoid:
+            #   1. list-form nearest_interp compatibility issues
+            #   2. applied_operations exhaustion when all 4 keys share the same ops trace
+            inv_image_transform = build_invertd(
+                keys=["image"],
+                transform=self.val_transform,
+                orig_keys=["image"],
+                nearest_interp=False,  # bilinear/trilinear for smooth image inversion
+                to_tensor=True,
+            ) if should_log_image else None
 
             # Fix 1: extract affine-derived voxel volume ONCE per sample, BEFORE try/except.
             # Previously, the fallback path used config.spacing (default 1.0,1.0,1.0 mm) which
@@ -729,17 +744,25 @@ class HASSLTrainer:
                     pv_mm3_lcc = float(inv_pred_lcc.sum().item()) * voxel_vol_mm3
                     gv_mm3 = float(inv_gt.sum().item()) * voxel_vol_mm3
 
-                    # Capture native scanner physical space tensors for sample 0 preview.
-                    # We invert ALL keys (image, pred, pred_lcc, label) through the same
-                    # Invertd pipeline so the image comes from actual scanner-space data,
-                    # not a trilinear upsample from 128³ which would look blurry.
-                    if b == 0 and first_batch_native_sample is None and should_log_image:
-                        first_batch_native_sample = (
-                            inv_out["image"].detach().cpu(),      # real inverted image
-                            inv_gt.detach().cpu(),
-                            inv_pred.detach().cpu(),
-                            inv_pred_lcc.detach().cpu(),
-                        )
+                    # Capture native-space tensors for sample 0 visualization.
+                    # Image is inverted via a SEPARATE single-key Invertd (inv_image_transform)
+                    # using a fresh ops deepcopy — this avoids the ops-exhaustion bug where
+                    # inverting image first consumes applied_operations, leaving pred/label empty.
+                    if b == 0 and first_batch_native_sample is None and should_log_image and inv_image_transform is not None:
+                        try:
+                            img_ops = copy.deepcopy(sample['image'].applied_operations) if hasattr(sample['image'], 'applied_operations') else []
+                            img_meta = copy.deepcopy(sample['image'].meta) if hasattr(sample['image'], 'meta') else {}
+                            from monai.data import MetaTensor as _MT
+                            img_mt = _MT(sample['image'].clone(), meta=img_meta, applied_operations=img_ops)
+                            inv_img_out = inv_image_transform({"image": img_mt})
+                            first_batch_native_sample = (
+                                inv_img_out["image"].detach().cpu(),
+                                inv_gt.detach().cpu(),
+                                inv_pred.detach().cpu(),
+                                inv_pred_lcc.detach().cpu(),
+                            )
+                        except Exception as img_e:
+                            logger.warning("[HASSL] Native-space image inversion failed (preview only): %s", img_e)
                 except Exception as e:
                     logger.warning(
                         "[HASSL] validate Invertd failed for sample %d, "
