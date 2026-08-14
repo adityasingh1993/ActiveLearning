@@ -1,80 +1,93 @@
-# HASSL Full Configuration (24GB GPU)
-# Dual-network CPS with SwinUNETR for maximum performance
+# HASSL Full Configuration (24GB VRAM GPU)
+# Dual-network CPS with DynUNet + SwinUNETR for maximum performance
 
 # ─── Data ─────────────────────────────────────────────────────────────
 data_dir: "./data"
 image_suffix: ".mha"
 label_suffix: ".seg.nrrd"
-num_classes: 1
-spacing: [0.100, 0.0386, 0.0982]
-spatial_size: [128, 128, 128]
-val_split: 5
+num_classes: 1                    # 1 = binary segmentation (sigmoid), >1 = multi-class (softmax)
+spacing: [0.100, 0.0386, 0.0982]  # Spacingd pixdim — ultrasound volume voxel resolution (mm per voxel)
+spatial_size: [128, 128, 128]     # Resized spatial target dimensions
+preprocessing_mode: "resize"      # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
+patch_size: [96, 96, 96]          # Patch crop size when preprocessing_mode == "patch"
+pos_neg_ratio: 1.0                # Positive/negative sample ratio for RandCropByPosNegLabeld (patch mode)
+val_split: 5                      # Number of labeled volumes held out for validation
 cache_dir: "./cache"
-use_cache_dataset: true
+use_cache_dataset: true           # Cache preprocessed tensors in RAM for fast training epochs
+patient_id_regex: null            # Custom regex for extracting patient ID prefix from volume filename
+server_cache_max_volumes: 20      # Max 3D volumes held in Web UI server LRU image/mask cache
 
 # ─── Compute ──────────────────────────────────────────────────────────
-compute_mode: "full"              # Full mode: dual-network CPS
-device: "cuda"
-batch_size: 2                     # 2 for 24GB
+compute_mode: "full"              # "full" (24GB VRAM dual-network CPS)
+device: "cuda"                    # "cuda" or "cpu"
+batch_size: 2                     # Batch size 2 for 24GB VRAM
 num_workers: 4
-use_amp: true
-use_gradient_checkpointing: true
+use_amp: true                     # Automatic Mixed Precision (FP16) training
+use_gradient_checkpointing: true  # Memory optimization for UNet/SwinUNETR
 seed: 42
 
 # ─── Network ──────────────────────────────────────────────────────────
-unet_backbone: "dynunet"
+unet_backbone: "dynunet"          # "dynunet" (MONAI DynUNet) or "unet" (Standard UNet)
 unet_channels: [16, 32, 64, 128, 256]
 unet_strides: [2, 2, 2, 2]
-unet_num_res_units: 2
-dynunet_deep_supervision: true
-dropout: 0.2
+unet_num_res_units: 2             # Only used when unet_backbone == "unet"
+dynunet_deep_supervision: true    # Enable deep supervision auxiliary loss heads (DynUNet)
+dropout: 0.2                      # Dropout rate for MC Dropout during uncertainty estimation
+swinunetr_feature_size: 48        # Secondary network feature size (SwinUNETR for 24GB mode)
 
-swinunetr_feature_size: 48
-
-# ─── SSL Pre-training ─────────────────────────────────────────────────
-ssl_epochs: 200                   # More epochs for full training
+# ─── SSL Pre-training (Phase 2) ───────────────────────────────────────
+ssl_epochs: 200                   # More epochs for full mode pre-training
 ssl_lr: 0.0001
 ssl_weight_decay: 0.00001
-ssl_mask_ratio: 0.3
-ssl_mask_cube_size: 16
-ssl_contrastive_temp: 0.07
-ssl_embedding_dim: 128
+ssl_mask_ratio: 0.3               # Fraction of volume to mask in masked spatial autoencoding
+ssl_mask_cube_size: 16            # Size of each sub-cube mask
+ssl_contrastive_temp: 0.07        # Temperature for InfoNCE contrastive loss
+ssl_embedding_dim: 128            # Projection head embedding dimension
+ssl_use_early_stopping: true      # Stop SSL early if contrastive loss stops improving
+ssl_early_stopping_patience: 20   # Epochs to wait before early stopping in SSL
 
-# ─── Semi-Supervised Training ─────────────────────────────────────────
-train_epochs: 300                 # More epochs for full training
+# ─── Semi-Supervised Training (Phase 3) ───────────────────────────────
+train_epochs: 300                 # Max epochs per Active Learning round (24GB mode)
 train_lr: 0.0001
 train_weight_decay: 0.00001
-lambda_unsup: 1.0
-ema_decay: 0.999
-flexmatch_threshold: 0.95
-mc_dropout_passes: 10             # More passes for better uncertainty
-consistency_rampup_epochs: 30
-save_every_n_epochs: 20
-log_image_every_n_epochs: 10
+lr_scheduler: "cosine"            # "cosine", "plateau", or "none"
+min_lr: 0.000001                  # Minimum learning rate floor
+lr_warmup_epochs: 5               # Linear LR warmup epochs at start of training
+use_early_stopping: true          # Stop AL round early if validation Dice plateaus
+early_stopping_patience: 30       # Validation checks to wait before early stopping
+early_stopping_min_delta: 0.0001  # Minimum Dice improvement delta
+lambda_unsup: 1.0                 # Max loss weight for unsupervised consistency loss
+ema_decay: 0.999                  # EMA teacher momentum coefficient
+flexmatch_threshold: 0.95         # Confidence threshold for semi-supervised pseudo-labeling
+mc_dropout_passes: 10             # MC Dropout forward passes (10 for 24GB mode)
+consistency_rampup_epochs: 30     # Linear rampup duration for unsupervised loss weight
+pseudo_label_weight: 0.5          # Weight multiplier for pseudo-labeled approved samples (0.5 = safe)
+save_every_n_epochs: 20           # Checkpoint saving frequency
+log_image_every_n_epochs: 10      # WandB/MLflow 6-panel uncertainty slice preview logging frequency
 
-# ─── Active Learning ──────────────────────────────────────────────────
-al_query_size: 10
-al_rounds: 4                     # Can afford more rounds with faster training
-al_strategy: "hybrid"
-al_hybrid_weights: [0.4, 0.3, 0.3]
+# ─── Active Learning (Phase 4) ───────────────────────────────────────
+al_query_size: 10                 # Number of volumes to query/promote per round
+al_rounds: 4                      # Total Active Learning rounds
+al_strategy: "hybrid"             # Query strategy: "bald", "coreset", "disagreement", "hybrid"
+al_hybrid_weights: [0.4, 0.3, 0.3]# Weights for (BALD, CoreSet, Disagreement) in hybrid mode
 
 # ─── Pseudo-Label Auto-Promotion Quality Gates ────────────────────────
-pseudo_confidence_threshold: 0.85     # Gate 1: Min foreground certainty (85%)
-pseudo_mc_passes: 10                 # Gate 2: Epistemic MC Dropout passes (10 for 24GB)
-pseudo_mc_var_threshold: 0.05        # Gate 2: Max allowed epistemic variance
-pseudo_tta_passes: 8                 # Gate 3: Aleatoric TTA passes
-pseudo_tta_var_threshold: 0.02       # Gate 3: Max allowed aleatoric variance
-pseudo_tta_flip: true                # Gate 3: Random spatial axis flips during TTA
-pseudo_tta_intensity_std: 0.02       # Gate 3: Gaussian intensity jitter std during TTA
+pseudo_confidence_threshold: 0.85 # Gate 1: Min foreground certainty (85%)
+pseudo_mc_passes: 10              # Gate 2: Epistemic MC Dropout forward passes (10 for 24GB)
+pseudo_mc_var_threshold: 0.05     # Gate 2: Max allowed epistemic variance
+pseudo_tta_passes: 8              # Gate 3: Aleatoric TTA augmented passes
+pseudo_tta_var_threshold: 0.02    # Gate 3: Max allowed aleatoric variance
+pseudo_tta_flip: true             # Gate 3: Random spatial axis flips during TTA
+pseudo_tta_intensity_std: 0.02    # Gate 3: Gaussian intensity jitter std during TTA
 
-
-# ─── Experiment Tracking ──────────────────────────────────────────────
+# ─── Experiment Tracking (Phase 5) ───────────────────────────────────
 tracker: "wandb"                  # "wandb", "mlflow", or "none"
 project_name: "hassl-ultrasound"
 experiment_name: "bladder-full"
-mlflow_tracking_uri: "http://localhost:5000"  # Or "file:./mlruns" for local directory
+run_name: null                    # Custom run name (auto-generated if null)
+mlflow_tracking_uri: "http://localhost:5000"
 
-# ─── Directories ──────────────────────────────────────────────────────
+# ─── Directories (Auto-created if missing) ───────────────────────────
 checkpoint_dir: "./experiments/checkpoints"
 log_dir: "./experiments/logs"
 preseg_dir: "./data/al_preseg"
