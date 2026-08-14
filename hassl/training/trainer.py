@@ -90,46 +90,7 @@ def compute_multiscale_loss(criterion, preds, target):
         return l.mean() if l.ndim > 0 else l
 
 
-def apply_keep_largest_cc(pred_tensor: torch.Tensor, min_size_voxels: int = 100) -> torch.Tensor:
-    """Keep only the largest CC and remove satellite predictions smaller than min_size_voxels.
-
-    Args:
-        pred_tensor: Binary prediction tensor [B, C, D, H, W].
-        min_size_voxels: Any connected component with fewer voxels than this is discarded,
-            even if it is the only component. Default 100 is safe for medium-sized targets
-            (bladder/prostate at 128^3 are 1000-10000 voxels). Set via config.lcc_min_size_voxels.
-
-    Two-pass approach:
-      Pass 1 — find and keep the largest CC.
-      Pass 2 — zero out any component (including the largest) below min_size_voxels threshold.
-    This removes satellite noise blobs that inflate FP rates and bias volume estimates upward.
-    """
-    import scipy.ndimage as ndi
-
-    device = pred_tensor.device
-    arr = pred_tensor.detach().cpu().numpy()
-    out = np.zeros_like(arr)
-
-    for b in range(arr.shape[0]):
-        for c in range(arr.shape[1]):
-            mask = arr[b, c] > 0.5
-            if not mask.any():
-                continue
-            labeled_arr, num = ndi.label(mask)
-            if num == 0:
-                continue
-            counts = np.bincount(labeled_arr.ravel())
-            counts[0] = 0  # exclude background
-            if counts.max() == 0:
-                continue
-            max_lab = counts.argmax()
-            largest_size = counts[max_lab]
-            # Keep largest CC only if it meets the minimum size threshold
-            if largest_size >= min_size_voxels:
-                out[b, c] = (labeled_arr == max_lab).astype(arr.dtype)
-            # else: all components are too small — output stays zero (no prediction)
-
-    return torch.from_numpy(out).to(device)
+from ..utils.postprocessing import apply_keep_largest_cc
 
 
 class EarlyStopping:
