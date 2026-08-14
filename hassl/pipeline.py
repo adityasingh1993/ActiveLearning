@@ -174,7 +174,9 @@ def run_train(config: HASSLConfig, round_num: int = 0, pretrained_weights: Optio
         print(f"  Resuming in-progress training round from {resume_path}")
         trainer.resume(str(resume_path), weights_only=False)
     elif round_num > 0:
-        prev_ckpt = Path(config.checkpoint_dir) / f"round{round_num - 1}_latest.pth"
+        prev_ckpt = Path(config.checkpoint_dir) / f"round{round_num - 1}_best.pth"
+        if not prev_ckpt.exists():
+            prev_ckpt = Path(config.checkpoint_dir) / f"round{round_num - 1}_latest.pth"
         if not prev_ckpt.exists():
             prev_ckpt = Path(config.checkpoint_dir) / "best_checkpoint.pth"
         if prev_ckpt.exists():
@@ -183,9 +185,15 @@ def run_train(config: HASSLConfig, round_num: int = 0, pretrained_weights: Optio
 
     trainer.train(num_epochs=config.train_epochs)
 
-    # Save latest round checkpoint
+    # Save latest and best round checkpoints
+    import shutil
     round_ckpt = Path(config.checkpoint_dir) / f"round{round_num}_latest.pth"
     trainer.save_checkpoint(str(round_ckpt), epoch=config.train_epochs - 1)
+
+    best_ckpt = Path(config.checkpoint_dir) / "best_checkpoint.pth"
+    if best_ckpt.exists():
+        round_best = Path(config.checkpoint_dir) / f"round{round_num}_best.pth"
+        shutil.copy(best_ckpt, round_best)
 
     tracker.finish()
     print(f"\n\u2713 Training round {round_num} complete.")
