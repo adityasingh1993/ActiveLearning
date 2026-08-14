@@ -1,8 +1,11 @@
 import logging
 import os
+import warnings
 from typing import Dict, Optional
 import numpy as np
 import torch
+
+warnings.filterwarnings("ignore", message=".*always_return_as_numpy.*")
 
 logger = logging.getLogger(__name__)
 import torch.nn as nn
@@ -568,7 +571,7 @@ class HASSLTrainer:
                             elif p.ndim == 6: p = p[:, 0]
                             p_prob = torch.sigmoid(p) if self.num_classes == 1 else torch.softmax(p, dim=1)
                             if flipped_dims:
-                                p_prob = torch.flip(p_prob, dims=flipped_dims)
+                                p_prob = torch.flip(p_prob, dims=tuple(flipped_dims))
                             tta_preds.append(p_prob)
                         tta_var_t = torch.stack(tta_preds, dim=0).var(dim=0)[0]
                 except Exception as e:

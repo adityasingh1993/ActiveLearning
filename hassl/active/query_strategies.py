@@ -116,7 +116,7 @@ class TTAUncertaintyScorer:
             # Randomly flip along D (dim 2), H (dim 3), W (dim 4) axes
             for dim in [2, 3, 4]:
                 if random.random() > 0.5:
-                    aug = torch.flip(aug, dims=[dim])
+                    aug = torch.flip(aug, dims=(dim,))
                     flipped_dims.append(dim)
         if self.intensity_std > 0.0:
             aug = aug + torch.randn_like(aug) * self.intensity_std
@@ -146,7 +146,7 @@ class TTAUncertaintyScorer:
 
                 # Un-flip the prediction spatially back to native coordinates
                 if flipped_dims:
-                    prob = torch.flip(prob, dims=flipped_dims)
+                    prob = torch.flip(prob, dims=tuple(flipped_dims))
 
                 preds.append(prob)
 
