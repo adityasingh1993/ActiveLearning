@@ -14,26 +14,26 @@
 
 ## 📌 Overview
 
-**HASSL (Hybrid Active Semi-Supervised Learning)** is a MONAI-native deep learning framework specifically designed for **3D B-Mode Ultrasound images**. 
+**HASSL (Hybrid Active Semi-Supervised Learning)** is a MONAI-native deep learning framework for **3D B-Mode Ultrasound segmentation** designed to work well with very few labels.
 
-When faced with a dataset of **~300 3D volumes where only 50 are labeled**, traditional supervised learning overfits, and basic active learning picks redundant or noisy scans. HASSL resolves this by integrating **Self-Supervised Pre-training (SSL)**, **Consistency-Regularized Semi-Supervised Learning (SSL)**, and **Hybrid Active Learning (AL)** into a single unified framework.
+When faced with a dataset of **~300 3D volumes where only 50 are labeled**, traditional supervised learning overfits and basic active learning picks redundant or noisy scans. HASSL resolves this by integrating **Self-Supervised Pre-training (SSL)**, **Consistency-Regularized Semi-Supervised Training**, and **Hybrid Active Learning (AL)** into a single unified framework.
 
 ---
 
 ## ✨ Key Features
 
-- **🧠 Self-Supervised Pre-Training**: Pre-trains UNet / DynUNet encoders on all 300 unlabeled 3D volumes using Masked Volume Inpainting (30%), InfoNCE Contrastive Learning, and 3D Rotation Prediction.
+- **🧠 Self-Supervised Pre-Training**: Pre-trains UNet / DynUNet encoders on all unlabeled 3D volumes using Masked Volume Inpainting, InfoNCE Contrastive Learning, and 3D Rotation Prediction.
 - **⚡ Dual-Compute Tier Architecture**:
-  - **Prototype Mode (8GB VRAM GPU)**: Uses Uncertainty-Aware Mean Teacher (UA-MT), AMP mixed precision, and MC Dropout variance masking (~6.2 GB VRAM).
-  - **Full Mode (24GB VRAM GPU)**: Scales to dual-network Cross-Pseudo Supervision (DynUNet + SwinUNETR transformer) (~18.5 GB VRAM).
-- **🎯 Hybrid Active Learning Strategy**: Selects the most informative volumes using a fused score:
-  $$\text{Score} = 0.4 \cdot \text{BALD (Uncertainty)} + 0.3 \cdot \text{CoreSet (Diversity)} + 0.3 \cdot \text{Disagreement}$$
-- **🔄 3 Flexible Operating Modes**:
-  - **Option A (Fully Automated)**: 100% hands-free pseudo-label promotion & retraining loop.
-  - **Option B (3D Slicer)**: Exports `.seg.nrrd` pre-segmentations for desktop review in 3D Slicer.
-  - **Option C (Browser Web UI)**: Embedded FastAPI + JS canvas slice viewer (`http://localhost:8000`) for one-click label review.
-- **🏥 Medical Format Native**: Built-in `.seg.nrrd` 3D Slicer segment metadata parser (`pynrrd`) and `.mha` SimpleITK loader.
-- **🧪 Comprehensive Test Suite**: 8 CPU unit test modules covering config, dataloaders, loss functions, network passes, and query strategies.
+  - **Prototype Mode (8GB VRAM)**: Uncertainty-Aware Mean Teacher (UA-MT) with EMA teacher, MC Dropout, AMP, and gradient checkpointing (~6.2 GB VRAM).
+  - **Full Mode (24GB VRAM)**: Dual-network Cross-Pseudo Supervision (DynUNet + SwinUNETR) with FlexMatch dynamic thresholding (~18.5 GB VRAM).
+- **🎯 Hybrid Active Learning**: Fused informativeness score:
+  $$\text{Score} = 0.4 \cdot \text{BALD} + 0.3 \cdot \text{CoreSet} + 0.3 \cdot \text{Disagreement}$$
+- **🔒 Dual Pseudo-Label Quality Gate**: Three-stage filter before any pseudo-label is promoted:
+  - **Gate 1** — Min foreground confidence (`pseudo_confidence_threshold: 0.85`)
+  - **Gate 2** — Max MC Dropout epistemic variance (`pseudo_mc_var_threshold: 0.05`)
+  - **Gate 3** — Max TTA aleatoric variance (`pseudo_tta_var_threshold: 0.02`)
+- **🔄 3 Flexible Operating Modes**: Fully Automated, 3D Slicer Desktop, or Browser Web UI.
+- **🏥 Medical Format Native**: `.seg.nrrd` 3D Slicer segment metadata parser and `.mha` SimpleITK loader.
 
 ---
 
@@ -44,7 +44,7 @@ flowchart TD
     subgraph Data Engine
         A[Raw 3D Ultrasound .mha] --> B[MONAI Preprocessing]
         A2[Ground Truth .seg.nrrd] --> B
-        B --> C[RAS Orientation + Spacingd + Resized 128³]
+        B --> C["RAS Orientation → Spacingd → Resized 128³\n(or Spacingd → RandCrop in patch mode)"]
     end
 
     subgraph Phase 2: SSL Pre-Training
@@ -56,7 +56,7 @@ flowchart TD
     subgraph Phase 3: Semi-Supervised Training
         E --> G{Compute Tier}
         G -->|Prototype 8GB| H[UA-Mean Teacher + MC Dropout]
-        G -->|Full 24GB| I[Dual-Network CPS: DynUNet + SwinUNETR]
+        G -->|Full 24GB| I[CPS: DynUNet + SwinUNETR]
         H --> J[Model Checkpoints]
         I --> J
     end
@@ -65,12 +65,50 @@ flowchart TD
         J --> K{Operating Mode}
         K -->|Option A| L[Auto-Promote High-Confidence Pseudo-Labels]
         K -->|Option B| M[Export .seg.nrrd for 3D Slicer]
-        K -->|Option C| N[FastAPI Web UI Server localhost:8000]
+        K -->|Option C| N[FastAPI Web UI localhost:8000]
         L --> O[Expand Labeled Pool & Retrain]
         M --> O
         N --> O
     end
 ```
+
+---
+
+## ⚙️ Preprocessing Pipeline
+
+In the default `resize` mode, every volume passes through this chain before reaching the model:
+
+```
+LoadImage → EnsureChannelFirst → Orientationd(RAS)
+  → Spacingd(config.spacing)
+  → AsDiscreted(threshold=0.5)          [binary] or NormalizeLabelsInDatasetd [multiclass]
+  → ScaleIntensityRangePercentilesd     [1–99 percentile → 0.0–1.0, channel-wise]
+  → Resized(128, 128, 128)              [whole-volume fixed grid]
+  → StrongAugmentation                  [train only]
+```
+
+For **patch mode** (`preprocessing_mode: "patch"`), `Resized` is replaced by `RandCropByPosNegLabeld(patch_size)` during training. Validation always uses `Resized(128, 128, 128)` in both modes.
+
+---
+
+## 🔍 Validation
+
+Validation uses `SlidingWindowInferer(roi_size=spatial_size, overlap=0.25)`. In `resize` mode the validation volume is already 128³, so the inferer runs exactly **one window = one forward pass**. Metrics computed per epoch:
+
+| Metric | Description |
+|:---|:---|
+| `val_dice` | Mean Dice (no post-processing) |
+| `val_dice_lcc` | Mean Dice after Largest Connected Component filtering |
+| `val_precision` / `val_recall` | Precision and Recall (no LCC) |
+| `val_hd95` | 95th-percentile Hausdorff Distance (mm) |
+| `val_rve_pct` | Relative Volume Error (%) in scanner-native mm³ |
+| `val_volume_r2` | R² of predicted vs. ground-truth volume |
+
+**Two visualization previews are logged** every `log_image_every_n_epochs` epochs:
+- `val_slice_preview_model_space` — raw 128³ model input with prediction overlay
+- `val_slice_preview_native_space` — scanner-native resolution via `Invertd` inversion
+
+> **Note**: `val_dice_lcc = 0.0` in early epochs is expected. LCC post-processing zeros predictions smaller than `lcc_min_size_voxels` voxels. Monitor `val_dice` (no LCC) to judge early training progress.
 
 ---
 
@@ -84,87 +122,84 @@ cd ActiveLearning
 pip install -r requirements.txt
 ```
 
-### 2. Prepare Your Data (or Generate Synthetic Data)
+### 2. Prepare Data
 
-#### Option 2A: Generate Synthetic 3D Ultrasound Data (For Testing)
+#### Option A — Generate Synthetic Test Data
 ```bash
 python -m hassl.utils.synthetic_data --output ./data --num-volumes 20 --num-labeled 5
 ```
 
-#### Option 2B: Use Real Data
-Place your dataset inside `data/`:
+#### Option B — Real Data
 ```
 data/
-├── images/    <-- Place all ~300 image volumes (.mha files)
-└── labels/    <-- Place your initial 50 label volumes (.seg.nrrd files)
+├── images/    ← All 3D image volumes (.mha)
+└── labels/    ← Labeled masks (.seg.nrrd)
 ```
+
+> **Important**: Delete `data/splits.json` before the first run if you have changed your dataset. HASSL creates this file once and reuses it across rounds to ensure reproducible patient-level splits.
 
 ---
 
-## 🎮 How to Run (Choose Your Operating Mode)
+## 🎮 Operating Modes
 
-### 🤖 Option A: Fully Automated Self-Training (Zero Manual Labor)
-Train and automatically promote high-confidence pseudo-labels **100% hands-free**:
+### 🤖 Option A: Fully Automated (Zero Manual Labor)
 ```bash
 python -m hassl.pipeline --config config.yaml --phase auto-loop
 ```
 
----
-
 ### 🖥️ Option B: 3D Slicer Desktop Workflow
-Export AI pre-segmentations, review in 3D Slicer, and trigger active learning rounds:
 ```bash
-# Step 1: Run SSL & Initial Training
+# Step 1: Initial training
 python -m hassl.pipeline --config config.yaml --phase all
 
-# Step 2: Open 3D Slicer, correct pre-segmentations in data/al_preseg/, save to data/labels/
+# Step 2: Review & correct predictions in 3D Slicer, save to data/labels/
 
-# Step 3: Retrain on expanded label pool
+# Step 3: Retrain
 python -m hassl.pipeline --config config.yaml --phase al-round --round 1
 ```
 
----
-
-### 🌐 Option C: Browser-Based Web UI (No 3D Slicer Required)
-Launch the local web application to review slices right in Chrome/Edge:
+### 🌐 Option C: Browser Web UI
 ```bash
 python -m hassl.pipeline --config config.yaml --phase serve
 ```
-1. Open **`http://localhost:8000`** in your browser.
-2. Scroll through 2D slices along **Axial**, **Coronal**, or **Sagittal** planes.
-3. Use keyboard shortcuts: `1`/`2`/`3` (switch view), `A` (accept label), `R` (reject), `N` (next volume).
-4. Click **"🔄 Retrain Model"** in the top header when finished reviewing a batch.
+Open **`http://localhost:8000`** → scroll slices → `A` accept / `R` reject / `N` next volume → **🔄 Retrain Model**.
 
 ---
 
-## ⚙️ Configuration Knobs
+## ⚙️ Key Configuration
 
-Configure hardware and network backbones in `config.yaml`:
+Two ready-to-use YAML files are provided:
+
+| File | GPU | Mode | Architecture |
+|:---|:---|:---|:---|
+| `config.yaml` | 8GB | `prototype` | Single DynUNet + UA-Mean Teacher |
+| `config_full.yaml` | 24GB | `full` | Dual-Network CPS (DynUNet + SwinUNETR) |
+
+Critical defaults to be aware of:
 
 ```yaml
-# Compute Mode: "prototype" (8GB VRAM) or "full" (24GB VRAM)
-compute_mode: "prototype"
-
-# Network Backbone: "dynunet" or "unet"
-unet_backbone: "dynunet"
-
-# Data Resizing & Resolution Spacing
+# Preprocessing
+preprocessing_mode: "resize"       # "resize" (whole vol 128³) or "patch" (96³ crops)
 spatial_size: [128, 128, 128]
-spacing: [0.1, 0.1, 0.1]
+spacing: [1.0, 1.0, 1.0]          # mm/voxel — set to your scanner's actual spacing
 
-# Experiment Tracking: "wandb", "mlflow", or "none"
-tracker: "wandb"
+# Semi-supervised training
+ema_decay: 0.99                    # 0.99 for small datasets (<100 labels); 0.999 for large
+consistency_rampup_epochs: 80      # Epochs before unsupervised loss reaches full weight
+train_lr: 1e-4
+lr_scheduler: "cosine"
+lr_warmup_epochs: 5
+
+# Validation splits
+val_split: 5                       # Number of patients held out for validation
+
+# Pseudo-label gates
+pseudo_confidence_threshold: 0.85
+pseudo_mc_var_threshold: 0.05
+pseudo_tta_var_threshold: 0.02
 ```
 
----
-
-## 🧪 Running Unit Tests
-
-Run the Pytest suite to verify dataset loaders, network forward passes, custom losses, and active learning algorithms:
-
-```bash
-pytest tests/
-```
+See [**Configuration Guide**](configuration_guide.md) for all 53 parameters.
 
 ---
 
@@ -172,47 +207,61 @@ pytest tests/
 
 ```
 ActiveLearning/
-├── README.md                       ← Project Overview & Quick Start
+├── README.md                       ← Project overview (this file)
 ├── config.yaml                     ← Prototype config (8GB GPU)
 ├── config_full.yaml                ← Full config (24GB GPU)
-├── execution_guide.md              ← Detailed step-by-step CLI & Web UI manual
-├── architecture_and_design_decisions.md ← High-Level & Low-Level Design (HLD/LLD)
-├── flow_and_decision_design.md    ← Sequence diagrams & loss formulations
-├── requirements.txt                ← Dependencies
+├── configuration_guide.md          ← Complete parameter reference with pitfalls
+├── execution_guide.md              ← Step-by-step CLI & Web UI manual with troubleshooting
+├── architecture_and_design_decisions.md  ← HLD/LLD & design rationale
+├── flow_and_decision_design.md     ← Pipeline flowcharts & loss equations
+├── requirements.txt
 ├── hassl/
-│   ├── config.py                   ← Central YAML dataclass config
+│   ├── config.py                   ← HASSLConfig dataclass (all 53 parameters)
 │   ├── pipeline.py                 ← Main CLI orchestrator
+│   ├── compat.py                   ← MONAI 1.4 / 1.5 compatibility layer
 │   ├── tracking.py                 ← WandB / MLflow unified interface
 │   ├── data/
-│   │   ├── data_engine.py          ← MONAI dataset & dataloader builders
-│   │   ├── nrrd_utils.py           ← .seg.nrrd 3D Slicer segment metadata parser
-│   │   └── augmentations.py        ← Weak / Strong / CutMix3D augmentations
+│   │   ├── data_engine.py          ← Dataset builders, transforms, patient-level splits
+│   │   ├── augmentations.py        ← Weak / Strong / Spatial / Intensity augmentations
+│   │   ├── label_utils.py          ← NormalizeLabelsInDatasetd for multiclass remapping
+│   │   └── nrrd_utils.py           ← .seg.nrrd 3D Slicer segment metadata parser
 │   ├── ssl/
 │   │   ├── ssl_pretrainer.py       ← Masked inpainting + InfoNCE SSL pre-training
 │   │   └── feature_extractor.py    ← Embedding extraction & t-SNE / UMAP plots
 │   ├── training/
 │   │   ├── trainer.py              ← Unified UA-MT / CPS semi-supervised trainer
-│   │   ├── losses.py               ← DiceCE + FlexMatch + Boundary losses
-│   │   └── ema.py                  ← EMA teacher model
+│   │   ├── losses.py               ← CombinedSegLoss (DiceCE) + UncertaintyMaskedLoss + BoundaryLoss
+│   │   └── ema.py                  ← EMA teacher model & MC Dropout utilities
 │   ├── active/
 │   │   ├── query_strategies.py     ← BALD + CoreSet + Disagreement + Hybrid strategy
-│   │   └── query_engine.py         ← Manifest manager & auto pseudo-label promoter
+│   │   └── query_engine.py         ← Manifest manager & pseudo-label promoter
 │   ├── app/                        ← Option C: Browser Web UI
 │   │   ├── server.py               ← FastAPI server for 2D slice streaming
 │   │   └── static/                 ← HTML / CSS / JS frontend
 │   └── utils/
 │       ├── visualization.py        ← Prediction overlays & uncertainty heatmaps
 │       └── synthetic_data.py       ← 3D ultrasound speckle noise dataset generator
-└── tests/                          ← Pytest Unit Test Suite
+└── tests/                          ← Pytest unit test suite
 ```
 
 ---
 
-## 📜 Documentation & Design Specifications
+## 🧪 Running Tests
 
-- 📘 [**Execution Guide**](execution_guide.md): Complete CLI & Web UI walkthrough.
-- 📐 [**Architecture & Design Decisions**](architecture_and_design_decisions.md): HLD, LLD, and rationale.
-- 🔄 [**Flow & Decision Specification**](flow_and_decision_design.md): Pipeline flowcharts & loss equations.
+```bash
+pytest tests/
+```
+
+---
+
+## 📜 Documentation
+
+| Document | Description |
+|:---|:---|
+| [**Configuration Guide**](configuration_guide.md) | All 53 parameters with defaults, descriptions, and common pitfalls |
+| [**Execution Guide**](execution_guide.md) | CLI walkthrough, Web UI manual, and troubleshooting |
+| [**Architecture & Design**](architecture_and_design_decisions.md) | HLD, LLD, and design rationale |
+| [**Flow & Decision Design**](flow_and_decision_design.md) | Pipeline flowcharts & loss equations |
 
 ---
 

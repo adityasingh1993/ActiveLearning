@@ -28,8 +28,11 @@ Organize your dataset inside the `data/` directory:
 ```
 f:\Projects\Canvas\AcftiveLearningV1\data\
 ├── images/    <-- Place all ~300 image volumes (.mha files) here
-└── labels/    <-- Place your 50 initial label volumes (.seg.nrrd files) here
+└── labels/    <-- Place your initial label volumes (.seg.nrrd files) here
 ```
+
+> [!WARNING]
+> **Important:** If you change your dataset or update the `val_split` configuration, you MUST delete `data/splits.json` before your first run to allow the pipeline to regenerate the new splits.
 
 ### Option 2B: Generate Synthetic Ultrasound Data (For Quick Testing)
 If you don't have real data ready yet, run the synthetic generator script to create 20 mock 3D ultrasound volumes with 5 labels:
@@ -65,10 +68,10 @@ python -m hassl.pipeline --config config.yaml --phase auto-loop
 
 #### What happens automatically:
 1. Performs Self-Supervised Pre-training (SSL) on all 300 volumes.
-2. Trains the initial model on your 50 labeled volumes.
+2. Trains the initial model on your labeled volumes.
 3. Evaluates pseudo-labels for unlabeled volumes.
-4. Auto-promotes the top 10 most confident pseudo-labels into `data/labels/`.
-5. Retrains over multiple rounds (50 → 60 → 70 → 80 volumes) until complete.
+4. Auto-promotes the top most confident pseudo-labels into `data/labels/`.
+5. Retrains over multiple rounds until complete.
 
 ---
 
@@ -130,7 +133,7 @@ python -m hassl.pipeline --config config.yaml --phase pretrain
 # Phase 2: Run Semi-Supervised Training on current labeled set
 python -m hassl.pipeline --config config.yaml --phase train
 
-# Phase 3: Run Active Learning Query (find top 10 informative scans)
+# Phase 3: Run Active Learning Query (find top informative scans)
 python -m hassl.pipeline --config config.yaml --phase query --round 1
 
 # Phase 4: Export AI Pre-segmentation masks for all unlabeled scans
@@ -142,7 +145,20 @@ python -m hassl.pipeline --config config_full.yaml --phase train
 
 ---
 
-## 6. Running Unit Tests
+## 6. Troubleshooting
+
+- **`validate Invertd failed for sample 0`**:
+  This is now a warning only — metrics are not affected, only the native-space visualization preview. Usually caused by empty `applied_operations` on MetaTensor (e.g., using `CacheDataset` for validation — don't).
+
+- **`val_dice_lcc = 0.0` in early epochs**:
+  This is normal. LCC post-processing zeros predictions smaller than `lcc_min_size_voxels` (default 100 voxels). Watch `val_dice` (no LCC) instead for early training progress.
+
+- **`model producing near-ZERO predictions`**:
+  Printed when `val_pred_fg_fraction < 1e-4`. Usually caused by class imbalance (background dominates). Check that `include_background=False` in losses (already fixed in code).
+
+---
+
+## 7. Running Unit Tests
 
 To verify that all modules, data loaders, neural network architectures, and active learning strategies are functioning cleanly on your CPU:
 

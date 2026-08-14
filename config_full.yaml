@@ -64,10 +64,14 @@ use_early_stopping: true          # Stop AL round early if validation Dice plate
 early_stopping_patience: 30       # Validation checks to wait before early stopping
 early_stopping_min_delta: 0.0001  # Minimum Dice improvement delta
 lambda_unsup: 1.0                 # Max loss weight for unsupervised consistency loss
-ema_decay: 0.999                  # EMA teacher momentum coefficient
+ema_decay: 0.999                  # EMA teacher momentum coefficient.
+                                   # 0.999 is appropriate for full mode which targets large datasets
+                                   # (>100 labeled volumes). For small datasets use 0.99 instead.
 flexmatch_threshold: 0.95         # Confidence threshold for semi-supervised pseudo-labeling
 mc_dropout_passes: 10             # MC Dropout forward passes (10 for 24GB mode)
-consistency_rampup_epochs: 30     # Linear rampup duration for unsupervised loss weight
+consistency_rampup_epochs: 80     # Linear rampup duration for unsupervised loss weight.
+                                   # 80 epochs gives the EMA teacher time to produce meaningful
+                                   # pseudo-labels before the unsupervised loss reaches full weight.
 pseudo_label_weight: 0.5          # Weight multiplier for pseudo-labeled approved samples (0.5 = safe)
 save_every_n_epochs: 20           # Checkpoint saving frequency
 log_image_every_n_epochs: 10      # WandB/MLflow 6-panel uncertainty slice preview logging frequency
