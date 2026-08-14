@@ -796,6 +796,83 @@ class HASSLTrainer:
             'val_gt_vol_mm3_mean': float(np.mean(gt_arr)) if len(gt_arr) > 0 else 0.0,
         }
 
+    def log_data_preview(self, epoch: int):
+        """Log 3-axis (axial/coronal/sagittal) views of a preprocessed val batch after resize.
+
+        Helps verify:
+        - AspectRatioResizeWithPadd is preserving anatomy correctly
+        - Image intensity normalisation looks reasonable (not flat/dark)
+        - Label mask is correctly co-registered with the image
+        - Foreground fraction is non-trivially small
+        Called at epoch 0 and every log_image_every_n_epochs thereafter.
+        """
+        try:
+            if self.val_loader is None or len(self.val_loader.dataset) == 0:
+                return
+            batch = next(iter(self.val_loader))
+            img_np = batch['image'][0, 0].cpu().numpy()   # [D, H, W]
+            lbl_np = batch['label'][0, 0].cpu().numpy()   # [D, H, W]
+
+            D, H, W = img_np.shape
+            fg_frac = float(lbl_np.mean())
+
+            # Pick best slice per axis (highest GT foreground area)
+            ax_idx = int(lbl_np.sum(axis=(1, 2)).argmax())   # axial
+            co_idx = int(lbl_np.sum(axis=(0, 2)).argmax())   # coronal
+            sa_idx = int(lbl_np.sum(axis=(0, 1)).argmax())   # sagittal
+
+            def make_panel(img_slice, lbl_slice, label):
+                """CLAHE-style per-slice contrast stretch + solid mask overlay."""
+                lo, hi = np.percentile(img_slice, [1, 99])
+                norm = np.clip((img_slice - lo) / (hi - lo + 1e-8), 0, 1)
+                gray = (norm * 255).astype(np.uint8)
+                rgb  = np.stack([gray, gray, gray], axis=-1)  # H x W x 3
+
+                # Image-only panel
+                p_img = rgb.copy()
+
+                # Label overlay panel: solid 50% alpha green
+                p_lbl = rgb.copy()
+                mask = lbl_slice > 0.5
+                if mask.any():
+                    overlay = p_lbl.copy()
+                    overlay[mask] = [0, 220, 100]              # bright green
+                    p_lbl = (p_lbl * 0.5 + overlay * 0.5).astype(np.uint8)
+
+                # Annotate label text
+                h, w = gray.shape
+                header = np.zeros((20, w, 3), dtype=np.uint8)
+                header[:] = [40, 40, 40]
+                panel = np.concatenate([header, p_img, p_lbl], axis=0)
+                return panel
+
+            panel_ax = make_panel(img_np[ax_idx], lbl_np[ax_idx], f"Axial z={ax_idx}")
+            panel_co = make_panel(img_np[:, co_idx, :], lbl_np[:, co_idx, :], f"Coronal y={co_idx}")
+            panel_sa = make_panel(img_np[:, :, sa_idx], lbl_np[:, :, sa_idx], f"Sagittal x={sa_idx}")
+
+            # Pad all panels to same height before concatenating horizontally
+            max_h = max(p.shape[0] for p in [panel_ax, panel_co, panel_sa])
+            def pad_h(p):
+                diff = max_h - p.shape[0]
+                return np.pad(p, ((0, diff), (0, 0), (0, 0)), mode='constant') if diff > 0 else p
+
+            grid = np.concatenate([pad_h(panel_ax), pad_h(panel_co), pad_h(panel_sa)], axis=1)
+
+            self.tracker.log_image(
+                grid,
+                name="data_preview_after_resize",
+                step=epoch,
+                caption=(
+                    f"Epoch {epoch} — Preprocessed val sample after resize "
+                    f"(Axial | Coronal | Sagittal) — each axis shows [Image | Label overlay] "
+                    f"| Shape: {D}x{H}x{W} | FG fraction: {fg_frac:.4f} "
+                    f"| GT slices: ax={ax_idx} co={co_idx} sa={sa_idx}"
+                ),
+                save_local_dir=os.path.join(self.config.log_dir, "data_previews")
+            )
+        except Exception as e:
+            logger.warning("[HASSL] Failed to generate data preview: %s", e)
+
     def log_validation_samples(
         self,
         epoch: int,
@@ -806,81 +883,123 @@ class HASSLTrainer:
         mc_var_t: Optional[torch.Tensor] = None,
         tta_var_t: Optional[torch.Tensor] = None,
     ):
-        """Generate and log 5-panel slice preview grid and 6-panel uncertainty heatmap preview grid."""
+        """Log a 3-row x 5-panel validation preview strip across axial/coronal/sagittal slices.
+
+        Each row = one anatomical axis (axial, coronal, sagittal) at the slice with
+        highest GT foreground. Each column = one view:
+          Image | GT overlay | Raw Pred | LCC Pred | Error map (TP/FP/FN)
+
+        Improvements over original:
+        - CLAHE-style per-slice 1-99th percentile contrast stretch (images no longer dark)
+        - Solid 50% alpha blended mask overlays (clearly visible even on bright backgrounds)
+        - 3-axis strip instead of 1 slice (catches structures that appear in only one plane)
+        - Error map uses pure solid colors on black bg (easier to read)
+        """
         try:
             from hassl.utils.visualization import render_uncertainty_slice_grid
 
-            img_np = img_t[0].numpy()
-            gt_np = gt_t[0].numpy()
+            img_np  = img_t[0].numpy()    # [D, H, W]
+            gt_np   = gt_t[0].numpy()
             pred_np = pred_t[0].numpy()
             pred_lcc_np = pred_lcc_t[0].numpy() if pred_lcc_t is not None else pred_np
 
-            gt_sums = gt_np.sum(axis=(1, 2))
-            slice_idx = int(gt_sums.argmax()) if gt_sums.max() > 0 else img_np.shape[0] // 2
+            D, H, W = img_np.shape
 
-            slice_img = img_np[slice_idx]
-            slice_gt = (gt_np[slice_idx] > 0.5).astype(np.float32)
-            slice_pred = (pred_np[slice_idx] > 0.5).astype(np.float32)
-            slice_lcc = (pred_lcc_np[slice_idx] > 0.5).astype(np.float32)
+            def clahe_norm(img_slice: np.ndarray) -> np.ndarray:
+                """Per-slice 1-99th percentile contrast stretch -> uint8 [0,255]."""
+                lo, hi = np.percentile(img_slice, [1, 99])
+                norm = np.clip((img_slice - lo) / (hi - lo + 1e-8), 0, 1)
+                return (norm * 255).astype(np.uint8)
 
-            p_min, p_max = slice_img.min(), slice_img.max()
-            slice_norm = (slice_img - p_min) / (p_max - p_min + 1e-8)
-            base_gray = (slice_norm * 255).astype(np.uint8)
-            base_rgb = np.stack([base_gray] * 3, axis=-1)
+            def alpha_overlay(gray_rgb: np.ndarray, mask: np.ndarray, color: list, alpha: float = 0.55) -> np.ndarray:
+                """Blend solid color over mask region with alpha transparency."""
+                out = gray_rgb.copy().astype(np.float32)
+                overlay = np.zeros_like(out)
+                overlay[mask] = color
+                out[mask] = out[mask] * (1 - alpha) + overlay[mask] * alpha
+                return np.clip(out, 0, 255).astype(np.uint8)
 
-            # Panel 1: Original Image
-            p1 = base_rgb.copy()
+            def make_row(img_slice, gt_slice, pred_slice, lcc_slice):
+                """Build one 5-panel row strip for a given 2D slice."""
+                gray  = clahe_norm(img_slice)
+                rgb   = np.stack([gray, gray, gray], axis=-1)
 
-            # Panel 2: Ground Truth (Green overlay)
-            p2 = base_rgb.copy()
-            p2[slice_gt > 0, 1] = np.clip(p2[slice_gt > 0, 1].astype(np.int32) + 120, 0, 255).astype(np.uint8)
+                gt_m  = gt_slice > 0.5
+                pr_m  = pred_slice > 0.5
+                lc_m  = lcc_slice > 0.5
 
-            # Panel 3: Raw Model Prediction (Cyan overlay - without Keep Largest CC)
-            p3 = base_rgb.copy()
-            p3[slice_pred > 0, 0] = np.clip(p3[slice_pred > 0, 0].astype(np.int32) + 120, 0, 255).astype(np.uint8)
-            p3[slice_pred > 0, 2] = np.clip(p3[slice_pred > 0, 2].astype(np.int32) + 120, 0, 255).astype(np.uint8)
+                # Panel 1: Image only
+                p1 = rgb.copy()
 
-            # Panel 4: Cleaned Model Prediction (Magenta overlay - WITH Keep Largest CC)
-            p4 = base_rgb.copy()
-            p4[slice_lcc > 0, 0] = np.clip(p4[slice_lcc > 0, 0].astype(np.int32) + 140, 0, 255).astype(np.uint8)
-            p4[slice_lcc > 0, 1] = np.clip(p4[slice_lcc > 0, 1].astype(np.int32) + 40, 0, 255).astype(np.uint8)
-            p4[slice_lcc > 0, 2] = np.clip(p4[slice_lcc > 0, 2].astype(np.int32) + 140, 0, 255).astype(np.uint8)
+                # Panel 2: GT overlay (green)
+                p2 = alpha_overlay(rgb, gt_m,  [30, 230, 80],  alpha=0.6)
 
-            # Panel 5: Composite Error Map after Keep Largest CC (Green=TP, Red=FP, Blue=FN)
-            p5 = base_rgb.copy()
-            tp = (slice_gt > 0) & (slice_lcc > 0)
-            fp = (slice_gt == 0) & (slice_lcc > 0)
-            fn = (slice_gt > 0) & (slice_lcc == 0)
+                # Panel 3: Raw prediction (cyan)
+                p3 = alpha_overlay(rgb, pr_m,  [0, 200, 230],  alpha=0.6)
 
-            p5[tp, 1] = 255  # Green for True Positive
-            p5[fp, 0] = 255  # Red for False Positive
-            p5[fn, 2] = 255  # Blue for False Negative
+                # Panel 4: LCC prediction (magenta)
+                p4 = alpha_overlay(rgb, lc_m,  [230, 50, 230], alpha=0.6)
 
-            grid_img = np.concatenate([p1, p2, p3, p4, p5], axis=1)
+                # Panel 5: Error map on BLACK background (TP green, FP red, FN blue)
+                p5 = np.zeros_like(rgb)
+                p5[gt_m  & lc_m]  = [0,   210,  60]   # TP green
+                p5[(~gt_m) & lc_m] = [230, 40,   40]   # FP red
+                p5[gt_m & (~lc_m)] = [40,  100,  230]  # FN blue
+
+                row = np.concatenate([p1, p2, p3, p4, p5], axis=1)
+                return row
+
+            # Pick best slice per axis (max GT foreground)
+            ax_sums = gt_np.sum(axis=(1, 2))   # per axial slice
+            co_sums = gt_np.sum(axis=(0, 2))   # per coronal slice
+            sa_sums = gt_np.sum(axis=(0, 1))   # per sagittal slice
+
+            ax_idx = int(ax_sums.argmax()) if ax_sums.max() > 0 else D // 2
+            co_idx = int(co_sums.argmax()) if co_sums.max() > 0 else H // 2
+            sa_idx = int(sa_sums.argmax()) if sa_sums.max() > 0 else W // 2
+
+            row_ax = make_row(img_np[ax_idx],         gt_np[ax_idx],         pred_np[ax_idx],         pred_lcc_np[ax_idx])
+            row_co = make_row(img_np[:, co_idx, :],   gt_np[:, co_idx, :],   pred_np[:, co_idx, :],   pred_lcc_np[:, co_idx, :])
+            row_sa = make_row(img_np[:, :, sa_idx],   gt_np[:, :, sa_idx],   pred_np[:, :, sa_idx],   pred_lcc_np[:, :, sa_idx])
+
+            # Pad rows to same width (different axes may have different widths)
+            max_w = max(r.shape[1] for r in [row_ax, row_co, row_sa])
+            def pad_w(r):
+                diff = max_w - r.shape[1]
+                return np.pad(r, ((0, 0), (0, diff), (0, 0)), mode='constant') if diff > 0 else r
+
+            # Add thin separator between rows
+            sep = np.full((3, max_w, 3), 80, dtype=np.uint8)
+            grid_img = np.concatenate([pad_w(row_ax), sep, pad_w(row_co), sep, pad_w(row_sa)], axis=0)
+
+            fg_frac = float(gt_np.mean())
+            pred_frac = float(pred_lcc_np.mean())
 
             self.tracker.log_image(
                 grid_img,
                 name="val_slice_preview",
                 step=epoch,
                 caption=(
-                    f"Epoch {epoch} Slice {slice_idx} "
-                    "(Image | GT-Green | RawPred-Cyan | LCCPred-Magenta | Error: TP-Green FP-Red FN-Blue)"
+                    f"Epoch {epoch} — "
+                    f"[Axial z={ax_idx} | Coronal y={co_idx} | Sagittal x={sa_idx}] "
+                    f"| Cols: Image / GT(green) / RawPred(cyan) / LCC(magenta) / Error(TP-G FP-R FN-B) "
+                    f"| GT fg={fg_frac:.3f} Pred fg={pred_frac:.3f}"
                 ),
                 save_local_dir=os.path.join(self.config.log_dir, "val_previews")
             )
 
             # Log 6-panel uncertainty preview if MC/TTA variance maps exist
             if mc_var_t is not None and tta_var_t is not None:
-                slice_mc = mc_var_t[0, slice_idx].numpy()
-                slice_tta = tta_var_t[0, slice_idx].numpy()
+                slice_mc  = mc_var_t[0, ax_idx].numpy()
+                slice_tta = tta_var_t[0, ax_idx].numpy()
 
                 grid_uncert = render_uncertainty_slice_grid(
-                    slice_img=slice_img,
-                    slice_gt=slice_gt,
-                    slice_pred=slice_pred,
+                    slice_img=img_np[ax_idx],
+                    slice_gt=gt_np[ax_idx] > 0.5,
+                    slice_pred=pred_np[ax_idx] > 0.5,
                     slice_mc_var=slice_mc,
                     slice_tta_var=slice_tta,
-                    slice_lcc=slice_lcc,
+                    slice_lcc=pred_lcc_np[ax_idx] > 0.5,
                 )
 
                 self.tracker.log_image(
@@ -888,8 +1007,8 @@ class HASSLTrainer:
                     name="val_uncertainty_preview",
                     step=epoch,
                     caption=(
-                        f"Epoch {epoch} Slice {slice_idx} "
-                        "(Image | GT | RawPred | MC Epistemic Heatmap | TTA Aleatoric Heatmap | Error Map)"
+                        f"Epoch {epoch} Axial z={ax_idx} "
+                        "(Image | GT | RawPred | MC Epistemic | TTA Aleatoric | Error)"
                     ),
                     save_local_dir=os.path.join(self.config.log_dir, "val_uncertainty_previews")
                 )
@@ -906,7 +1025,41 @@ class HASSLTrainer:
             else:
                 train_loss, sup_loss, unsup_loss, uncert = self.train_one_epoch_cps(epoch)
 
+            # --- Per-epoch diagnostics: foreground fraction & zero-prediction alert ---
+            try:
+                fg_fracs, pred_fracs = [], []
+                for bd in self.labeled_loader:
+                    fg_fracs.append(float(bd['label'].float().mean().item()))
+                    break  # only first batch for speed
+                if self.val_loader is not None:
+                    for bd in self.val_loader:
+                        self.net_A.eval()
+                        with torch.no_grad():
+                            _p = self.net_A(bd['image'].to(self.device))
+                            if isinstance(_p, (list, tuple)): _p = _p[0]
+                            elif _p.ndim == 6: _p = _p[:, 0]
+                            _pb = (torch.sigmoid(_p) > 0.5).float()
+                            pred_fracs.append(float(_pb.mean().item()))
+                        self.net_A.train()
+                        break
+                fg_mean  = np.mean(fg_fracs)  if fg_fracs  else float('nan')
+                pf_mean  = np.mean(pred_fracs) if pred_fracs else float('nan')
+                if not np.isnan(pf_mean) and pf_mean < 1e-4:
+                    print(f"  [HASSL WARN] Epoch {epoch}: model producing near-ZERO predictions "
+                          f"(pred_fg={pf_mean:.5f}). Possible mode collapse or extreme class imbalance.")
+                self.tracker.log_metrics({
+                    'train_fg_fraction': fg_mean,
+                    'val_pred_fg_fraction': pf_mean,
+                }, step=epoch)
+            except Exception:
+                pass
+
             should_log_image = ((epoch + 1) % log_img_freq == 0) or (epoch == end_epoch - 1)
+
+            # Log post-resize data preview at epoch 0 and on image-log epochs
+            if epoch == self.start_epoch or should_log_image:
+                self.log_data_preview(epoch)
+
             val_metrics = self.validate(epoch=epoch, should_log_image=should_log_image)
             val_dice = val_metrics['val_dice']
 
