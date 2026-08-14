@@ -114,6 +114,10 @@ class BoundaryLoss(nn.Module):
         return res
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Guard against zero-foreground or all-background predictions/targets
+        if pred.sum() == 0 or target.sum() == 0:
+            return torch.tensor(1.0, device=pred.device, requires_grad=True)
+
         with torch.no_grad():
             edt = self.compute_edt(target.cpu().numpy())
             edt_weights = torch.from_numpy(edt).to(pred.device)
@@ -138,14 +142,31 @@ class CombinedSegLoss(nn.Module):
       (2.0), making Dice computation mathematically invalid for multi-class tasks.
     - Default loss_type="generalized_dice_focal": combines Generalized Dice Loss (class weighting)
       with Focal Loss for improved convergence on difficult boundaries and high class imbalance.
+    - lambda_focal=0.25 & lambda_gdl=1.0: rebalances Focal Loss vs GDL. In 3D medical volumes with
+      99% background, unweighted Focal Loss (lambda_focal=1.0) accumulates massive background
+      gradients that push all predictions to 0 (pred_fg = 0.00001). Lowering lambda_focal allows GDL
+      to pull predictions into foreground regions.
     """
 
-    def __init__(self, num_classes: int, loss_type: str = "generalized_dice_focal", include_boundary: bool = False, boundary_weight: float = 0.5, reduction: str = 'mean'):
+    def __init__(
+        self,
+        num_classes: int,
+        loss_type: str = "generalized_dice_focal",
+        include_boundary: bool = False,
+        boundary_weight: float = 0.5,
+        reduction: str = 'mean',
+        lambda_gdl: float = 1.0,
+        lambda_focal: float = 0.25,
+        gamma: float = 2.0,
+    ):
         super().__init__()
         self.num_classes = num_classes
         self.loss_type = loss_type
         self.include_boundary = include_boundary
         self.boundary_weight = boundary_weight
+        self.lambda_gdl = lambda_gdl
+        self.lambda_focal = lambda_focal
+        self.gamma = gamma
 
         sigmoid = num_classes == 1
         softmax = num_classes > 1
@@ -161,9 +182,9 @@ class CombinedSegLoss(nn.Module):
                 sigmoid=sigmoid,
                 softmax=softmax,
                 reduction=monai_reduction,
-                lambda_gdl=1.0,
-                lambda_focal=1.0,
-                gamma=2.0,
+                lambda_gdl=lambda_gdl,
+                lambda_focal=lambda_focal,
+                gamma=gamma,
             )
         else:
             self.dice_ce = DiceCELoss(

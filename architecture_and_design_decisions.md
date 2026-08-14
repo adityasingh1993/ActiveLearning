@@ -207,3 +207,18 @@ Predicted Mask: (B, 1, 128, 128, 128) uint8
 | **Semi-Supervision**| Consistency regularization + uncertainty masking | `EMATeacher` ($\alpha=0.999$), `UncertaintyMaskedLoss`, `FlexMatch` |
 | **Active Learning** | Hybrid selection (Uncertainty + Diversity + Discrepancy) | `BALDStrategy` ($T=5$), `CoreSetStrategy` (128-dimGAP), `HybridStrategy` |
 | **Interfaces** | Automated Loop, 3D Slicer, Web Dashboard | CLI `pipeline.py`, `pynrrd` parser, FastAPI streaming `server.py` |
+
+---
+
+## 6. Loss Rebalancing & Metric Safeguards
+
+### 6.1 Mode Collapse & Loss Weighting (`pred_fg ≈ 0.00001`)
+- **Problem**: In 3D ultrasound volumes (e.g. bladder/prostate), target structures occupy only 1–5% of total volume (95–99% background). Unweighted Focal Loss (`lambda_focal = 1.0`) sums over ~2,000,000 background voxels, creating massive background penalty gradients that force logits negative ($p \to 0$), causing the network to collapse to all-background predictions (`pred_fg ≈ 0.00001`).
+- **Solution**: Rebalanced `GeneralizedDiceFocalLoss` with **`lambda_gdl = 1.0`** and **`lambda_focal = 0.25`**. Volume-normalized Generalized Dice Loss ($GDL$) remains the primary driver (immune to class count ratio), while Focal Loss ($FL$) refines hard boundary voxels without triggering mode collapse.
+
+### 6.2 Empty Prediction Distance Metric Safeguards (`class 0 = 0`)
+- **Problem**: When a model produces 0 foreground voxels (`pred.sum() == 0`), surface metrics such as 95th Percentile Hausdorff Distance (`HD95`) and Euclidean Distance Transform (`EDT` in Boundary Loss) attempt distance calculations between ground truth and an empty point set ($\emptyset$), yielding mathematically undefined `NaN` or `Inf` values.
+- **Solution**:
+  1. **`BoundaryLoss`**: Guarded with `if pred.sum() == 0 or target.sum() == 0: return torch.tensor(1.0)`.
+  2. **`HD95` Aggregation**: Guarded `hd95_metric.aggregate()` with `torch.isnan` and `torch.isinf` checks in `trainer.py`, replacing invalid outputs with clean `NaN`.
+  3. **Relative Volume Error (`RVE`)**: Guarded `(pred_vol - gt_vol) / gt_vol` against zero-division when `gt_vol == 0`.

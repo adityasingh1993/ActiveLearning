@@ -62,6 +62,9 @@ class HASSLConfig:
     dynunet_deep_supervision: bool = True  # Only for DynUNet
     dropout: float = 0.2  # For MC Dropout during uncertainty estimation
     loss_type: str = "generalized_dice_focal"  # "generalized_dice_focal" or "dice_ce"
+    loss_lambda_gdl: float = 1.0  # Weight for Generalized Dice Loss
+    loss_lambda_focal: float = 0.25  # Weight for Focal Loss (0.25 prevents 99% bg mode collapse)
+    loss_focal_gamma: float = 2.0  # Gamma focusing parameter for Focal Loss
 
     # Full mode additional network
     swinunetr_feature_size: int = 48

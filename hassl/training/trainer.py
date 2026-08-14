@@ -239,7 +239,17 @@ class HASSLTrainer:
         self.early_stopper = EarlyStopping(patience=patience, min_delta=min_delta, mode='max') if use_es else None
 
         loss_type = getattr(config, 'loss_type', 'generalized_dice_focal')
-        self.criterion = CombinedSegLoss(self.num_classes, loss_type=loss_type, include_boundary=False)
+        lambda_gdl = getattr(config, 'loss_lambda_gdl', 1.0)
+        lambda_focal = getattr(config, 'loss_lambda_focal', 0.25)
+        gamma = getattr(config, 'loss_focal_gamma', 2.0)
+        self.criterion = CombinedSegLoss(
+            self.num_classes,
+            loss_type=loss_type,
+            include_boundary=False,
+            lambda_gdl=lambda_gdl,
+            lambda_focal=lambda_focal,
+            gamma=gamma,
+        )
         self.masked_criterion = UncertaintyMaskedLoss(self.criterion)
         self.best_dice = 0.0
         self.dice_metric = DiceMetric(include_background=False if self.num_classes > 1 else True, reduction="mean")
@@ -394,9 +404,12 @@ class HASSLTrainer:
                     else:
                         pseudo_labels = torch.argmax(pseudo_probs, dim=1, keepdim=True)
 
-                    loss_unsup = self.masked_criterion(preds_u, pseudo_labels, mask)
-                    if loss_unsup.ndim > 0:
-                        loss_unsup = loss_unsup.mean()
+                    if pseudo_labels.sum() > 0:
+                        loss_unsup = self.masked_criterion(preds_u, pseudo_labels, mask)
+                        if loss_unsup.ndim > 0:
+                            loss_unsup = loss_unsup.mean()
+                    else:
+                        loss_unsup = torch.tensor(0.0, device=self.device)
 
                     uncert_val = uncertainty.mean().item()
 
@@ -850,7 +863,8 @@ class HASSLTrainer:
 
         try:
             raw_hd95 = hd95_metric.aggregate().item()
-            val_hd95 = float('nan') if torch.isnan(torch.tensor(raw_hd95)) else float(raw_hd95)
+            raw_t = torch.tensor(raw_hd95)
+            val_hd95 = float('nan') if (torch.isnan(raw_t) or torch.isinf(raw_t)) else float(raw_hd95)
         except Exception:
             val_hd95 = float('nan')
 

@@ -60,6 +60,10 @@ HASSL comes with two pre-configured master configuration files:
 | `unet_num_res_units` | `int` | `2` | Only for UNet. |
 | `dynunet_deep_supervision` | `bool` | `true` | Only for DynUNet. |
 | `dropout` | `float` | `0.2` | MC Dropout rate. |
+| `loss_type` | `str` | `"generalized_dice_focal"` | `"generalized_dice_focal"` or `"dice_ce"`. |
+| `loss_lambda_gdl` | `float` | `1.0` | Weight for Generalized Dice Loss (volume-normalized). |
+| `loss_lambda_focal` | `float` | `0.25` | Weight for Focal Loss (0.25 prevents 99% background mode collapse). |
+| `loss_focal_gamma` | `float` | `2.0` | Focusing parameter for Focal Loss. |
 | `swinunetr_feature_size` | `int` | `48` | Full mode additional network parameter. |
 
 ### SSL Pre-training (Phase 2)
