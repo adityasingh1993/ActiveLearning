@@ -1,7 +1,8 @@
+import copy
 import logging
 import os
 import warnings
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 
@@ -547,6 +548,7 @@ class HASSLTrainer:
         pred_vols_mm3_lcc = []
         gt_vols_mm3 = []
         first_batch_sample = None
+        first_batch_native_sample = None
 
         inferer = SlidingWindowInferer(roi_size=self.config.spatial_size, sw_batch_size=2, overlap=0.25)
 
@@ -679,21 +681,21 @@ class HASSLTrainer:
 
                 try:
                     # Wrap predictions as MetaTensors carrying the input's transform trace.
+                    # Use deepcopy on applied_operations so popping operations during Invertd
+                    # does not mutate the reference list shared across keys.
+                    ops_copy1 = copy.deepcopy(sample['image'].applied_operations) if hasattr(sample['image'], 'applied_operations') else []
+                    ops_copy2 = copy.deepcopy(sample['image'].applied_operations) if hasattr(sample['image'], 'applied_operations') else []
+                    meta_copy = copy.deepcopy(sample['image'].meta) if hasattr(sample['image'], 'meta') else {}
+
                     pred_mt = MetaTensor(
                         preds_binary[b].clone(),
-                        meta=sample['image'].meta if hasattr(sample['image'], 'meta') else {},
-                        applied_operations=(
-                            sample['image'].applied_operations
-                            if hasattr(sample['image'], 'applied_operations') else []
-                        ),
+                        meta=meta_copy,
+                        applied_operations=ops_copy1,
                     )
                     pred_lcc_mt = MetaTensor(
                         preds_binary_lcc[b].clone(),
-                        meta=sample['image'].meta if hasattr(sample['image'], 'meta') else {},
-                        applied_operations=(
-                            sample['image'].applied_operations
-                            if hasattr(sample['image'], 'applied_operations') else []
-                        ),
+                        meta=copy.deepcopy(meta_copy),
+                        applied_operations=ops_copy2,
                     )
                     sample["pred"] = pred_mt
                     sample["pred_lcc"] = pred_lcc_mt
@@ -708,6 +710,19 @@ class HASSLTrainer:
                     pv_mm3 = float(inv_pred.sum().item()) * voxel_vol_mm3
                     pv_mm3_lcc = float(inv_pred_lcc.sum().item()) * voxel_vol_mm3
                     gv_mm3 = float(inv_gt.sum().item()) * voxel_vol_mm3
+
+                    # Capture native scanner physical space tensors for sample 0 preview
+                    if b == 0 and first_batch_native_sample is None and should_log_image:
+                        native_shape = tuple(inv_pred.shape[1:])
+                        inv_img_t = torch.nn.functional.interpolate(
+                            inputs[0:1], size=native_shape, mode='trilinear', align_corners=False
+                        )[0].detach().cpu()
+                        first_batch_native_sample = (
+                            inv_img_t,
+                            inv_gt.detach().cpu(),
+                            inv_pred.detach().cpu(),
+                            inv_pred_lcc.detach().cpu()
+                        )
                 except Exception as e:
                     logger.warning(
                         "[HASSL] validate Invertd failed for sample %d, "
@@ -777,7 +792,11 @@ class HASSLTrainer:
             val_volume_r2_lcc = 1.0 if np.allclose(pred_arr_lcc, gt_arr) else 0.0
 
         if should_log_image and first_batch_sample is not None:
-            self.log_validation_samples(epoch, *first_batch_sample)
+            self.log_validation_samples(
+                epoch=epoch,
+                model_sample=first_batch_sample,
+                native_sample=first_batch_native_sample
+            )
 
         return {
             'val_dice': val_dice,
@@ -876,34 +895,21 @@ class HASSLTrainer:
     def log_validation_samples(
         self,
         epoch: int,
-        img_t: torch.Tensor,
-        gt_t: torch.Tensor,
-        pred_t: torch.Tensor,
-        pred_lcc_t: Optional[torch.Tensor] = None,
-        mc_var_t: Optional[torch.Tensor] = None,
-        tta_var_t: Optional[torch.Tensor] = None,
+        model_sample: Tuple[torch.Tensor, ...],
+        native_sample: Optional[Tuple[torch.Tensor, ...]] = None,
     ):
-        """Log a 3-row x 5-panel validation preview strip across axial/coronal/sagittal slices.
+        """Log 3-axis x 5-panel validation preview strips for BOTH model space and native physical space.
 
-        Each row = one anatomical axis (axial, coronal, sagittal) at the slice with
-        highest GT foreground. Each column = one view:
-          Image | GT overlay | Raw Pred | LCC Pred | Error map (TP/FP/FN)
+        Previews logged:
+          1. `val_slice_preview_model_space_128`: 128x128x128 preprocessed model resolution
+          2. `val_slice_preview_native_space`: Original scanner physical resolution (after Invertd)
+          3. `val_uncertainty_preview`: MC/TTA epistemic and aleatoric heatmaps (model space)
 
-        Improvements over original:
-        - CLAHE-style per-slice 1-99th percentile contrast stretch (images no longer dark)
-        - Solid 50% alpha blended mask overlays (clearly visible even on bright backgrounds)
-        - 3-axis strip instead of 1 slice (catches structures that appear in only one plane)
-        - Error map uses pure solid colors on black bg (easier to read)
+        Each strip shows 3 rows (Axial, Coronal, Sagittal) x 5 columns:
+          [Image | GT (green) | Raw Pred (cyan) | LCC Pred (magenta) | Error Map (TP green/FP red/FN blue)]
         """
         try:
             from hassl.utils.visualization import render_uncertainty_slice_grid
-
-            img_np  = img_t[0].numpy()    # [D, H, W]
-            gt_np   = gt_t[0].numpy()
-            pred_np = pred_t[0].numpy()
-            pred_lcc_np = pred_lcc_t[0].numpy() if pred_lcc_t is not None else pred_np
-
-            D, H, W = img_np.shape
 
             def clahe_norm(img_slice: np.ndarray) -> np.ndarray:
                 """Per-slice 1-99th percentile contrast stretch -> uint8 [0,255]."""
@@ -919,87 +925,112 @@ class HASSLTrainer:
                 out[mask] = out[mask] * (1 - alpha) + overlay[mask] * alpha
                 return np.clip(out, 0, 255).astype(np.uint8)
 
-            def make_row(img_slice, gt_slice, pred_slice, lcc_slice):
-                """Build one 5-panel row strip for a given 2D slice."""
-                gray  = clahe_norm(img_slice)
-                rgb   = np.stack([gray, gray, gray], axis=-1)
+            def build_3axis_grid(img_t, gt_t, pred_t, lcc_t):
+                """Build 3-row (axial, coronal, sagittal) x 5-col preview grid for a 3D volume."""
+                img_np  = img_t[0].numpy()    # [D, H, W]
+                gt_np   = gt_t[0].numpy()
+                pred_np = pred_t[0].numpy()
+                lcc_np  = lcc_t[0].numpy()
 
-                gt_m  = gt_slice > 0.5
-                pr_m  = pred_slice > 0.5
-                lc_m  = lcc_slice > 0.5
+                D, H, W = img_np.shape
 
-                # Panel 1: Image only
-                p1 = rgb.copy()
+                def make_row(img_slice, gt_slice, pred_slice, lcc_slice):
+                    gray = clahe_norm(img_slice)
+                    rgb  = np.stack([gray, gray, gray], axis=-1)
 
-                # Panel 2: GT overlay (green)
-                p2 = alpha_overlay(rgb, gt_m,  [30, 230, 80],  alpha=0.6)
+                    gt_m = gt_slice > 0.5
+                    pr_m = pred_slice > 0.5
+                    lc_m = lcc_slice > 0.5
 
-                # Panel 3: Raw prediction (cyan)
-                p3 = alpha_overlay(rgb, pr_m,  [0, 200, 230],  alpha=0.6)
+                    p1 = rgb.copy()
+                    p2 = alpha_overlay(rgb, gt_m, [30, 230, 80], alpha=0.6)
+                    p3 = alpha_overlay(rgb, pr_m, [0, 200, 230], alpha=0.6)
+                    p4 = alpha_overlay(rgb, lc_m, [230, 50, 230], alpha=0.6)
 
-                # Panel 4: LCC prediction (magenta)
-                p4 = alpha_overlay(rgb, lc_m,  [230, 50, 230], alpha=0.6)
+                    p5 = np.zeros_like(rgb)
+                    p5[gt_m & lc_m]    = [0, 210, 60]    # TP green
+                    p5[(~gt_m) & lc_m]  = [230, 40, 40]   # FP red
+                    p5[gt_m & (~lc_m)]  = [40, 100, 230]  # FN blue
 
-                # Panel 5: Error map on BLACK background (TP green, FP red, FN blue)
-                p5 = np.zeros_like(rgb)
-                p5[gt_m  & lc_m]  = [0,   210,  60]   # TP green
-                p5[(~gt_m) & lc_m] = [230, 40,   40]   # FP red
-                p5[gt_m & (~lc_m)] = [40,  100,  230]  # FN blue
+                    return np.concatenate([p1, p2, p3, p4, p5], axis=1)
 
-                row = np.concatenate([p1, p2, p3, p4, p5], axis=1)
-                return row
+                ax_sums = gt_np.sum(axis=(1, 2))
+                co_sums = gt_np.sum(axis=(0, 2))
+                sa_sums = gt_np.sum(axis=(0, 1))
 
-            # Pick best slice per axis (max GT foreground)
-            ax_sums = gt_np.sum(axis=(1, 2))   # per axial slice
-            co_sums = gt_np.sum(axis=(0, 2))   # per coronal slice
-            sa_sums = gt_np.sum(axis=(0, 1))   # per sagittal slice
+                ax_idx = int(ax_sums.argmax()) if ax_sums.max() > 0 else D // 2
+                co_idx = int(co_sums.argmax()) if co_sums.max() > 0 else H // 2
+                sa_idx = int(sa_sums.argmax()) if sa_sums.max() > 0 else W // 2
 
-            ax_idx = int(ax_sums.argmax()) if ax_sums.max() > 0 else D // 2
-            co_idx = int(co_sums.argmax()) if co_sums.max() > 0 else H // 2
-            sa_idx = int(sa_sums.argmax()) if sa_sums.max() > 0 else W // 2
+                row_ax = make_row(img_np[ax_idx],       gt_np[ax_idx],       pred_np[ax_idx],       lcc_np[ax_idx])
+                row_co = make_row(img_np[:, co_idx, :], gt_np[:, co_idx, :], pred_np[:, co_idx, :], lcc_np[:, co_idx, :])
+                row_sa = make_row(img_np[:, :, sa_idx], gt_np[:, :, sa_idx], pred_np[:, :, sa_idx], lcc_np[:, :, sa_idx])
 
-            row_ax = make_row(img_np[ax_idx],         gt_np[ax_idx],         pred_np[ax_idx],         pred_lcc_np[ax_idx])
-            row_co = make_row(img_np[:, co_idx, :],   gt_np[:, co_idx, :],   pred_np[:, co_idx, :],   pred_lcc_np[:, co_idx, :])
-            row_sa = make_row(img_np[:, :, sa_idx],   gt_np[:, :, sa_idx],   pred_np[:, :, sa_idx],   pred_lcc_np[:, :, sa_idx])
+                max_w = max(r.shape[1] for r in [row_ax, row_co, row_sa])
+                def pad_w(r):
+                    diff = max_w - r.shape[1]
+                    return np.pad(r, ((0, 0), (0, diff), (0, 0)), mode='constant') if diff > 0 else r
 
-            # Pad rows to same width (different axes may have different widths)
-            max_w = max(r.shape[1] for r in [row_ax, row_co, row_sa])
-            def pad_w(r):
-                diff = max_w - r.shape[1]
-                return np.pad(r, ((0, 0), (0, diff), (0, 0)), mode='constant') if diff > 0 else r
+                sep = np.full((3, max_w, 3), 80, dtype=np.uint8)
+                grid = np.concatenate([pad_w(row_ax), sep, pad_w(row_co), sep, pad_w(row_sa)], axis=0)
+                return grid, (ax_idx, co_idx, sa_idx), (D, H, W), float(gt_np.mean()), float(lcc_np.mean())
 
-            # Add thin separator between rows
-            sep = np.full((3, max_w, 3), 80, dtype=np.uint8)
-            grid_img = np.concatenate([pad_w(row_ax), sep, pad_w(row_co), sep, pad_w(row_sa)], axis=0)
+            # -------------------------------------------------------------------
+            # 1. Model Space Preview (128x128x128)
+            # -------------------------------------------------------------------
+            img_m, gt_m, pred_m, lcc_m = model_sample[0], model_sample[1], model_sample[2], model_sample[3]
+            mc_var_t = model_sample[4] if len(model_sample) > 4 else None
+            tta_var_t = model_sample[5] if len(model_sample) > 5 else None
 
-            fg_frac = float(gt_np.mean())
-            pred_frac = float(pred_lcc_np.mean())
+            grid_m, (ax_i, co_i, sa_i), shape_m, gt_f_m, pr_f_m = build_3axis_grid(img_m, gt_m, pred_m, lcc_m)
 
             self.tracker.log_image(
-                grid_img,
-                name="val_slice_preview",
+                grid_m,
+                name="val_slice_preview_model_space_128",
                 step=epoch,
                 caption=(
-                    f"Epoch {epoch} — "
-                    f"[Axial z={ax_idx} | Coronal y={co_idx} | Sagittal x={sa_idx}] "
+                    f"Epoch {epoch} [Model Space {shape_m[0]}x{shape_m[1]}x{shape_m[2]}] "
+                    f"| Slices: ax={ax_i} co={co_i} sa={sa_i} "
                     f"| Cols: Image / GT(green) / RawPred(cyan) / LCC(magenta) / Error(TP-G FP-R FN-B) "
-                    f"| GT fg={fg_frac:.3f} Pred fg={pred_frac:.3f}"
+                    f"| GT fg={gt_f_m:.3f} Pred fg={pr_f_m:.3f}"
                 ),
-                save_local_dir=os.path.join(self.config.log_dir, "val_previews")
+                save_local_dir=os.path.join(self.config.log_dir, "val_previews_model_space")
             )
 
-            # Log 6-panel uncertainty preview if MC/TTA variance maps exist
+            # -------------------------------------------------------------------
+            # 2. Native Physical Space Preview (after Invertd — actual scanner size)
+            # -------------------------------------------------------------------
+            if native_sample is not None:
+                img_n, gt_n, pred_n, lcc_n = native_sample[0], native_sample[1], native_sample[2], native_sample[3]
+                grid_n, (ax_in, co_in, sa_in), shape_n, gt_f_n, pr_f_n = build_3axis_grid(img_n, gt_n, pred_n, lcc_n)
+
+                self.tracker.log_image(
+                    grid_n,
+                    name="val_slice_preview_native_space",
+                    step=epoch,
+                    caption=(
+                        f"Epoch {epoch} [Native Scanner Space {shape_n[0]}x{shape_n[1]}x{shape_n[2]}] "
+                        f"| Slices: ax={ax_in} co={co_in} sa={sa_in} "
+                        f"| Cols: Image / GT(green) / RawPred(cyan) / LCC(magenta) / Error(TP-G FP-R FN-B) "
+                        f"| GT fg={gt_f_n:.3f} Pred fg={pr_f_n:.3f}"
+                    ),
+                    save_local_dir=os.path.join(self.config.log_dir, "val_previews_native_space")
+                )
+
+            # -------------------------------------------------------------------
+            # 3. Model Space Uncertainty Heatmaps (MC & TTA)
+            # -------------------------------------------------------------------
             if mc_var_t is not None and tta_var_t is not None:
-                slice_mc  = mc_var_t[0, ax_idx].numpy()
-                slice_tta = tta_var_t[0, ax_idx].numpy()
+                slice_mc  = mc_var_t[0, ax_i].numpy()
+                slice_tta = tta_var_t[0, ax_i].numpy()
 
                 grid_uncert = render_uncertainty_slice_grid(
-                    slice_img=img_np[ax_idx],
-                    slice_gt=gt_np[ax_idx] > 0.5,
-                    slice_pred=pred_np[ax_idx] > 0.5,
+                    slice_img=img_m[0, ax_i].numpy(),
+                    slice_gt=gt_m[0, ax_i].numpy() > 0.5,
+                    slice_pred=pred_m[0, ax_i].numpy() > 0.5,
                     slice_mc_var=slice_mc,
                     slice_tta_var=slice_tta,
-                    slice_lcc=pred_lcc_np[ax_idx] > 0.5,
+                    slice_lcc=lcc_m[0, ax_i].numpy() > 0.5,
                 )
 
                 self.tracker.log_image(
@@ -1007,7 +1038,7 @@ class HASSLTrainer:
                     name="val_uncertainty_preview",
                     step=epoch,
                     caption=(
-                        f"Epoch {epoch} Axial z={ax_idx} "
+                        f"Epoch {epoch} Model Space Axial z={ax_i} "
                         "(Image | GT | RawPred | MC Epistemic | TTA Aleatoric | Error)"
                     ),
                     save_local_dir=os.path.join(self.config.log_dir, "val_uncertainty_previews")
