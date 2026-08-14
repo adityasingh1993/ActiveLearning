@@ -195,12 +195,15 @@ teacher_pseudo_fg_frac >> real   ⚠️  Teacher over-predicts foreground (false
 
 | Curve | What it measures |
 |:---|:---|
-| `consistency_rampup_weight` | Unsupervised loss weight: 0.0 at epoch 0 → 1.0 at `consistency_rampup_epochs` |
+| `consistency_rampup_weight` | Unsupervised loss weight: 0.0 at epoch 0 → 1.0 at `consistency_rampup_epochs` (resets to 0.0 at start of each AL round so student adapts to newly labeled scans first) |
 | `uncertainty_mean` | Mean MC Dropout epistemic uncertainty per epoch (should decrease) |
 | `supervised_loss` | Loss on labeled data (should decrease steadily) |
 | `unsupervised_loss` | Consistency loss on unlabeled data (noisy in early epochs) |
 | `train_fg_fraction` | Fraction of foreground voxels in labeled batch |
 | `val_pred_fg_fraction` | Fraction of foreground in model predictions (watch for near-zero collapse) |
+
+> **Note on Rampup Resets Across AL Rounds**:
+> At the start of every new Active Learning round (Round 0 → Round 1 → Round 2), `consistency_rampup_weight` automatically resets to `0.0` at epoch 0. This gives the student model ~20 epochs to absorb newly annotated hard scans before the EMA teacher's consistency loss reaches full strength. If a training round is interrupted mid-round (e.g. at epoch 45), resuming resumes rampup at `45 / 80 = 0.5625` without resetting.
 
 ### 6.4 Recommended W&B Panel Layout
 

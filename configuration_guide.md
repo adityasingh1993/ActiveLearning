@@ -144,7 +144,10 @@ HASSL comes with two pre-configured master configuration files:
 
 - **`splits.json` Caching**: The `splits.json` file must be deleted if you change `val_split` or update your dataset. Otherwise, it will continue using the outdated dataset split.
 - **`ema_decay` Tuning**: The default `ema_decay=0.99` is correct for small datasets (<100 labeled volumes). If you have a large dataset (>100 labeled volumes), use `ema_decay=0.999`.
-- **`consistency_rampup_epochs`**: Default is now `80`. This gives the teacher model enough time to converge before the unsupervised loss reaches its full weight.
+- **`consistency_rampup_epochs`**: Default is `80`.
+  - *Why rampup is needed*: At epoch 0, the teacher is randomly initialized and its pseudo-labels on unlabeled data are pure noise. Ramping up `unsup_weight` linearly from 0.0 to 1.0 prevents noisy unsupervised gradients from overwhelming the supervised signal in early training.
+  - *Per-Round Reset*: **Rampup automatically resets to 0.0 at the start of every Active Learning (AL) round.** When a new round starts, newly annotated hard scans are added to the labeled pool. The student must first adapt to these new ground-truth labels during epochs 0–20 before the EMA teacher's updated predictions exert full consistency pressure.
+  - *Mid-Round Resumes*: If an in-progress round is interrupted and resumed (e.g. at epoch 45), rampup resumes at `45 / 80 = 0.5625` rather than resetting to 0.
 - **`preprocessing_mode` Selection**:
   - `resize`: The whole volume is resized to 128³ (or `spatial_size`). This is fast and good for small datasets.
   - `patch`: Uses native resolution crops. This is better for large structures but requires more epochs to train effectively.
