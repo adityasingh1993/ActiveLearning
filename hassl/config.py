@@ -7,7 +7,7 @@ Supports two compute tiers (prototype/full) and configurable network backbones.
 
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Dict, Optional, Tuple
 import yaml
 
 
@@ -29,6 +29,12 @@ class HASSLConfig:
     label_suffix: str = ".seg.nrrd"
     num_classes: int = 1  # 1 = binary (sigmoid), >1 = multi-class (softmax)
     spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)  # Spacingd pixdim (mm per voxel)
+    label_names: Optional[Dict[int, str]] = None  # Multi-class label map {0:'bg',1:'bladder',3:'urethra'}
+                                                   # None = binary mode (AsDiscreted threshold=0.5)
+                                                   # dict = NormalizeLabelsInDatasetd remaps non-contiguous values
+    lcc_min_size_voxels: int = 100  # LCC satellite filter: discard CCs smaller than this at spatial_size resolution
+                                    # 100 is safe for medium targets (bladder/prostate ~1000-10000 voxels at 128^3)
+                                    # Set to 0 to disable
     spatial_size: Tuple[int, int, int] = (128, 128, 128)  # Resize target (used in "resize" mode and for val/inference)
     preprocessing_mode: str = "resize"  # "resize" (Spacingd+Resized) or "patch" (Spacingd+RandCropByPosNegLabeld)
     patch_size: Tuple[int, int, int] = (96, 96, 96)  # Training crop size when preprocessing_mode == "patch"
