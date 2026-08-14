@@ -40,27 +40,44 @@ class FlexMatchThreshold(nn.Module):
 
 
 class UncertaintyMaskedLoss(nn.Module):
-    """Wraps base loss and applies a binary mask suppressing high-uncertainty voxels."""
+    """Applies a voxel-wise confidence mask to suppress uncertain pseudo-label regions.
+
+    Uses BCE-with-logits (reduction='none') as the per-voxel loss so that the spatial
+    mask can be applied before averaging.  DiceLoss inherently reduces to a scalar per
+    volume, so it cannot be masked per-voxel; CE is a strictly per-voxel signal and
+    sufficient for the unsupervised consistency term.
+
+    The supervised loss (clean GT labels) continues using the full DiceCELoss — no
+    masking is needed there because ground-truth masks are reliable.
+    """
 
     def __init__(self, base_loss: nn.Module):
         super().__init__()
-        self.base_loss = base_loss
+        self.base_loss = base_loss  # kept for API compatibility, not used in forward
+        self._bce = nn.BCEWithLogitsLoss(reduction='none')
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        base_loss_per_voxel = self.base_loss(pred, target)
+        """Compute masked BCE loss over confident voxels only.
 
-        if base_loss_per_voxel.ndim == 0:
-            # Base loss aggregated to scalar (e.g. DiceCELoss reduction='mean')
-            return base_loss_per_voxel * mask.mean()
+        Args:
+            pred:   Logit predictions  [B, C, D, H, W]  (NOT sigmoid-activated)
+            target: Binary pseudo-labels [B, C, D, H, W] float {0, 1}
+            mask:   Confidence mask      [B, C, D, H, W] or broadcastable; 1=confident 0=uncertain
 
-        if mask.shape != base_loss_per_voxel.shape:
-            mask = mask.view_as(base_loss_per_voxel)
+        Returns:
+            Scalar loss averaged over confident voxels only.
+            Returns 0 when no confident voxels exist (avoids NaN on fully-masked batches).
+        """
+        # Expand mask to match pred if needed (e.g. mask is [B, 1, D, H, W])
+        if mask.shape != pred.shape:
+            mask = mask.expand_as(pred)
 
-        masked_loss = base_loss_per_voxel * mask
+        bce_per_voxel = self._bce(pred, target.float())
+        masked_loss = bce_per_voxel * mask
         mask_sum = mask.sum()
         if mask_sum > 0:
             return masked_loss.sum() / mask_sum
-        return torch.tensor(0.0, device=pred.device)
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
 
 
 class BoundaryLoss(nn.Module):
@@ -110,6 +127,17 @@ class BoundaryLoss(nn.Module):
 
 
 class CombinedSegLoss(nn.Module):
+    """Dice + CE loss for supervised segmentation training.
+
+    Fixes applied:
+    - include_background=False always: background Dice is trivially high (~0.97) for
+      sparse foreground structures (bladder 2-5% of volume), drowning the gradient
+      signal for the actual target class.
+    - to_onehot_y=True for multiclass: MONAI DiceLoss requires one-hot encoded targets.
+      Without this, integer class indices (e.g. 2) are treated as probability activations
+      (2.0), making Dice computation mathematically invalid for multi-class tasks.
+    """
+
     def __init__(self, num_classes: int, include_boundary: bool = False, boundary_weight: float = 0.5, reduction: str = 'mean'):
         super().__init__()
         self.num_classes = num_classes
@@ -118,14 +146,17 @@ class CombinedSegLoss(nn.Module):
 
         sigmoid = num_classes == 1
         softmax = num_classes > 1
+        to_onehot_y = num_classes > 1  # Required for multiclass: converts int targets to one-hot
 
         # MONAI DiceCELoss only accepts 'mean' or 'sum'
         monai_reduction = reduction if reduction in ('mean', 'sum') else 'mean'
 
         self.dice_ce = DiceCELoss(
-            include_background=False if num_classes > 1 else True,
-            sigmoid=sigmoid, softmax=softmax,
-            reduction=monai_reduction
+            include_background=False,  # Always exclude background — foreground Dice is what matters
+            to_onehot_y=to_onehot_y,   # Required for multiclass integer-label targets
+            sigmoid=sigmoid,
+            softmax=softmax,
+            reduction=monai_reduction,
         )
 
         if include_boundary:

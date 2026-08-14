@@ -81,8 +81,24 @@ class AspectRatioResizeWithPadd(MapTransform):
         return d
 
 
-def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label_suffix: str = ".seg.nrrd", seed: int = 42, patient_id_regex: Optional[str] = None) -> Dict[str, List[str]]:
-    """Create or load a frozen split file (splits.json) with patient-level holdouts (C-4, V-11 fix)."""
+def get_or_create_frozen_splits(
+    data_dir: str,
+    image_suffix: str = ".mha",
+    label_suffix: str = ".seg.nrrd",
+    seed: int = 42,
+    patient_id_regex: Optional[str] = None,
+    val_split: int = 5,
+) -> Dict[str, List[str]]:
+    """Create or load a frozen split file (splits.json) with patient-level holdouts (C-4, V-11 fix).
+
+    Args:
+        val_split: Target number of patients to hold out for validation.
+                   Previously this was hardcoded to 15% of total patients, which on a
+                   10-patient dataset gives only 1 validation patient — erratic Dice
+                   scores, unreliable early stopping, and biased best-model selection.
+                   Now respects config.val_split (default 5), clamped so at least 1
+                   training patient always remains.
+    """
     splits_file = Path(data_dir) / "splits.json"
     if splits_file.exists():
         with open(splits_file, "r") as f:
@@ -124,8 +140,15 @@ def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label
     rng.shuffle(patient_ids)
 
     n_total_p = len(patient_ids)
+
+    # Test split: fixed at 15% (not configurable — held out for final evaluation only)
     n_test_p = max(1, int(n_total_p * 0.15)) if n_total_p >= 5 else 0
-    n_val_p = max(1, int(n_total_p * 0.15)) if n_total_p >= 5 else (1 if n_total_p > 1 else 0)
+
+    # Validation split: respect config.val_split, clamped so at least 1 training patient remains
+    remaining_after_test = n_total_p - n_test_p
+    n_val_p = min(val_split, max(0, remaining_after_test - 1))  # leave at least 1 train patient
+    if n_total_p < 5:
+        n_val_p = 1 if n_total_p > 1 else 0
 
     test_patients = set(patient_ids[:n_test_p])
     val_patients = set(patient_ids[n_test_p:n_test_p + n_val_p])
@@ -145,7 +168,7 @@ def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label
     with open(splits_file, "w") as f:
         json.dump(splits, f, indent=4)
 
-    print(f"[DataEngine] Created patient-level frozen splits: {len(train_ids)} train, {len(val_ids)} val, {len(test_ids)} test")
+    print(f"[DataEngine] Created patient-level frozen splits: {len(train_ids)} train, {len(val_ids)} val (target={val_split}), {len(test_ids)} test")
     return splits
 
 
@@ -353,12 +376,14 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
 def build_dataloaders(config):
     """Build train, unlabeled, and FIXED validation dataloaders with asymmetric transforms (C-4, N-5, P-1 fix)."""
     patient_id_regex = getattr(config, 'patient_id_regex', None)
+    val_split = getattr(config, 'val_split', 5)
     splits = get_or_create_frozen_splits(
         config.data_dir,
         image_suffix=config.image_suffix,
         label_suffix=config.label_suffix,
         seed=config.seed,
         patient_id_regex=patient_id_regex,
+        val_split=val_split,
     )
 
     val_ids_set = set(splits.get("val_ids", []))
@@ -442,12 +467,14 @@ def build_dataloaders(config):
 def build_all_volumes_loader(config):
     """Build a dataloader for ALL volumes (excluding test set), without labels for SSL."""
     patient_id_regex = getattr(config, 'patient_id_regex', None)
+    val_split = getattr(config, 'val_split', 5)
     splits = get_or_create_frozen_splits(
         config.data_dir,
         image_suffix=config.image_suffix,
         label_suffix=config.label_suffix,
         seed=config.seed,
         patient_id_regex=patient_id_regex,
+        val_split=val_split,
     )
     test_ids_set = set(splits.get("test_ids", []))
 

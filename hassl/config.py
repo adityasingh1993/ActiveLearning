@@ -87,10 +87,18 @@ class HASSLConfig:
     early_stopping_patience: int = 30
     early_stopping_min_delta: float = 1e-4
     lambda_unsup: float = 1.0  # Max weight for unsupervised loss
-    ema_decay: float = 0.999  # EMA teacher momentum
+    ema_decay: float = 0.99   # EMA teacher momentum. Lower than 0.999 for small datasets:
+                               # with batch_size=1, ~10 labeled vols → 10 steps/epoch.
+                               # At 0.999 the teacher needs ~700 steps (70 epochs) to reflect
+                               # the student; at 0.99 it catches up in ~10 epochs.
+                               # Use 0.999 only for large datasets (>100 labeled volumes).
     flexmatch_threshold: float = 0.95  # Initial pseudo-label confidence threshold
     mc_dropout_passes: int = 5  # 5 for 8GB, 10 for 24GB
-    consistency_rampup_epochs: int = 30  # Linear rampup for unsupervised weight
+    consistency_rampup_epochs: int = 80  # Linear rampup for unsupervised weight.
+                                          # Keep low until teacher is trained: at epoch 30 the EMA
+                                          # teacher on a small dataset is still producing noisy labels.
+                                          # 80 epochs allows ~800 steps (batch_size=1, ~10 vols) for
+                                          # the teacher to converge before full unsupervised weight.
     pseudo_label_weight: float = 0.5  # Weight multiplier for pseudo-labeled approved samples
     save_every_n_epochs: int = 20  # Checkpoint frequency
     log_image_every_n_epochs: int = 10  # Log sample predictions

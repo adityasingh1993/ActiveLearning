@@ -462,9 +462,27 @@ class HASSLTrainer:
                 loss_cps_B = torch.tensor(0.0, device=self.device)
 
                 if inputs_u is not None:
-                    # Both networks see aligned input (N-5 fix)
-                    preds_A_u = self.net_A(inputs_u)
-                    preds_B_u = self.net_B(inputs_u)
+                    # CPS requires perturbation-induced consistency: each network must see a
+                    # differently-augmented view of the same volume so their predictions diverge
+                    # enough to provide meaningful cross-supervision.  Without augmentation both
+                    # networks immediately agree → pseudo-labels collapse to the same bias.
+                    # _make_unlabeled_views produces:
+                    #   view_A: shared spatial aug + intensity aug (student A view)
+                    #   view_B: shared spatial aug only             (student B view)
+                    # We generate two independent augmentation pairs so A and B get distinct views.
+                    try:
+                        inputs_u_A, inputs_u_A_alt = self._make_unlabeled_views(inputs_u)
+                        inputs_u_B, inputs_u_B_alt = self._make_unlabeled_views(inputs_u)
+                        # net_A gets view_A, net_B gets view_B (independently augmented)
+                        inputs_for_A = inputs_u_A.to(self.device)
+                        inputs_for_B = inputs_u_B.to(self.device)
+                    except Exception as e:
+                        print(f"[HASSL Warning] CPS augmentation failed: {e}. Using unaugmented inputs.")
+                        inputs_for_A = inputs_u
+                        inputs_for_B = inputs_u
+
+                    preds_A_u = self.net_A(inputs_for_A)
+                    preds_B_u = self.net_B(inputs_for_B)
 
                     if isinstance(preds_A_u, (list, tuple)): preds_A_u = preds_A_u[0]
                     elif preds_A_u.ndim == 6: preds_A_u = preds_A_u[:, 0]
@@ -628,10 +646,10 @@ class HASSLTrainer:
 
             decollated_samples = decollate_batch(batch_data)
             inv_transform = build_invertd(
-                keys=["pred", "pred_lcc", "label"],
+                keys=["image", "pred", "pred_lcc", "label"],
                 transform=self.val_transform,
-                orig_keys=["image", "image", "label"],
-                nearest_interp=True,
+                orig_keys=["image", "image", "image", "label"],
+                nearest_interp=[False, True, True, True],  # image=cubic, masks=nearest
                 to_tensor=True,
             )
 
@@ -711,17 +729,16 @@ class HASSLTrainer:
                     pv_mm3_lcc = float(inv_pred_lcc.sum().item()) * voxel_vol_mm3
                     gv_mm3 = float(inv_gt.sum().item()) * voxel_vol_mm3
 
-                    # Capture native scanner physical space tensors for sample 0 preview
+                    # Capture native scanner physical space tensors for sample 0 preview.
+                    # We invert ALL keys (image, pred, pred_lcc, label) through the same
+                    # Invertd pipeline so the image comes from actual scanner-space data,
+                    # not a trilinear upsample from 128³ which would look blurry.
                     if b == 0 and first_batch_native_sample is None and should_log_image:
-                        native_shape = tuple(inv_pred.shape[1:])
-                        inv_img_t = torch.nn.functional.interpolate(
-                            inputs[0:1], size=native_shape, mode='trilinear', align_corners=False
-                        )[0].detach().cpu()
                         first_batch_native_sample = (
-                            inv_img_t,
+                            inv_out["image"].detach().cpu(),      # real inverted image
                             inv_gt.detach().cpu(),
                             inv_pred.detach().cpu(),
-                            inv_pred_lcc.detach().cpu()
+                            inv_pred_lcc.detach().cpu(),
                         )
                 except Exception as e:
                     logger.warning(
@@ -840,34 +857,30 @@ class HASSLTrainer:
             co_idx = int(lbl_np.sum(axis=(0, 2)).argmax())   # coronal
             sa_idx = int(lbl_np.sum(axis=(0, 1)).argmax())   # sagittal
 
-            def make_panel(img_slice, lbl_slice, label):
-                """CLAHE-style per-slice contrast stretch + solid mask overlay."""
+            def make_panel(img_slice, lbl_slice):
+                """Per-slice 1-99th percentile contrast stretch + solid mask overlay at actual pixel size."""
                 lo, hi = np.percentile(img_slice, [1, 99])
                 norm = np.clip((img_slice - lo) / (hi - lo + 1e-8), 0, 1)
                 gray = (norm * 255).astype(np.uint8)
                 rgb  = np.stack([gray, gray, gray], axis=-1)  # H x W x 3
 
-                # Image-only panel
                 p_img = rgb.copy()
 
-                # Label overlay panel: solid 50% alpha green
                 p_lbl = rgb.copy()
-                mask = lbl_slice > 0.5
+                mask  = lbl_slice > 0.5
                 if mask.any():
                     overlay = p_lbl.copy()
-                    overlay[mask] = [0, 220, 100]              # bright green
+                    overlay[mask] = [0, 220, 100]
                     p_lbl = (p_lbl * 0.5 + overlay * 0.5).astype(np.uint8)
 
-                # Annotate label text
                 h, w = gray.shape
-                header = np.zeros((20, w, 3), dtype=np.uint8)
-                header[:] = [40, 40, 40]
-                panel = np.concatenate([header, p_img, p_lbl], axis=0)
+                header = np.full((20, w, 3), 40, dtype=np.uint8)
+                panel  = np.concatenate([header, p_img, p_lbl], axis=0)
                 return panel
 
-            panel_ax = make_panel(img_np[ax_idx], lbl_np[ax_idx], f"Axial z={ax_idx}")
-            panel_co = make_panel(img_np[:, co_idx, :], lbl_np[:, co_idx, :], f"Coronal y={co_idx}")
-            panel_sa = make_panel(img_np[:, :, sa_idx], lbl_np[:, :, sa_idx], f"Sagittal x={sa_idx}")
+            panel_ax = make_panel(img_np[ax_idx],          lbl_np[ax_idx])
+            panel_co = make_panel(img_np[:, co_idx, :],    lbl_np[:, co_idx, :])
+            panel_sa = make_panel(img_np[:, :, sa_idx],    lbl_np[:, :, sa_idx])
 
             # Pad all panels to same height before concatenating horizontally
             max_h = max(p.shape[0] for p in [panel_ax, panel_co, panel_sa])
@@ -876,6 +889,7 @@ class HASSLTrainer:
                 return np.pad(p, ((0, diff), (0, 0), (0, 0)), mode='constant') if diff > 0 else p
 
             grid = np.concatenate([pad_h(panel_ax), pad_h(panel_co), pad_h(panel_sa)], axis=1)
+            out_h, out_w = grid.shape[:2]
 
             self.tracker.log_image(
                 grid,
@@ -883,9 +897,10 @@ class HASSLTrainer:
                 step=epoch,
                 caption=(
                     f"Epoch {epoch} — Preprocessed val sample after resize "
-                    f"(Axial | Coronal | Sagittal) — each axis shows [Image | Label overlay] "
-                    f"| Shape: {D}x{H}x{W} | FG fraction: {fg_frac:.4f} "
-                    f"| GT slices: ax={ax_idx} co={co_idx} sa={sa_idx}"
+                    f"(Axial | Coronal | Sagittal) — each axis: [Image | Label overlay] "
+                    f"| Volume: {D}x{H}x{W} | FG fraction: {fg_frac:.4f} "
+                    f"| GT slices: ax={ax_idx} co={co_idx} sa={sa_idx} "
+                    f"| Logged: {out_h}x{out_w}px"
                 ),
                 save_local_dir=os.path.join(self.config.log_dir, "data_previews")
             )
@@ -901,12 +916,16 @@ class HASSLTrainer:
         """Log 3-axis x 5-panel validation preview strips for BOTH model space and native physical space.
 
         Previews logged:
-          1. `val_slice_preview_model_space_128`: 128x128x128 preprocessed model resolution
-          2. `val_slice_preview_native_space`: Original scanner physical resolution (after Invertd)
+          1. `val_slice_preview_model_space`: Slices at exact model resolution (128x128x128)
+          2. `val_slice_preview_native_space`: Slices at actual scanner voxel resolution (after Invertd)
           3. `val_uncertainty_preview`: MC/TTA epistemic and aleatoric heatmaps (model space)
 
         Each strip shows 3 rows (Axial, Coronal, Sagittal) x 5 columns:
           [Image | GT (green) | Raw Pred (cyan) | LCC Pred (magenta) | Error Map (TP green/FP red/FN blue)]
+
+        Images are logged at the exact pixel dimensions of the underlying volume — no artificial
+        upscaling or downscaling. Model space panels are 128px per slice; native space panels are
+        whatever the actual scanner voxel grid is.
         """
         try:
             from hassl.utils.visualization import render_uncertainty_slice_grid
@@ -926,7 +945,9 @@ class HASSLTrainer:
                 return np.clip(out, 0, 255).astype(np.uint8)
 
             def build_3axis_grid(img_t, gt_t, pred_t, lcc_t):
-                """Build 3-row (axial, coronal, sagittal) x 5-col preview grid for a 3D volume."""
+                """Build 3-row (axial, coronal, sagittal) x 5-col preview grid.
+                Logged at the exact pixel dimensions of the volume — no rescaling.
+                """
                 img_np  = img_t[0].numpy()    # [D, H, W]
                 gt_np   = gt_t[0].numpy()
                 pred_np = pred_t[0].numpy()
@@ -949,8 +970,8 @@ class HASSLTrainer:
 
                     p5 = np.zeros_like(rgb)
                     p5[gt_m & lc_m]    = [0, 210, 60]    # TP green
-                    p5[(~gt_m) & lc_m]  = [230, 40, 40]   # FP red
-                    p5[gt_m & (~lc_m)]  = [40, 100, 230]  # FN blue
+                    p5[(~gt_m) & lc_m] = [230, 40, 40]   # FP red
+                    p5[gt_m & (~lc_m)] = [40, 100, 230]  # FN blue
 
                     return np.concatenate([p1, p2, p3, p4, p5], axis=1)
 
@@ -971,25 +992,29 @@ class HASSLTrainer:
                     diff = max_w - r.shape[1]
                     return np.pad(r, ((0, 0), (0, diff), (0, 0)), mode='constant') if diff > 0 else r
 
-                sep = np.full((3, max_w, 3), 80, dtype=np.uint8)
+                sep  = np.full((3, max_w, 3), 80, dtype=np.uint8)
                 grid = np.concatenate([pad_w(row_ax), sep, pad_w(row_co), sep, pad_w(row_sa)], axis=0)
-                return grid, (ax_idx, co_idx, sa_idx), (D, H, W), float(gt_np.mean()), float(lcc_np.mean())
+                out_h, out_w = grid.shape[:2]
+                return grid, (ax_idx, co_idx, sa_idx), (D, H, W), float(gt_np.mean()), float(lcc_np.mean()), (out_h, out_w)
 
             # -------------------------------------------------------------------
-            # 1. Model Space Preview (128x128x128)
+            # 1. Model Space Preview — exact 128³ pixel dimensions
+            #    Shows precisely what the model operates on.
             # -------------------------------------------------------------------
             img_m, gt_m, pred_m, lcc_m = model_sample[0], model_sample[1], model_sample[2], model_sample[3]
-            mc_var_t = model_sample[4] if len(model_sample) > 4 else None
+            mc_var_t  = model_sample[4] if len(model_sample) > 4 else None
             tta_var_t = model_sample[5] if len(model_sample) > 5 else None
 
-            grid_m, (ax_i, co_i, sa_i), shape_m, gt_f_m, pr_f_m = build_3axis_grid(img_m, gt_m, pred_m, lcc_m)
+            grid_m, (ax_i, co_i, sa_i), shape_m, gt_f_m, pr_f_m, (out_h_m, out_w_m) = build_3axis_grid(
+                img_m, gt_m, pred_m, lcc_m
+            )
 
             self.tracker.log_image(
                 grid_m,
-                name="val_slice_preview_model_space_128",
+                name="val_slice_preview_model_space",
                 step=epoch,
                 caption=(
-                    f"Epoch {epoch} [Model Space {shape_m[0]}x{shape_m[1]}x{shape_m[2]}] "
+                    f"Epoch {epoch} [Model Space {shape_m[0]}x{shape_m[1]}x{shape_m[2]} — {out_h_m}x{out_w_m}px] "
                     f"| Slices: ax={ax_i} co={co_i} sa={sa_i} "
                     f"| Cols: Image / GT(green) / RawPred(cyan) / LCC(magenta) / Error(TP-G FP-R FN-B) "
                     f"| GT fg={gt_f_m:.3f} Pred fg={pr_f_m:.3f}"
@@ -998,18 +1023,22 @@ class HASSLTrainer:
             )
 
             # -------------------------------------------------------------------
-            # 2. Native Physical Space Preview (after Invertd — actual scanner size)
+            # 2. Native Physical Space Preview — actual scanner voxel resolution
+            #    Image + segmentation both inverted through Invertd (orientation→
+            #    spacing→resize), logged at their true pixel dimensions.
             # -------------------------------------------------------------------
             if native_sample is not None:
                 img_n, gt_n, pred_n, lcc_n = native_sample[0], native_sample[1], native_sample[2], native_sample[3]
-                grid_n, (ax_in, co_in, sa_in), shape_n, gt_f_n, pr_f_n = build_3axis_grid(img_n, gt_n, pred_n, lcc_n)
+                grid_n, (ax_in, co_in, sa_in), shape_n, gt_f_n, pr_f_n, (out_h_n, out_w_n) = build_3axis_grid(
+                    img_n, gt_n, pred_n, lcc_n
+                )
 
                 self.tracker.log_image(
                     grid_n,
                     name="val_slice_preview_native_space",
                     step=epoch,
                     caption=(
-                        f"Epoch {epoch} [Native Scanner Space {shape_n[0]}x{shape_n[1]}x{shape_n[2]}] "
+                        f"Epoch {epoch} [Native Scanner Space {shape_n[0]}x{shape_n[1]}x{shape_n[2]} — {out_h_n}x{out_w_n}px] "
                         f"| Slices: ax={ax_in} co={co_in} sa={sa_in} "
                         f"| Cols: Image / GT(green) / RawPred(cyan) / LCC(magenta) / Error(TP-G FP-R FN-B) "
                         f"| GT fg={gt_f_n:.3f} Pred fg={pr_f_n:.3f}"
