@@ -61,6 +61,7 @@ class HASSLConfig:
     unet_num_res_units: int = 2  # Only for UNet
     dynunet_deep_supervision: bool = True  # Only for DynUNet
     dropout: float = 0.2  # For MC Dropout during uncertainty estimation
+    loss_type: str = "generalized_dice_focal"  # "generalized_dice_focal" or "dice_ce"
 
     # Full mode additional network
     swinunetr_feature_size: int = 48

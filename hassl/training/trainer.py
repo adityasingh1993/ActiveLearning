@@ -238,7 +238,8 @@ class HASSLTrainer:
         min_delta = getattr(config, 'early_stopping_min_delta', 1e-4)
         self.early_stopper = EarlyStopping(patience=patience, min_delta=min_delta, mode='max') if use_es else None
 
-        self.criterion = CombinedSegLoss(self.num_classes, include_boundary=False)
+        loss_type = getattr(config, 'loss_type', 'generalized_dice_focal')
+        self.criterion = CombinedSegLoss(self.num_classes, loss_type=loss_type, include_boundary=False)
         self.masked_criterion = UncertaintyMaskedLoss(self.criterion)
         self.best_dice = 0.0
         self.dice_metric = DiceMetric(include_background=False if self.num_classes > 1 else True, reduction="mean")
@@ -423,6 +424,8 @@ class HASSLTrainer:
 
         N = max(1, len(self.labeled_loader))
         M = max(1, n_unlabeled_steps)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return (
             total_loss / N,
             total_sup / N,
@@ -550,6 +553,8 @@ class HASSLTrainer:
             total_unsup += (loss_cps_A + loss_cps_B).item() / 2
 
         N = max(1, len(self.labeled_loader))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return total_loss / N, total_sup / N, total_unsup / N, 0.0
 
     @torch.no_grad()
@@ -593,7 +598,8 @@ class HASSLTrainer:
         first_batch_sample = None
         first_batch_native_sample = None
 
-        inferer = SlidingWindowInferer(roi_size=self.config.spatial_size, sw_batch_size=2, overlap=0.25)
+        sw_bs = 1 if self.mode == 'prototype' else getattr(self.config, 'sw_batch_size', 2)
+        inferer = SlidingWindowInferer(roi_size=self.config.spatial_size, sw_batch_size=sw_bs, overlap=0.25)
 
         for batch_idx, batch_data in enumerate(self.val_loader):
             inputs = batch_data['image'].to(self.device)
@@ -885,6 +891,9 @@ class HASSLTrainer:
                 model_sample=first_batch_sample,
                 native_sample=first_batch_native_sample
             )
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return {
             'val_dice': val_dice,

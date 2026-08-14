@@ -452,6 +452,8 @@ def build_dataloaders(config):
     )
 
     num_workers = getattr(config, 'num_workers', 2)
+    if os.name == 'nt' and getattr(config, 'compute_mode', 'prototype') == 'prototype':
+        num_workers = 0  # 0 workers on Windows prototype mode prevents multiprocess IPC memory leaks/crashes
     batch_size = getattr(config, 'batch_size', 1)
 
     labeled_loader = MonaiDataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers) if len(train_ds) > 0 else None

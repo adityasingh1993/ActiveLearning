@@ -222,6 +222,9 @@ class SSLPretrainer:
             avg_rot = epoch_rot / N
             avg_cont = epoch_cont / N
 
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             current_lr = self.optimizer.param_groups[0]['lr']
             if getattr(self, 'scheduler', None) is not None:
                 self.scheduler.step()

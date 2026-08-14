@@ -40,6 +40,7 @@ unet_strides: [2, 2, 2, 2]
 unet_num_res_units: 2             # Only used when unet_backbone == "unet"
 dynunet_deep_supervision: true    # Enable deep supervision auxiliary loss heads (DynUNet)
 dropout: 0.2                      # Dropout rate for MC Dropout during uncertainty estimation
+loss_type: "generalized_dice_focal"# "generalized_dice_focal" (Generalized Dice + Focal) or "dice_ce"
 swinunetr_feature_size: 48        # Secondary network feature size (SwinUNETR for 24GB mode)
 
 # ─── SSL Pre-training (Phase 2) ───────────────────────────────────────

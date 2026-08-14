@@ -2,8 +2,16 @@ import pytest
 import torch
 from hassl.training.losses import CombinedSegLoss, FlexMatchThreshold, UncertaintyMaskedLoss, BoundaryLoss
 
-def test_combined_seg_loss():
-    loss_fn = CombinedSegLoss(num_classes=1)
+def test_combined_seg_loss_generalized_dice_focal():
+    loss_fn = CombinedSegLoss(num_classes=1, loss_type="generalized_dice_focal")
+    pred = torch.rand(2, 1, 32, 32, 32)
+    target = torch.randint(0, 2, (2, 1, 32, 32, 32)).float()
+    loss = loss_fn(pred, target)
+    assert loss.dim() == 0
+    assert loss.item() >= 0
+
+def test_combined_seg_loss_dice_ce():
+    loss_fn = CombinedSegLoss(num_classes=1, loss_type="dice_ce")
     pred = torch.rand(2, 1, 32, 32, 32)
     target = torch.randint(0, 2, (2, 1, 32, 32, 32)).float()
     loss = loss_fn(pred, target)

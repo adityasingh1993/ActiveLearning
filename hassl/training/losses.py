@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import scipy.ndimage as ndimage
-from monai.losses import DiceCELoss
+from monai.losses import DiceCELoss, GeneralizedDiceFocalLoss
 
 
 class FlexMatchThreshold(nn.Module):
@@ -47,7 +47,7 @@ class UncertaintyMaskedLoss(nn.Module):
     volume, so it cannot be masked per-voxel; CE is a strictly per-voxel signal and
     sufficient for the unsupervised consistency term.
 
-    The supervised loss (clean GT labels) continues using the full DiceCELoss — no
+    The supervised loss (clean GT labels) continues using the full DiceCELoss / GeneralizedDiceFocalLoss — no
     masking is needed there because ground-truth masks are reliable.
     """
 
@@ -127,7 +127,7 @@ class BoundaryLoss(nn.Module):
 
 
 class CombinedSegLoss(nn.Module):
-    """Dice + CE loss for supervised segmentation training.
+    """Configurable segmentation loss for supervised training (Generalized Dice Focal Loss or DiceCE).
 
     Fixes applied:
     - include_background=False always: background Dice is trivially high (~0.97) for
@@ -136,11 +136,14 @@ class CombinedSegLoss(nn.Module):
     - to_onehot_y=True for multiclass: MONAI DiceLoss requires one-hot encoded targets.
       Without this, integer class indices (e.g. 2) are treated as probability activations
       (2.0), making Dice computation mathematically invalid for multi-class tasks.
+    - Default loss_type="generalized_dice_focal": combines Generalized Dice Loss (class weighting)
+      with Focal Loss for improved convergence on difficult boundaries and high class imbalance.
     """
 
-    def __init__(self, num_classes: int, include_boundary: bool = False, boundary_weight: float = 0.5, reduction: str = 'mean'):
+    def __init__(self, num_classes: int, loss_type: str = "generalized_dice_focal", include_boundary: bool = False, boundary_weight: float = 0.5, reduction: str = 'mean'):
         super().__init__()
         self.num_classes = num_classes
+        self.loss_type = loss_type
         self.include_boundary = include_boundary
         self.boundary_weight = boundary_weight
 
@@ -148,16 +151,28 @@ class CombinedSegLoss(nn.Module):
         softmax = num_classes > 1
         to_onehot_y = num_classes > 1  # Required for multiclass: converts int targets to one-hot
 
-        # MONAI DiceCELoss only accepts 'mean' or 'sum'
+        # MONAI loss reduction accepts 'mean' or 'sum'
         monai_reduction = reduction if reduction in ('mean', 'sum') else 'mean'
 
-        self.dice_ce = DiceCELoss(
-            include_background=False,  # Always exclude background — foreground Dice is what matters
-            to_onehot_y=to_onehot_y,   # Required for multiclass integer-label targets
-            sigmoid=sigmoid,
-            softmax=softmax,
-            reduction=monai_reduction,
-        )
+        if loss_type == "generalized_dice_focal":
+            self.dice_ce = GeneralizedDiceFocalLoss(
+                include_background=False,  # Always exclude background — foreground Dice is what matters
+                to_onehot_y=to_onehot_y,   # Required for multiclass integer-label targets
+                sigmoid=sigmoid,
+                softmax=softmax,
+                reduction=monai_reduction,
+                lambda_gdl=1.0,
+                lambda_focal=1.0,
+                gamma=2.0,
+            )
+        else:
+            self.dice_ce = DiceCELoss(
+                include_background=False,  # Always exclude background — foreground Dice is what matters
+                to_onehot_y=to_onehot_y,   # Required for multiclass integer-label targets
+                sigmoid=sigmoid,
+                softmax=softmax,
+                reduction=monai_reduction,
+            )
 
         if include_boundary:
             self.boundary_loss = BoundaryLoss(num_classes)
