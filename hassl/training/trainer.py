@@ -601,16 +601,12 @@ class HASSLTrainer:
                         orig_affine = meta['original_affine'][b]
 
                 try:
-                    from monai.transforms import Invertd, Compose, Resized, Orientationd
-                    # Filter val_transform to only spatial invertibles (Resized, Orientationd).
-                    # Spacingd inverse resampling can attempt gigabyte memory allocations if voxel ratio is high.
-                    invertible_val_tf = Compose([
-                        t for t in self.val_transform.transforms
-                        if isinstance(t, (Resized, Orientationd))
-                    ])
+                    from monai.transforms import Invertd
+                    # Pass self.val_transform directly so MONAI's Invertd matches the exact transform
+                    # object memory IDs recorded in inputs[b].applied_operations.
                     inv_transform = Invertd(
                         keys=["pred", "pred_lcc", "label"],
-                        transform=invertible_val_tf,
+                        transform=self.val_transform,
                         orig_keys=["image", "image", "label"],
                         meta_keys=["pred_meta_dict", "pred_lcc_meta_dict", "label_meta_dict"],
                         orig_meta_keys=["image_meta_dict", "image_meta_dict", "label_meta_dict"],
