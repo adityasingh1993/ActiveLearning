@@ -317,6 +317,10 @@ class HASSLTrainer:
         unsup_weight = self.get_rampup_weight(epoch)
         pseudo_weight = getattr(self.config, 'pseudo_label_weight', 0.5)
         total_loss, total_sup, total_unsup, total_uncert = 0.0, 0.0, 0.0, 0.0
+        # Teacher diagnostic accumulators: confidence and foreground fraction of pseudo-labels
+        total_pseudo_conf = 0.0   # Mean teacher sigmoid probability on unlabeled voxels
+        total_pseudo_fg   = 0.0   # Fraction of voxels the teacher labels as foreground
+        n_unlabeled_steps = 0
 
         if self.unlabeled_loader is None or len(self.unlabeled_loader.dataset) == 0:
             iter_unlabeled = None
@@ -395,6 +399,13 @@ class HASSLTrainer:
 
                     uncert_val = uncertainty.mean().item()
 
+                    # --- Teacher diagnostics (no grad, detached) ---
+                    with torch.no_grad():
+                        pp = pseudo_probs.detach().float()
+                        total_pseudo_conf += float(pp.mean().item())           # Mean confidence [0,1]
+                        total_pseudo_fg   += float((pp > 0.5).float().mean().item())  # FG fraction
+                        n_unlabeled_steps += 1
+
                 loss = loss_sup + unsup_weight * loss_unsup
 
             self.scaler.scale(loss).backward()
@@ -411,7 +422,15 @@ class HASSLTrainer:
             total_uncert += uncert_val
 
         N = max(1, len(self.labeled_loader))
-        return total_loss / N, total_sup / N, total_unsup / N, total_uncert / N
+        M = max(1, n_unlabeled_steps)
+        return (
+            total_loss / N,
+            total_sup / N,
+            total_unsup / N,
+            total_uncert / N,
+            total_pseudo_conf / M,   # NEW: teacher mean confidence on unlabeled
+            total_pseudo_fg / M,     # NEW: teacher foreground fraction on unlabeled
+        )
 
     def train_one_epoch_cps(self, epoch: int):
         self.net_A.train()
@@ -561,6 +580,12 @@ class HASSLTrainer:
         hd95_metric = build_hd95_metric(
             include_background=False if self.num_classes > 1 else True
         )
+        # Teacher Dice metric — prototype mode only (EMA shadow model)
+        # Runs alongside student in the same val loop so there is no extra DataLoader pass.
+        teacher_dice_metric = DiceMetric(include_background=False if self.num_classes > 1 else True, reduction="mean")
+        has_teacher = self.mode == 'prototype' and hasattr(self, 'teacher')
+        if has_teacher:
+            self.teacher.shadow.eval()
 
         pred_vols_mm3 = []
         pred_vols_mm3_lcc = []
@@ -575,6 +600,7 @@ class HASSLTrainer:
             targets = batch_data['label'].to(self.device)
 
             with torch.amp.autocast(self.device_type, enabled=(self.device_type == 'cuda')):
+                # --- Student forward ---
                 preds = inferer(inputs, self.net_A)
                 if isinstance(preds, (list, tuple)):
                     preds = preds[0]
@@ -585,6 +611,17 @@ class HASSLTrainer:
                     preds_binary = (torch.sigmoid(preds) > 0.5).float()
                 else:
                     preds_binary = torch.argmax(preds, dim=1, keepdim=True).float()
+
+                # --- Teacher forward (prototype mode only, no grad already via @torch.no_grad) ---
+                if has_teacher:
+                    t_preds = inferer(inputs, self.teacher.shadow)
+                    if isinstance(t_preds, (list, tuple)): t_preds = t_preds[0]
+                    elif t_preds.ndim == 6: t_preds = t_preds[:, 0]
+                    if self.num_classes == 1:
+                        t_binary = (torch.sigmoid(t_preds) > 0.5).float()
+                    else:
+                        t_binary = torch.argmax(t_preds, dim=1, keepdim=True).float()
+                    teacher_dice_metric(y_pred=t_binary, y=targets)
 
             lcc_min_size_voxels = getattr(self.config, 'lcc_min_size_voxels', 100)
             preds_binary_lcc = apply_keep_largest_cc(preds_binary, min_size_voxels=lcc_min_size_voxels)
@@ -831,6 +868,17 @@ class HASSLTrainer:
             val_volume_r2 = 1.0 if np.allclose(pred_arr, gt_arr) else 0.0
             val_volume_r2_lcc = 1.0 if np.allclose(pred_arr_lcc, gt_arr) else 0.0
 
+        # Teacher Dice (prototype mode only)
+        if has_teacher:
+            try:
+                raw_t = teacher_dice_metric.aggregate().item()
+                val_dice_teacher = float('nan') if torch.isnan(torch.tensor(raw_t)) else float(raw_t)
+            except Exception:
+                val_dice_teacher = float('nan')
+            self.teacher.shadow.train()  # restore teacher to train-compatible state
+        else:
+            val_dice_teacher = float('nan')
+
         if should_log_image and first_batch_sample is not None:
             self.log_validation_samples(
                 epoch=epoch,
@@ -840,6 +888,7 @@ class HASSLTrainer:
 
         return {
             'val_dice': val_dice,
+            'val_dice_teacher': val_dice_teacher,  # EMA teacher Dice (NaN in CPS mode)
             'val_dice_lcc': val_dice_lcc,
             'val_precision': val_prec,
             'val_precision_lcc': val_prec_lcc,
@@ -1104,9 +1153,10 @@ class HASSLTrainer:
 
         for epoch in range(self.start_epoch, end_epoch):
             if self.mode == 'prototype':
-                train_loss, sup_loss, unsup_loss, uncert = self.train_one_epoch_uamt(epoch)
+                train_loss, sup_loss, unsup_loss, uncert, pseudo_conf, pseudo_fg = self.train_one_epoch_uamt(epoch)
             else:
                 train_loss, sup_loss, unsup_loss, uncert = self.train_one_epoch_cps(epoch)
+                pseudo_conf, pseudo_fg = float('nan'), float('nan')
 
             # --- Per-epoch diagnostics: foreground fraction & zero-prediction alert ---
             try:
@@ -1173,18 +1223,24 @@ class HASSLTrainer:
                 'unsupervised_loss': unsup_loss,
                 'learning_rate': current_lr,
                 'uncertainty_mean': uncert,
+                # Teacher diagnostic curves (prototype mode; NaN in CPS mode)
+                'teacher_pseudo_conf': pseudo_conf,       # Mean teacher sigmoid confidence on unlabeled [0,1]
+                'teacher_pseudo_fg_frac': pseudo_fg,      # Fraction of unlabeled voxels labelled as FG by teacher
+                'consistency_rampup_weight': self.get_rampup_weight(epoch),  # Unsupervised loss rampup progress
                 'epoch': epoch,
                 **val_metrics
             }
             self.tracker.log_metrics(metrics, step=epoch)
 
-            hd95_str = f"{val_metrics['val_hd95']:.2f}mm" if not np.isnan(val_metrics['val_hd95']) else "N/A"
-            dice_str  = f"{val_dice:.4f}"                    if not np.isnan(val_dice)                    else "N/A"
-            prec_str  = f"{val_metrics['val_precision']:.4f}" if not np.isnan(val_metrics['val_precision']) else "N/A"
-            rec_str   = f"{val_metrics['val_recall']:.4f}"    if not np.isnan(val_metrics['val_recall'])    else "N/A"
+            hd95_str    = f"{val_metrics['val_hd95']:.2f}mm" if not np.isnan(val_metrics['val_hd95']) else "N/A"
+            dice_str    = f"{val_dice:.4f}"                    if not np.isnan(val_dice)                    else "N/A"
+            t_dice_str  = f"{val_metrics['val_dice_teacher']:.4f}" if not np.isnan(val_metrics['val_dice_teacher']) else "N/A"
+            prec_str    = f"{val_metrics['val_precision']:.4f}" if not np.isnan(val_metrics['val_precision']) else "N/A"
+            rec_str     = f"{val_metrics['val_recall']:.4f}"    if not np.isnan(val_metrics['val_recall'])    else "N/A"
 
             print(f"  Epoch {epoch:3d}/{end_epoch} | "
-                  f"Loss: {train_loss:.4f} | Dice: {dice_str} | "
+                  f"Loss: {train_loss:.4f} | "
+                  f"Dice(S): {dice_str} | Dice(T): {t_dice_str} | "
                   f"Prec: {prec_str} | Rec: {rec_str} | "
                   f"RVE: {val_metrics['val_rve_pct']:.1f}% | R²: {val_metrics['val_volume_r2']:.3f} | "
                   f"HD95: {hd95_str} | LR: {current_lr:.6f}")
