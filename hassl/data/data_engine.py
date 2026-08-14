@@ -238,9 +238,12 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
 
     # Intensity normalisation (image only) — placed before spatial crop so
     # crop statistics reflect the normalised distribution.
+    # channel_wise=True prevents divide-by-zero crash when a single channel is
+    # fully saturated (flat intensity), which is common in ultrasound background slices.
     if "image" in keys:
         transforms.append(ScaleIntensityRangePercentilesd(
-            keys=["image"], lower=1, upper=99, b_min=0, b_max=1, clip=True
+            keys=["image"], lower=1, upper=99, b_min=0, b_max=1, clip=True,
+            channel_wise=True
         ))
 
     if preprocessing_mode == "patch" and is_training:

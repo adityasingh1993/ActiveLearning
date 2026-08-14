@@ -2,11 +2,13 @@ import torch
 import numpy as np
 from monai.transforms import (
     Compose,
+    MapTransform,
     RandomizableTransform,
     RandFlipd,
     RandRotated,
     RandAffined,
     RandGaussianSmoothd,
+    RandGaussianNoised,
     RandScaleIntensityd,
     RandAdjustContrastd
 )
@@ -38,6 +40,26 @@ class RandMultiplicativeSpeckleNoised(RandomizableTransform):
         return data_dict
 
 
+class SafeClampIntensityd(MapTransform):
+    """Clamp image intensity to [minv, maxv] after augmentation to prevent out-of-range values.
+
+    RandScaleIntensityd and RandAdjustContrastd can push pixel values above 1.0 even when the
+    input was in [0,1]. Confirmed experimentally: max=1.0179 after strong augmentation.
+    Out-of-range inputs shift the activation distribution and degrade convergence significantly.
+    """
+
+    def __init__(self, keys, minv: float = 0.0, maxv: float = 1.0, allow_missing_keys: bool = False):
+        super().__init__(keys, allow_missing_keys)
+        self.minv = minv
+        self.maxv = maxv
+
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.key_iterator(d):
+            d[key] = torch.clamp(d[key].float(), self.minv, self.maxv)
+        return d
+
+
 def get_spatial_augmentation(keys=["image", "label"]):
     """Pure spatial/geometric transforms (flip, rotation, affine). Shared between teacher and student (V7-1 fix)."""
     return Compose([
@@ -53,13 +75,20 @@ def get_spatial_augmentation(keys=["image", "label"]):
 
 
 def get_intensity_augmentation(keys=["image"]):
-    """Pure photometric/intensity transforms (speckle, blur, contrast). Applied to student view only (V7-1 fix)."""
+    """Pure photometric/intensity transforms (speckle, blur, contrast). Applied to student view only (V7-1 fix).
+
+    All transforms are followed by SafeClampIntensityd to ensure image values stay in [0,1].
+    Without this clamp, RandScaleIntensityd and RandAdjustContrastd push values above 1.0
+    (measured max=1.0179), causing out-of-distribution inputs that degrade convergence.
+    """
     image_keys = [k for k in keys if k == "image"]
     return Compose([
         RandMultiplicativeSpeckleNoised(keys=image_keys, prob=0.5, std=0.08),
         RandGaussianSmoothd(keys=image_keys, prob=0.3, sigma_x=(0.5, 1.2), sigma_y=(0.5, 1.2), sigma_z=(0.5, 1.2)),
+        RandGaussianNoised(keys=image_keys, prob=0.2, mean=0.0, std=0.02),  # Additive Gaussian noise for US background robustness
         RandScaleIntensityd(keys=image_keys, factors=0.1, prob=0.5),
         RandAdjustContrastd(keys=image_keys, prob=0.5, gamma=(0.7, 1.5)),
+        SafeClampIntensityd(keys=image_keys, minv=0.0, maxv=1.0),  # Clamp after aug: prevents >1.0 inputs to network
     ])
 
 
