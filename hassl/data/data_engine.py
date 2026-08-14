@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import List, Dict, Optional
 
+from hassl.compat import ORIENTATIOND_RAS_LABELS
+
 logger = logging.getLogger(__name__)
 
 from monai.data import CacheDataset, PersistentDataset, Dataset, DataLoader as MonaiDataLoader
@@ -225,7 +227,7 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
     transforms = [
         LoadImaged(keys=keys, image_only=False),
         EnsureChannelFirstd(keys=keys),
-        Orientationd(keys=keys, axcodes="RAS"),
+        Orientationd(keys=keys, axcodes="RAS", labels=ORIENTATIOND_RAS_LABELS),
     ]
     if use_spacingd:
         transforms.append(Spacingd(keys=keys, pixdim=config.spacing, mode=mode))
@@ -299,15 +301,25 @@ def build_dataloaders(config):
 
     cache_dir = getattr(config, 'cache_dir', None)
 
-    # 1. Validation dataset (FIXED across all rounds!)
-    val_ds, _ = build_labeled_dataset(
-        config.data_dir,
-        config.image_suffix,
-        config.label_suffix,
-        include_ids=splits.get("val_ids"),
-        transform=val_transforms,
-        cache_dir=cache_dir,
-    )
+    # 1. Validation dataset — FIXED across all rounds AND uses plain Dataset (not CacheDataset).
+    # Reason: CacheDataset pre-runs transforms and bakes the output tensors into RAM. The cached
+    # tensors' MetaTensor.applied_operations may be stale or empty because they were recorded
+    # against a now-dead transform instance. Invertd then cannot replay the chain → exception.
+    # Using plain Dataset ensures transforms run live each iteration, so applied_operations
+    # always contains fresh entries that match self.val_transform.
+    val_data_dicts: list = []
+    data_dir_path_val = Path(config.data_dir)
+    for img_path in sorted(glob.glob(str(data_dir_path_val / f"**/*{config.image_suffix}"), recursive=True)):
+        base_name = os.path.basename(img_path).replace(config.image_suffix, "")
+        if base_name not in set(splits.get("val_ids", [])):
+            continue
+        lbl_path = str(data_dir_path_val / "labels" / f"{base_name}{config.label_suffix}")
+        if not os.path.exists(lbl_path):
+            lbl_path = str(Path(img_path).parent / f"{base_name}{config.label_suffix}")
+        if os.path.exists(lbl_path):
+            val_data_dicts.append({"image": img_path, "label": lbl_path, "id": base_name, "provenance": "human"})
+
+    val_ds = Dataset(data=val_data_dicts, transform=val_transforms)
 
     # 2. Labeled Training dataset (excludes val & test)
     data_dir_path = Path(config.data_dir)
@@ -344,10 +356,13 @@ def build_dataloaders(config):
     batch_size = getattr(config, 'batch_size', 1)
 
     labeled_loader = MonaiDataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers) if len(train_ds) > 0 else None
-    val_loader = MonaiDataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers) if len(val_ds) > 0 else None
+    # val_loader: batch_size=1, num_workers=0 (plain Dataset, no workers needed; avoids multiprocess fork overhead)
+    val_loader = MonaiDataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0) if len(val_ds) > 0 else None
     unlabeled_loader = MonaiDataLoader(unlabeled_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers) if len(unlabeled_ds) > 0 else None
 
-    return labeled_loader, unlabeled_loader, val_loader
+    # Return val_transforms so callers can pass the EXACT same Compose instance to Invertd.
+    # Invertd matches transforms by object identity; a separately-constructed Compose fails.
+    return labeled_loader, unlabeled_loader, val_loader, val_transforms
 
 
 def build_all_volumes_loader(config):

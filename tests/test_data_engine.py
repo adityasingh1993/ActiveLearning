@@ -40,8 +40,9 @@ def test_build_unlabeled_dataset(synthetic_data_dir, sample_config):
 def test_build_dataloaders(synthetic_data_dir, sample_config):
     sample_config.data_dir = str(synthetic_data_dir)
     sample_config.use_cache_dataset = False
-    labeled, unlabeled, val = build_dataloaders(sample_config)
+    labeled, unlabeled, val, val_transforms = build_dataloaders(sample_config)
     assert labeled is not None or unlabeled is not None or val is not None
+    assert val_transforms is not None  # must be the Compose instance for Invertd identity matching
 
 
 def test_base_transforms(sample_config):

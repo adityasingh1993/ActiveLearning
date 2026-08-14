@@ -117,15 +117,13 @@ class QueryEngine:
         if self.config:
             try:
                 from hassl.data.data_engine import get_base_transforms
-                from monai.transforms import Invertd
+                from hassl.compat import build_invertd
 
                 val_transform = get_base_transforms(self.config, keys=["image"], is_training=False)
-                inv_transform = Invertd(
+                inv_transform = build_invertd(
                     keys=["pred"],
                     transform=val_transform,
                     orig_keys=["image"],
-                    meta_keys=["pred_meta_dict"],
-                    orig_meta_keys=["image_meta_dict"],
                     nearest_interp=True,
                     to_tensor=True,
                 )

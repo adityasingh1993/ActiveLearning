@@ -6,7 +6,7 @@ data_dir: "./data"
 image_suffix: ".mha"
 label_suffix: ".seg.nrrd"
 num_classes: 1                    # 1 = binary segmentation (sigmoid), >1 = multi-class (softmax)
-spacing: [0.100, 0.0386, 0.0982]  # Spacingd pixdim — ultrasound volume voxel resolution (mm per voxel)
+spacing: [1.0, 1.0, 1.0]           # Spacingd pixdim — 3D volume voxel resolution (mm per voxel)
 spatial_size: [128, 128, 128]     # Resized spatial target dimensions
 preprocessing_mode: "resize"      # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
 patch_size: [96, 96, 96]          # Patch crop size when preprocessing_mode == "patch"

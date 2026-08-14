@@ -143,7 +143,7 @@ def run_train(config: HASSLConfig, round_num: int = 0, pretrained_weights: Optio
     tracker.log_metrics({"al_round": round_num}, step=0)
 
     # Build dataloaders
-    labeled_loader, unlabeled_loader, val_loader = build_dataloaders(config)
+    labeled_loader, unlabeled_loader, val_loader, val_transforms = build_dataloaders(config)
     print(f"  Labeled volumes: {len(labeled_loader.dataset)}")
     print(f"  Unlabeled volumes: {len(unlabeled_loader.dataset)}")
     print(f"  Validation volumes: {len(val_loader.dataset)}")
@@ -165,6 +165,7 @@ def run_train(config: HASSLConfig, round_num: int = 0, pretrained_weights: Optio
         val_loader=val_loader,
         tracker=tracker,
         pretrained_weights=pretrained_weights,
+        val_transform=val_transforms,  # same Compose instance used by val DataLoader → Invertd works
     )
 
     # Resume from checkpoint if available for this round, or load weights from previous AL round
@@ -218,7 +219,7 @@ def run_query(config: HASSLConfig, round_num: int = 1) -> None:
     )
 
     # Load dataloaders
-    labeled_loader, unlabeled_loader, val_loader = build_dataloaders(config)
+    labeled_loader, unlabeled_loader, val_loader, val_transforms = build_dataloaders(config)
 
     if unlabeled_loader is None or len(unlabeled_loader.dataset) == 0:
         print("  No unlabeled volumes remaining to query.")
@@ -228,7 +229,7 @@ def run_query(config: HASSLConfig, round_num: int = 1) -> None:
     # Load trained models
     trainer = HASSLTrainer(config=config, labeled_loader=labeled_loader,
                            unlabeled_loader=unlabeled_loader, val_loader=val_loader,
-                           tracker=tracker)
+                           tracker=tracker, val_transform=val_transforms)
 
     best_ckpt = Path(config.checkpoint_dir) / "best_checkpoint.pth"
     if best_ckpt.exists():
@@ -335,7 +336,7 @@ def run_export_preseg(config: HASSLConfig) -> None:
     print("HASSL: Exporting AI Pre-segmentation Masks")
     print("=" * 60)
 
-    labeled_loader, unlabeled_loader, val_loader = build_dataloaders(config)
+    labeled_loader, unlabeled_loader, val_loader, val_transforms = build_dataloaders(config)
 
     if unlabeled_loader is None or len(unlabeled_loader.dataset) == 0:
         print("  No unlabeled volumes available.")
@@ -344,7 +345,7 @@ def run_export_preseg(config: HASSLConfig) -> None:
     tracker = ExperimentTracker(backend="none")
     trainer = HASSLTrainer(config=config, labeled_loader=labeled_loader,
                            unlabeled_loader=unlabeled_loader, val_loader=val_loader,
-                           tracker=tracker)
+                           tracker=tracker, val_transform=val_transforms)
 
     best_ckpt = Path(config.checkpoint_dir) / "best_checkpoint.pth"
     if best_ckpt.exists():
@@ -399,7 +400,7 @@ def run_auto_loop(config: HASSLConfig, start_round: int = 0, pretrained_weights:
         print(f"{'=' * 60}")
 
         # Build current dataloaders
-        labeled_loader, unlabeled_loader, val_loader = build_dataloaders(config)
+        labeled_loader, unlabeled_loader, val_loader, val_transforms = build_dataloaders(config)
 
         if unlabeled_loader and len(unlabeled_loader.dataset) > 0:
             # Load best model from previous round
@@ -409,7 +410,7 @@ def run_auto_loop(config: HASSLConfig, start_round: int = 0, pretrained_weights:
             tracker = ExperimentTracker(backend="none")
             trainer = HASSLTrainer(config=config, labeled_loader=labeled_loader,
                                    unlabeled_loader=unlabeled_loader, val_loader=val_loader,
-                                   tracker=tracker)
+                                   tracker=tracker, val_transform=val_transforms)
             best_ckpt = Path(config.checkpoint_dir) / "best_checkpoint.pth"
             if best_ckpt.exists():
                 trainer.load_checkpoint(str(best_ckpt))

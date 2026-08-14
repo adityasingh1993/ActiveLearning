@@ -5,7 +5,16 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 
-warnings.filterwarnings("ignore", message=".*always_return_as_numpy.*")
+from hassl.compat import (
+    MONAI_GE_15,
+    build_invertd,
+    build_hd95_metric,
+    build_confusion_metric,
+)
+
+# Suppress MONAI 1.5+ internal deprecation warnings that are non-actionable for users
+if MONAI_GE_15:
+    warnings.filterwarnings("ignore", message=".*always_return_as_numpy.*")
 
 logger = logging.getLogger(__name__)
 import torch.nn as nn
@@ -163,7 +172,7 @@ class HASSLTrainer:
     """Unified trainer supporting UA-Mean Teacher (prototype) and CPS (full) modes."""
 
     def __init__(self, config, labeled_loader, unlabeled_loader, val_loader,
-                 tracker: ExperimentTracker, pretrained_weights=None):
+                 tracker: ExperimentTracker, pretrained_weights=None, val_transform=None):
         self.config = config
         self.labeled_loader = labeled_loader
         self.unlabeled_loader = unlabeled_loader
@@ -221,10 +230,18 @@ class HASSLTrainer:
         self.spatial_aug = get_spatial_augmentation(keys=["image"])
         self.intensity_aug = get_intensity_augmentation(keys=["image"])
 
-        # Build and store val transform for Invertd-based original-space volume calculation.
-        # Val always uses Resized (resize or patch mode) so Invertd is well-defined.
-        from ..data.data_engine import get_base_transforms
-        self.val_transform = get_base_transforms(config, keys=["image", "label"], is_training=False)
+        # Store val transform for Invertd-based original-space volume calculation.
+        # CRITICAL: must be the EXACT same Compose instance passed to the val DataLoader.
+        # Invertd replays applied_operations by matching transform entries; a separately-
+        # constructed Compose (even with identical config) has different object IDs and
+        # will fail to find a matching entry → 'validate Invertd failed for sample 0'.
+        # build_dataloaders() now returns val_transforms; callers should pass it here.
+        if val_transform is not None:
+            self.val_transform = val_transform
+        else:
+            # Fallback for callers that don't yet pass val_transform (backward-compatible).
+            from ..data.data_engine import get_base_transforms
+            self.val_transform = get_base_transforms(config, keys=["image", "label"], is_training=False)
 
         # Load pre-trained SSL weights if available
         if pretrained_weights and os.path.exists(pretrained_weights):
@@ -495,23 +512,17 @@ class HASSLTrainer:
         self.dice_metric.reset()
 
         from monai.inferers import SlidingWindowInferer
-        from monai.metrics import ConfusionMatrixMetric, HausdorffDistanceMetric, DiceMetric
+        from monai.metrics import DiceMetric
 
         dice_metric_lcc = DiceMetric(include_background=False if self.num_classes > 1 else True, reduction="mean")
-        confusion_metric = ConfusionMatrixMetric(
-            include_background=False if self.num_classes > 1 else True,
-            metric_name=["precision", "recall"],
-            reduction="mean"
+        confusion_metric = build_confusion_metric(
+            include_background=False if self.num_classes > 1 else True
         )
-        confusion_metric_lcc = ConfusionMatrixMetric(
-            include_background=False if self.num_classes > 1 else True,
-            metric_name=["precision", "recall"],
-            reduction="mean"
+        confusion_metric_lcc = build_confusion_metric(
+            include_background=False if self.num_classes > 1 else True
         )
-        hd95_metric = HausdorffDistanceMetric(
-            include_background=False if self.num_classes > 1 else True,
-            percentile=95,
-            reduction="mean"
+        hd95_metric = build_hd95_metric(
+            include_background=False if self.num_classes > 1 else True
         )
 
         pred_vols_mm3 = []
@@ -593,15 +604,12 @@ class HASSLTrainer:
             confusion_metric_lcc(y_pred=preds_binary_lcc, y=targets)
 
             from monai.data import decollate_batch, MetaTensor
-            from monai.transforms import Invertd
 
             decollated_samples = decollate_batch(batch_data)
-            inv_transform = Invertd(
+            inv_transform = build_invertd(
                 keys=["pred", "pred_lcc", "label"],
                 transform=self.val_transform,
                 orig_keys=["image", "image", "label"],
-                meta_keys=["pred_meta_dict", "pred_lcc_meta_dict", "label_meta_dict"],
-                orig_meta_keys=["image_meta_dict", "image_meta_dict", "label_meta_dict"],
                 nearest_interp=True,
                 to_tensor=True,
             )
