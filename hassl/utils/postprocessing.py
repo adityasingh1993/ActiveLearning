@@ -7,30 +7,32 @@ Connected component filtering and morphological post-processing utilities for 3D
 import numpy as np
 import scipy.ndimage as ndi
 import torch
-from typing import Optional
+from typing import List, Optional, Union
 
 
 def apply_keep_largest_cc(
     pred_tensor: torch.Tensor,
-    min_size_voxels: int = 100,
-    target_class: int = 1,
+    n_components: int = 1,
+    min_size_voxels: int = 0,
+    target_class: Optional[int] = None,
     threshold: float = 0.5,
 ) -> torch.Tensor:
-    """Keep only the single largest 3D connected component for Component 1 (target foreground).
+    """Keep top N (default n_components=1) largest 3D connected components across foreground classes.
 
-    Identifies 3D connected components for class/component 1 (or foreground channel),
-    retains ONLY the largest connected component by voxel count, and zeroes out all smaller
-    satellite noise blobs (disconnected false positive fragments).
+    Ranks 3D connected components by voxel volume and retains ONLY the top `n_components`
+    largest components, zeroing out all smaller satellite fragments. Does NOT require a hard
+    voxel minimum size threshold when min_size_voxels=0.
 
     Args:
         pred_tensor: Prediction tensor [B, C, D, H, W] or integer label map [B, D, H, W].
-        min_size_voxels: Minimum voxel count for the largest component to be retained.
-        target_class: Target component label/class index to filter (default 1).
+        n_components: Number of largest connected components to keep (default 1).
+        min_size_voxels: Optional minimum voxel size threshold (default 0 = no size cutoff).
+        target_class: Specific class label/channel index to filter. None = filter all foreground classes (default None).
         threshold: Binarization probability threshold for soft activations (default 0.5).
 
     Returns:
-        Tensor of exact same shape, type, and device as pred_tensor, with only the largest
-        connected component retained for component 1.
+        Tensor of exact same shape, type, and device as pred_tensor with only the top n_components
+        largest connected components retained per foreground class.
     """
     device = pred_tensor.device
     arr = pred_tensor.detach().cpu().numpy()
@@ -43,22 +45,25 @@ def apply_keep_largest_cc(
             # Shape [B, C, D, H, W]
             num_channels = arr.shape[1]
             if num_channels == 1:
-                # Binary single-channel: channel 0 is Component 1 (target foreground)
-                mask = (arr[b, 0] == target_class) if is_discrete else (arr[b, 0] > threshold)
+                # Binary single-channel: channel 0 is foreground
+                mask = (arr[b, 0] == 1) if is_discrete else (arr[b, 0] > threshold)
                 if mask.any():
                     labeled_arr, num = ndi.label(mask)
                     if num > 0:
                         counts = np.bincount(labeled_arr.ravel())
-                        counts[0] = 0  # exclude background 0
-                        if counts.max() > 0:
-                            max_lab = counts.argmax()
-                            largest_size = counts[max_lab]
-                            if largest_size >= min_size_voxels:
-                                out[b, 0] = (labeled_arr == max_lab).astype(arr.dtype)
+                        counts[0] = 0  # ignore background 0
+                        sorted_labels = np.argsort(counts)[::-1]
+                        top_labels = [
+                            lbl for lbl in sorted_labels[:n_components]
+                            if counts[lbl] >= min_size_voxels and counts[lbl] > 0
+                        ]
+                        if top_labels:
+                            keep_mask = np.isin(labeled_arr, top_labels)
+                            out[b, 0] = np.where(keep_mask, arr[b, 0], 0).astype(arr.dtype)
             else:
-                # Multi-channel: apply to channel target_class (or all non-bg channels if target_class=None)
+                # Multi-channel: filter non-background channels (c >= 1) or target_class
                 for c in range(num_channels):
-                    if c == 0:
+                    if c == 0 and target_class != 0:
                         out[b, 0] = arr[b, 0]
                         continue
                     if target_class is not None and c != target_class:
@@ -70,26 +75,34 @@ def apply_keep_largest_cc(
                         if num > 0:
                             counts = np.bincount(labeled_arr.ravel())
                             counts[0] = 0
-                            if counts.max() > 0:
-                                max_lab = counts.argmax()
-                                largest_size = counts[max_lab]
-                                if largest_size >= min_size_voxels:
-                                    out[b, c] = (labeled_arr == max_lab).astype(arr.dtype)
+                            sorted_labels = np.argsort(counts)[::-1]
+                            top_labels = [
+                                lbl for lbl in sorted_labels[:n_components]
+                                if counts[lbl] >= min_size_voxels and counts[lbl] > 0
+                            ]
+                            if top_labels:
+                                keep_mask = np.isin(labeled_arr, top_labels)
+                                out[b, c] = np.where(keep_mask, arr[b, c], 0).astype(arr.dtype)
 
         elif arr.ndim == 4:
             # Shape [B, D, H, W] discrete integer label map
-            out[b] = arr[b].copy()  # preserve other label classes
-            mask = arr[b] == target_class
-            if mask.any():
-                labeled_arr, num = ndi.label(mask)
-                if num > 0:
-                    counts = np.bincount(labeled_arr.ravel())
-                    counts[0] = 0
-                    if counts.max() > 0:
-                        max_lab = counts.argmax()
-                        largest_size = counts[max_lab]
-                        out[b][mask] = 0  # zero out component 1 voxels first
-                        if largest_size >= min_size_voxels:
-                            out[b][labeled_arr == max_lab] = target_class
+            out[b] = arr[b].copy()  # preserve background and other classes by default
+            classes_to_filter = [target_class] if target_class is not None else np.unique(arr[b])[np.unique(arr[b]) != 0]
+            for cls in classes_to_filter:
+                mask = arr[b] == cls
+                if mask.any():
+                    labeled_arr, num = ndi.label(mask)
+                    if num > 0:
+                        counts = np.bincount(labeled_arr.ravel())
+                        counts[0] = 0
+                        sorted_labels = np.argsort(counts)[::-1]
+                        top_labels = [
+                            lbl for lbl in sorted_labels[:n_components]
+                            if counts[lbl] >= min_size_voxels and counts[lbl] > 0
+                        ]
+                        out[b][mask] = 0  # clear all voxels of this class first
+                        if top_labels:
+                            keep_mask = np.isin(labeled_arr, top_labels)
+                            out[b][keep_mask] = cls
 
     return torch.from_numpy(out).to(device)

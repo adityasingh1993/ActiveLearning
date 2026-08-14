@@ -52,3 +52,20 @@ def test_apply_keep_largest_cc_component_1():
     assert filtered[0, 0, 25:27, 25:27, 25:27].sum() == 0
     assert filtered.sum() == 125
 
+def test_apply_keep_largest_cc_n_components_1_no_voxel_cutoff():
+    from hassl.utils.postprocessing import apply_keep_largest_cc
+    # Construct tensor with two small blobs: size 12 and size 4 (both < 100 voxels)
+    t = torch.zeros(1, 1, 16, 16, 16)
+    t[0, 0, 2:4, 2:4, 2:5] = 1.0  # Component A (2x2x3 = 12 voxels)
+    t[0, 0, 10:12, 10:12, 10:11] = 1.0  # Component B (2x2x1 = 4 voxels)
+
+    # n_components=1, min_size_voxels=0 (no hard voxel cutoff)
+    filtered = apply_keep_largest_cc(t, n_components=1, min_size_voxels=0)
+
+    # Top 1 largest component (12 voxels) must be kept even though < 100
+    assert filtered[0, 0, 2:4, 2:4, 2:5].sum() == 12
+    # Component B (4 voxels) must be zeroed out
+    assert filtered[0, 0, 10:12, 10:12, 10:11].sum() == 0
+    assert filtered.sum() == 12
+
+
