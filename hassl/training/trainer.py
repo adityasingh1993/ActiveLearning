@@ -601,13 +601,12 @@ class HASSLTrainer:
                         orig_affine = meta['original_affine'][b]
 
                 try:
-                    from monai.transforms import Invertd, Compose
-                    # Filter val_transform to only spatial invertible transforms (Orientationd, Spacingd, Resized).
-                    # Non-invertible transforms like LoadImaged and ScaleIntensityRangePercentilesd cause
-                    # MONAI's Invertd to fail with a RuntimeError on Resized.inverse.
+                    from monai.transforms import Invertd, Compose, Resized, Orientationd
+                    # Filter val_transform to only spatial invertibles (Resized, Orientationd).
+                    # Spacingd inverse resampling can attempt gigabyte memory allocations if voxel ratio is high.
                     invertible_val_tf = Compose([
                         t for t in self.val_transform.transforms
-                        if hasattr(t, 'inverse') and callable(getattr(t, 'inverse', None))
+                        if isinstance(t, (Resized, Orientationd))
                     ])
                     inv_transform = Invertd(
                         keys=["pred", "pred_lcc", "label"],

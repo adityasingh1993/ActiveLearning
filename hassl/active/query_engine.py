@@ -117,12 +117,12 @@ class QueryEngine:
         if self.config:
             try:
                 from hassl.data.data_engine import get_base_transforms
-                from monai.transforms import Invertd, Compose
+                from monai.transforms import Invertd, Compose, Resized, Orientationd
 
                 val_transform = get_base_transforms(self.config, keys=["image"], is_training=False)
                 invertible_val_tf = Compose([
                     t for t in val_transform.transforms
-                    if hasattr(t, 'inverse') and callable(getattr(t, 'inverse', None))
+                    if isinstance(t, (Resized, Orientationd))
                 ])
                 inv_transform = Invertd(
                     keys=["pred"],

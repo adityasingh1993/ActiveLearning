@@ -28,7 +28,7 @@ class HASSLConfig:
     image_suffix: str = ".mha"
     label_suffix: str = ".seg.nrrd"
     num_classes: int = 1  # 1 = binary (sigmoid), >1 = multi-class (softmax)
-    spacing: Tuple[float, float, float] = (0.100, 0.0386, 0.0982)  # Spacingd pixdim (mm per voxel)
+    spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)  # Spacingd pixdim (mm per voxel)
     spatial_size: Tuple[int, int, int] = (128, 128, 128)  # Resize target (used in "resize" mode and for val/inference)
     preprocessing_mode: str = "resize"  # "resize" (Spacingd+Resized) or "patch" (Spacingd+RandCropByPosNegLabeld)
     patch_size: Tuple[int, int, int] = (96, 96, 96)  # Training crop size when preprocessing_mode == "patch"

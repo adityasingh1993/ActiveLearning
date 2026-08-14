@@ -1,10 +1,13 @@
 import os
 import glob
 import json
+import logging
 import random
 import re
 from pathlib import Path
 from typing import List, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 from monai.data import CacheDataset, PersistentDataset, Dataset, DataLoader as MonaiDataLoader
 from monai.transforms import (
@@ -208,12 +211,24 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
     resize_mode = tuple(["trilinear" if k == "image" else "nearest" for k in keys])
     preprocessing_mode = getattr(config, 'preprocessing_mode', 'resize')
 
+    # Guard against corrupted or ultra-fine spacing values (< 0.1 mm) that cause 300GB+ OOM allocation in Spacingd
+    use_spacingd = False
+    if config.spacing and all(s >= 0.1 for s in config.spacing):
+        use_spacingd = True
+    else:
+        logger.warning(
+            "[HASSL DataEngine] Skipping Spacingd because config.spacing %s contains micro-spacing values (<0.1mm) "
+            "that cause 300GB+ OOM memory allocations. Relying on Resized(spatial_size=%s) for safe spatial normalization.",
+            getattr(config, 'spacing', None), getattr(config, 'spatial_size', (128, 128, 128))
+        )
+
     transforms = [
         LoadImaged(keys=keys, image_only=False),
         EnsureChannelFirstd(keys=keys),
         Orientationd(keys=keys, axcodes="RAS"),
-        Spacingd(keys=keys, pixdim=config.spacing, mode=mode),
     ]
+    if use_spacingd:
+        transforms.append(Spacingd(keys=keys, pixdim=config.spacing, mode=mode))
 
     # Normalize label values (e.g. 255 -> 1) to clean binary masks
     if "label" in keys and getattr(config, 'num_classes', 1) == 1:
