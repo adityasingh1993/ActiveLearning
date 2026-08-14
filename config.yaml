@@ -58,6 +58,16 @@ al_rounds: 3
 al_strategy: "hybrid"
 al_hybrid_weights: [0.4, 0.3, 0.3]   # BALD, CoreSet, Disagreement
 
+# ─── Pseudo-Label Auto-Promotion Quality Gates ────────────────────────
+pseudo_confidence_threshold: 0.85     # Gate 1: Min foreground certainty (85%)
+pseudo_mc_passes: 5                  # Gate 2: Epistemic MC Dropout forward passes
+pseudo_mc_var_threshold: 0.05        # Gate 2: Max allowed epistemic variance
+pseudo_tta_passes: 8                 # Gate 3: Aleatoric TTA augmented passes
+pseudo_tta_var_threshold: 0.02       # Gate 3: Max allowed aleatoric variance
+pseudo_tta_flip: true                # Gate 3: Random spatial axis flips during TTA
+pseudo_tta_intensity_std: 0.02       # Gate 3: Gaussian intensity jitter std during TTA
+
+
 # ─── Experiment Tracking ──────────────────────────────────────────────
 tracker: "wandb"                  # "wandb", "mlflow", or "none"
 project_name: "hassl-ultrasound"
