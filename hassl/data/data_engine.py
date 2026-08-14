@@ -28,6 +28,7 @@ from monai.transforms import (
 )
 
 from .augmentations import get_strong_augmentation
+from .label_utils import NormalizeLabelsInDatasetd
 
 
 class AspectRatioResizeWithPadd(MapTransform):
@@ -284,9 +285,18 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
     if use_spacingd:
         transforms.append(Spacingd(keys=keys, pixdim=config.spacing, mode=mode))
 
-    # Normalize label values (e.g. 255 -> 1) to clean binary masks
-    if "label" in keys and getattr(config, 'num_classes', 1) == 1:
-        transforms.append(AsDiscreted(keys=["label"], threshold=0.5))
+    # Label normalisation — applied after Spacingd (if any) so resampling happens first.
+    if "label" in keys:
+        num_classes = getattr(config, 'num_classes', 1)
+        label_names = getattr(config, 'label_names', None)
+        if num_classes == 1:
+            # Binary: threshold to {0, 1} (handles NRRD files where foreground = 255 etc.)
+            transforms.append(AsDiscreted(keys=["label"], threshold=0.5))
+        elif label_names and isinstance(label_names, dict):
+            # Multi-class with explicit label map: remap non-contiguous values to 0,1,2,...,N
+            # e.g. label_names={0:'bg', 1:'bladder', 3:'urethra', 7:'sphincter'} -> 0,1,2,3
+            transforms.append(NormalizeLabelsInDatasetd(keys=["label"], label_names=label_names))
+        # else: multi-class without label_names — trust the NRRD values are already contiguous
 
     # Intensity normalisation (image only) — placed before spatial crop so
     # crop statistics reflect the normalised distribution.

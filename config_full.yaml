@@ -7,6 +7,9 @@ image_suffix: ".mha"
 label_suffix: ".seg.nrrd"
 num_classes: 1                    # 1 = binary segmentation (sigmoid), >1 = multi-class (softmax)
 spacing: [1.0, 1.0, 1.0]           # Spacingd pixdim — 3D volume voxel resolution (mm per voxel)
+label_names: null                  # Multi-class label map: {0: 'background', 1: 'bladder', 3: 'urethra'}
+                                   # null = binary mode (AsDiscreted threshold=0.5)
+                                   # dict = NormalizeLabelsInDatasetd remaps to contiguous 0,1,2,...
 spatial_size: [128, 128, 128]     # Resized spatial target dimensions
 preprocessing_mode: "resize"      # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
 patch_size: [96, 96, 96]          # Patch crop size when preprocessing_mode == "patch"
@@ -16,6 +19,10 @@ cache_dir: "./cache"
 use_cache_dataset: true           # Cache preprocessed tensors in RAM for fast training epochs
 patient_id_regex: null            # Custom regex for extracting patient ID prefix from volume filename
 server_cache_max_volumes: 20      # Max 3D volumes held in Web UI server LRU image/mask cache
+lcc_min_size_voxels: 100          # LCC satellite filter: discard connected components smaller than
+                                   # this (voxel count at spatial_size resolution). 100 is safe for
+                                   # medium targets (bladder/prostate ~1000-10000 voxels at 128^3).
+                                   # Set to 0 to disable filtering entirely.
 
 # ─── Compute ──────────────────────────────────────────────────────────
 compute_mode: "full"              # "full" (24GB VRAM dual-network CPS)

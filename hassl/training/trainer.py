@@ -89,8 +89,20 @@ def compute_multiscale_loss(criterion, preds, target):
         return l.mean() if l.ndim > 0 else l
 
 
-def apply_keep_largest_cc(pred_tensor: torch.Tensor) -> torch.Tensor:
-    """Keep only the largest connected component for each sample/channel in a binary/multiclass prediction batch."""
+def apply_keep_largest_cc(pred_tensor: torch.Tensor, min_size_voxels: int = 100) -> torch.Tensor:
+    """Keep only the largest CC and remove satellite predictions smaller than min_size_voxels.
+
+    Args:
+        pred_tensor: Binary prediction tensor [B, C, D, H, W].
+        min_size_voxels: Any connected component with fewer voxels than this is discarded,
+            even if it is the only component. Default 100 is safe for medium-sized targets
+            (bladder/prostate at 128^3 are 1000-10000 voxels). Set via config.lcc_min_size_voxels.
+
+    Two-pass approach:
+      Pass 1 — find and keep the largest CC.
+      Pass 2 — zero out any component (including the largest) below min_size_voxels threshold.
+    This removes satellite noise blobs that inflate FP rates and bias volume estimates upward.
+    """
     import scipy.ndimage as ndi
 
     device = pred_tensor.device
@@ -103,12 +115,18 @@ def apply_keep_largest_cc(pred_tensor: torch.Tensor) -> torch.Tensor:
             if not mask.any():
                 continue
             labeled_arr, num = ndi.label(mask)
-            if num > 0:
-                counts = np.bincount(labeled_arr.ravel())
-                counts[0] = 0  # Ignore background label
-                if counts.max() > 0:
-                    max_lab = counts.argmax()
-                    out[b, c] = (labeled_arr == max_lab).astype(arr.dtype)
+            if num == 0:
+                continue
+            counts = np.bincount(labeled_arr.ravel())
+            counts[0] = 0  # exclude background
+            if counts.max() == 0:
+                continue
+            max_lab = counts.argmax()
+            largest_size = counts[max_lab]
+            # Keep largest CC only if it meets the minimum size threshold
+            if largest_size >= min_size_voxels:
+                out[b, c] = (labeled_arr == max_lab).astype(arr.dtype)
+            # else: all components are too small — output stays zero (no prediction)
 
     return torch.from_numpy(out).to(device)
 
@@ -548,7 +566,8 @@ class HASSLTrainer:
                 else:
                     preds_binary = torch.argmax(preds, dim=1, keepdim=True).float()
 
-            preds_binary_lcc = apply_keep_largest_cc(preds_binary)
+            lcc_min_size_voxels = getattr(self.config, 'lcc_min_size_voxels', 100)
+            preds_binary_lcc = apply_keep_largest_cc(preds_binary, min_size_voxels=lcc_min_size_voxels)
 
             if first_batch_sample is None and should_log_image:
                 # Compute MC Dropout epistemic variance & TTA aleatoric variance 3D maps for sample 0
@@ -614,16 +633,49 @@ class HASSLTrainer:
                 to_tensor=True,
             )
 
+            # Fix 1: extract affine-derived voxel volume ONCE per sample, BEFORE try/except.
+            # Previously, the fallback path used config.spacing (default 1.0,1.0,1.0 mm) which
+            # produced wrong mm³ units and made val_volume_r2 meaningless. Now both the Invertd
+            # success path and the fallback use the same scanner-native voxel volume.
+            lcc_min_size = getattr(self.config, 'lcc_min_size_voxels', 100)
+
             for b, sample in enumerate(decollated_samples):
-                orig_affine = None
+                # --- Affine-derived voxel volume (scanner-native mm³) ---
+                voxel_vol_mm3 = None
+
+                # Priority 1: original_affine from MetaTensor meta (most accurate — pre-transform)
                 if hasattr(inputs, 'meta'):
-                    orig_affine = inputs.meta.get('original_affine', None)
-                    if orig_affine is not None and torch.is_tensor(orig_affine):
-                        orig_affine = orig_affine[b]
-                if 'image_meta_dict' in batch_data:
+                    raw = inputs.meta.get('original_affine', None)
+                    if raw is not None:
+                        af = raw[b] if (torch.is_tensor(raw) and raw.ndim > 2) else raw
+                        if torch.is_tensor(af) and af.shape == (4, 4):
+                            voxel_vol_mm3 = float(torch.abs(torch.det(af[:3, :3].float())).item())
+
+                # Priority 2: current affine from MetaTensor meta (post-transform, still usable)
+                if voxel_vol_mm3 is None and hasattr(sample.get('image', None), 'meta'):
+                    raw = sample['image'].meta.get('affine', None)
+                    if raw is not None and torch.is_tensor(raw) and raw.shape == (4, 4):
+                        voxel_vol_mm3 = float(torch.abs(torch.det(raw[:3, :3].float())).item())
+
+                # Priority 3: image_meta_dict (older MONAI data format)
+                if voxel_vol_mm3 is None and 'image_meta_dict' in batch_data:
                     meta = batch_data['image_meta_dict']
-                    if orig_affine is None and 'original_affine' in meta:
-                        orig_affine = meta['original_affine'][b]
+                    for key in ('original_affine', 'affine'):
+                        if key in meta:
+                            raw = meta[key]
+                            af = raw[b] if (torch.is_tensor(raw) and raw.ndim > 2) else raw
+                            if torch.is_tensor(af) and af.shape == (4, 4):
+                                voxel_vol_mm3 = float(torch.abs(torch.det(af[:3, :3].float())).item())
+                                break
+
+                # Fallback: config.spacing (still wrong for micro-spacing but better than silence)
+                if voxel_vol_mm3 is None or voxel_vol_mm3 <= 0:
+                    voxel_vol_mm3 = float(
+                        self.config.spacing[0] * self.config.spacing[1] * self.config.spacing[2]
+                    )
+                    logger.debug(
+                        "[HASSL] validate sample %d: affine not found, using config.spacing for voxel volume", b
+                    )
 
                 try:
                     # Wrap predictions as MetaTensors carrying the input's transform trace.
@@ -653,33 +705,18 @@ class HASSLTrainer:
                     inv_pred_lcc = inv_out["pred_lcc"]
                     inv_gt = inv_out["label"]
 
-                    if orig_affine is not None and torch.is_tensor(orig_affine):
-                        orig_voxel_vol = float(
-                            torch.abs(torch.det(orig_affine[:3, :3].float())).item()
-                        )
-                    else:
-                        orig_voxel_vol = float(
-                            self.config.spacing[0]
-                            * self.config.spacing[1]
-                            * self.config.spacing[2]
-                        )
-
-                    pv_mm3 = float(inv_pred.sum().item()) * orig_voxel_vol
-                    pv_mm3_lcc = float(inv_pred_lcc.sum().item()) * orig_voxel_vol
-                    gv_mm3 = float(inv_gt.sum().item()) * orig_voxel_vol
+                    pv_mm3 = float(inv_pred.sum().item()) * voxel_vol_mm3
+                    pv_mm3_lcc = float(inv_pred_lcc.sum().item()) * voxel_vol_mm3
+                    gv_mm3 = float(inv_gt.sum().item()) * voxel_vol_mm3
                 except Exception as e:
                     logger.warning(
                         "[HASSL] validate Invertd failed for sample %d, "
                         "falling back to resized-space volume: %s", b, e
                     )
-                    voxel_vol = float(
-                        self.config.spacing[0]
-                        * self.config.spacing[1]
-                        * self.config.spacing[2]
-                    )
-                    pv_mm3 = float(preds_binary[b].sum().item()) * voxel_vol
-                    pv_mm3_lcc = float(preds_binary_lcc[b].sum().item()) * voxel_vol
-                    gv_mm3 = float(targets[b].sum().item()) * voxel_vol
+                    # voxel_vol_mm3 already computed above — same correct units in fallback
+                    pv_mm3 = float(preds_binary[b].sum().item()) * voxel_vol_mm3
+                    pv_mm3_lcc = float(preds_binary_lcc[b].sum().item()) * voxel_vol_mm3
+                    gv_mm3 = float(targets[b].sum().item()) * voxel_vol_mm3
 
                 spacing_b = self.config.spacing
                 if hasattr(inputs, 'meta') and 'affine' in inputs.meta:
