@@ -143,9 +143,88 @@ python -m hassl.pipeline --config config.yaml --phase export-preseg
 python -m hassl.pipeline --config config_full.yaml --phase train
 ```
 
+
 ---
 
-## 6. Troubleshooting
+## 6. Monitoring Training (W&B / MLflow Curves)
+
+Every epoch logs the following curves. Open your W&B project and group them as described below.
+
+### 6.1 Core Validation Curves
+
+| Curve | Expected behaviour | Action if not improving |
+|:---|:---|:---|
+| `val_dice` | Rises from ~0 toward 0.6–0.9 | Check `teacher_pseudo_conf` and `val_pred_fg_fraction` |
+| `val_dice_lcc` | Slightly below or equal to `val_dice` after epoch ~30 | If 0.0 all the time, lower `lcc_min_size_voxels` |
+| `val_recall` | Should improve alongside Dice | If recall is low but precision is high → threshold too high |
+| `val_hd95` | Should decrease (smaller = better) | Noisy in early epochs; trust after epoch 50 |
+
+### 6.2 Teacher vs Student Gap
+
+Three new curves are logged every epoch (prototype / UA-MT mode only):
+
+| Curve | What it measures | Healthy range |
+|:---|:---|:---|
+| `val_dice_teacher` | EMA teacher Dice on validation set | ≥ `val_dice` after warmup |
+| `teacher_pseudo_conf` | Mean teacher sigmoid confidence on **unlabeled** voxels | Rises from ~0.5 → 0.85+ over first 80 epochs |
+| `teacher_pseudo_fg_frac` | Fraction of unlabeled voxels the teacher labels as foreground | Should roughly match your real FG fraction |
+
+Console output shows both side by side each epoch:
+```
+Epoch  15/200 | Loss: 0.7430 | Dice(S): 0.1820 | Dice(T): 0.2140 | Prec: 0.4210 | Rec: 0.2930 | ...
+```
+
+#### Reading the teacher / student gap
+
+```
+val_dice_teacher  >  val_dice    ✅ Healthy — EMA smoothing generalises better than raw student.
+val_dice_teacher  ≈  val_dice    ✅ Fine — teacher closely tracks student.
+val_dice_teacher  <  val_dice    ⚠️  EMA decay too high — teacher is lagging the student.
+                                      Fix: reduce ema_decay (try 0.95 for very small datasets).
+Both stuck near 0.0              ❌  Neither is learning foreground.
+                                      Check teacher_pseudo_fg_frac — if near 0, teacher still
+                                      predicts all background. Unsupervised loss may be dominating
+                                      too early. Increase consistency_rampup_epochs.
+teacher_pseudo_conf stays ~0.5   ❌  Teacher is still random. Too few supervised steps before
+                                      unsupervised loss kicks in. Increase consistency_rampup_epochs.
+teacher_pseudo_fg_frac >> real   ⚠️  Teacher over-predicts foreground (false positives).
+                                      Lower pseudo_confidence_threshold or raise lambda_unsup.
+```
+
+### 6.3 Training Diagnostics
+
+| Curve | What it measures |
+|:---|:---|
+| `consistency_rampup_weight` | Unsupervised loss weight: 0.0 at epoch 0 → 1.0 at `consistency_rampup_epochs` |
+| `uncertainty_mean` | Mean MC Dropout epistemic uncertainty per epoch (should decrease) |
+| `supervised_loss` | Loss on labeled data (should decrease steadily) |
+| `unsupervised_loss` | Consistency loss on unlabeled data (noisy in early epochs) |
+| `train_fg_fraction` | Fraction of foreground voxels in labeled batch |
+| `val_pred_fg_fraction` | Fraction of foreground in model predictions (watch for near-zero collapse) |
+
+### 6.4 Recommended W&B Panel Layout
+
+Create three panel groups in W&B:
+
+**Panel 1 — Learning Progress**
+- `val_dice` + `val_dice_teacher` (same plot) — teacher vs student
+- `val_dice_lcc`
+- `val_hd95`
+
+**Panel 2 — Teacher Quality**
+- `teacher_pseudo_conf`
+- `teacher_pseudo_fg_frac`
+- `consistency_rampup_weight`
+
+**Panel 3 — Loss Dynamics**
+- `supervised_loss`
+- `unsupervised_loss`
+- `uncertainty_mean`
+- `learning_rate`
+
+---
+
+## 7. Troubleshooting
 
 - **`validate Invertd failed for sample 0`**:
   This is now a warning only — metrics are not affected, only the native-space visualization preview. Usually caused by empty `applied_operations` on MetaTensor (e.g., using `CacheDataset` for validation — don't).
@@ -156,9 +235,18 @@ python -m hassl.pipeline --config config_full.yaml --phase train
 - **`model producing near-ZERO predictions`**:
   Printed when `val_pred_fg_fraction < 1e-4`. Usually caused by class imbalance (background dominates). Check that `include_background=False` in losses (already fixed in code).
 
+- **`val_dice_teacher < val_dice` throughout training**:
+  EMA decay is too high for your dataset size. Reduce `ema_decay` from `0.99` toward `0.95`. With `batch_size=1` and fewer than 5 labeled volumes, even `0.99` may be too slow.
+
+- **`teacher_pseudo_conf` stuck at 0.5**:
+  The teacher is still outputting near-uniform probabilities. This means the supervised signal has not had enough time to train the student before the unsupervised loss kicks in. Increase `consistency_rampup_epochs` (try 120–150 for very small datasets).
+
+- **`teacher_pseudo_fg_frac` is near 0.0 after epoch 30**:
+  The teacher is predicting all background on unlabeled data. The pseudo-labels are pure noise — the consistency loss is actively hurting training. Increase `consistency_rampup_epochs` and verify the supervised loss is decreasing.
+
 ---
 
-## 7. Running Unit Tests
+## 8. Running Unit Tests
 
 To verify that all modules, data loaders, neural network architectures, and active learning strategies are functioning cleanly on your CPU:
 
@@ -168,7 +256,7 @@ pytest tests/
 
 Expected output:
 ```
-============================= test session starts =============================
+============================= test session results ==============================
 collected 24 items
 
 tests/test_config.py ........                                            [ 33%]
@@ -177,5 +265,5 @@ tests/test_nrrd_utils.py ..                                             [ 62%]
 tests/test_trainer.py .....                                            [ 83%]
 tests/test_losses.py ....                                               [100%]
 
-============================== 24 passed in 3.42s =============================
+============================== 24 passed in 3.42s ==============================
 ```
