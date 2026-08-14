@@ -22,10 +22,62 @@ from monai.transforms import (
     RandCropByPosNegLabeld,
     RandSpatialCropd,
     ScaleIntensityRangePercentilesd,
-    AsDiscreted
+    AsDiscreted,
+    SpatialPadd,
+    MapTransform,
 )
 
 from .augmentations import get_strong_augmentation
+
+
+class AspectRatioResizeWithPadd(MapTransform):
+    """Resize to fit within spatial_size preserving aspect ratio, then zero-pad to spatial_size.
+
+    Used when Spacingd is skipped (micro-spacing < 0.1mm guard). In that case, bare Resized
+    squishes e.g. a 1200x800x400 ultrasound volume isotropically into 128x128x128, distorting
+    anatomy and teaching the model incorrect shape priors for the target structure.
+
+    This transform instead:
+      1. Computes scale = min(target_dim / current_dim) across all spatial axes.
+      2. Resizes to (D*scale, H*scale, W*scale) — all dims <= spatial_size.
+      3. Symmetrically zero-pads the remaining space to reach spatial_size exactly.
+
+    When Spacingd IS active (spacing >= 0.1mm), the existing bare Resized is used as before
+    because Spacingd already normalises the voxel pitch to a uniform grid.
+    """
+
+    def __init__(self, keys, spatial_size, mode, allow_missing_keys: bool = False):
+        super().__init__(keys, allow_missing_keys)
+        self.spatial_size = tuple(spatial_size)
+        self._mode_list = [mode] if isinstance(mode, str) else list(mode)
+
+    def __call__(self, data):
+        d = dict(data)
+        active_keys = [k for k in self.key_iterator(d)]
+        if not active_keys:
+            return d
+
+        # Derive scale from the first key's spatial shape (all keys are spatially aligned)
+        ref = d[active_keys[0]]
+        current_spatial = ref.shape[1:]           # drop channel dim -> (D, H, W)
+        ndim = len(current_spatial)
+        target = self.spatial_size[:ndim]
+
+        # Scale by the axis that needs to shrink the most so nothing overflows
+        scale = min(target[i] / max(int(current_spatial[i]), 1) for i in range(ndim))
+        scaled = tuple(
+            min(max(int(round(current_spatial[i] * scale)), 1), target[i])
+            for i in range(ndim)
+        )
+
+        # Resize each key with its own interpolation mode
+        for idx, key in enumerate(active_keys):
+            mode_k = self._mode_list[idx] if idx < len(self._mode_list) else self._mode_list[-1]
+            d = Resized(keys=[key], spatial_size=scaled, mode=mode_k)(d)
+
+        # Symmetrically zero-pad all keys to the final target size
+        d = SpatialPadd(keys=active_keys, spatial_size=list(target), method="symmetric", mode="constant")(d)
+        return d
 
 
 def get_or_create_frozen_splits(data_dir: str, image_suffix: str = ".mha", label_suffix: str = ".seg.nrrd", seed: int = 42, patient_id_regex: Optional[str] = None) -> Dict[str, List[str]]:
@@ -270,8 +322,17 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
                 random_size=False,
             ))
     else:
-        # "resize" mode (default), or validation in any mode
-        transforms.append(Resized(keys=keys, spatial_size=config.spatial_size, mode=resize_mode))
+        # Spatial normalisation to fixed grid for whole-volume inference.
+        # When Spacingd ran (use_spacingd=True): voxel pitch is already uniform so isotropic
+        # resize is appropriate.
+        # When Spacingd was skipped (micro-spacing): use aspect-ratio-preserving resize + pad
+        # so anatomy is not distorted by squishing e.g. 1200x800x400 → 128x128x128 isotropically.
+        if use_spacingd:
+            transforms.append(Resized(keys=keys, spatial_size=config.spatial_size, mode=resize_mode))
+        else:
+            transforms.append(AspectRatioResizeWithPadd(
+                keys=keys, spatial_size=config.spatial_size, mode=resize_mode
+            ))
 
     if is_training and apply_strong_aug:
         transforms.append(get_strong_augmentation(keys=keys))
