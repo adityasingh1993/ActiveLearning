@@ -73,6 +73,21 @@ class HASSLConfig:
     lcc_fill_holes: bool = True  # Apply 3D binary hole filling inside LCC organ masks
     enable_crypto_ledger: bool = True  # SHA-256 cryptographic transaction hashing for data lineage
 
+    # ─── QC Gate ─────────────────────────────────────────────────────────
+    enable_qc_gate: bool = True              # Automated quality control gate after inference
+    qc_uncertainty_threshold: float = 0.35  # Max mean foreground entropy before flagging
+    qc_volume_min_voxels: int = 500          # Anatomical prior: minimum bladder volume (voxels)
+    qc_volume_max_voxels: int = 150_000      # Anatomical prior: maximum bladder volume (voxels)
+    qc_max_cc_count: int = 3                 # Max connected components before flagging
+    qc_surface_convexity_min: float = 0.70   # Minimum surface convexity ratio (0–1)
+
+    # ─── MedSAM Foundation Model ─────────────────────────────────────────
+    medsam_enabled: bool = False             # Opt-in; downloads weights on first use (~2–5GB)
+    medsam_variant: str = "sam_med3d"        # "sam_med3d" | "medsam2"
+    medsam_checkpoint_dir: str = "./checkpoints/medsam"
+    medsam_qc_dice_threshold: float = 0.50  # Min Dice vs. MedSAM before QC flag
+    medsam_bootstrap_rounds: int = 1         # Use MedSAM pseudo-labels for rounds 0..N
+
     # Full mode additional network
     net_b_backbone: str = "res_dynunet"  # "res_dynunet" (Dual-CNN CPS) or "swinunetr"
     swinunetr_feature_size: int = 48

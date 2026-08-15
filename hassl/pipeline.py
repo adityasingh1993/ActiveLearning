@@ -293,6 +293,78 @@ def run_query(config: HASSLConfig, round_num: int = 1) -> None:
     )
     print(f"  Saved to: {config.preseg_dir}/")
 
+    # ── QC Gate: evaluate exported pre-segmentations ──────────────────────
+    if getattr(config, "enable_qc_gate", True):
+        from hassl.utils.qc_gate import QCGate
+        from hassl.active.review_queue import ReviewQueue
+        from hassl.utils.medsam_adapter import MedSAMAdapter
+
+        qc_gate = QCGate.from_config(config)
+        review_queue = ReviewQueue(
+            queue_path=str(Path(config.log_dir) / "human_review_queue.json")
+        )
+
+        medsam: Optional[MedSAMAdapter] = None
+        if getattr(config, "medsam_enabled", False) and round_num <= getattr(config, "medsam_bootstrap_rounds", 1):
+            print("  [MedSAM] Loading foundation model for QC cross-check...")
+            medsam = MedSAMAdapter.from_config(config)
+
+        print(f"\n  Running QC Gate on {len(queried_ids)} queried volumes...")
+        qc_passed, qc_failed = [], []
+
+        model_A.eval()
+        device = next(model_A.parameters()).device
+        with torch.no_grad():
+            for batch in unlabeled_loader:
+                imgs = batch["image"].to(device)
+                vids = batch.get("id", batch.get("volume_id", []))
+                vids = [v for v in vids if v in queried_ids]
+                if not vids:
+                    continue
+                out = model_A(imgs)
+                if isinstance(out, (list, tuple)):
+                    out = out[0]
+                if out.ndim == 6:
+                    out = out[:, 0]
+
+                for i, vol_id in enumerate(vids):
+                    logit = out[i : i + 1]
+                    medsam_mask = None
+                    if medsam is not None:
+                        vol_np = imgs[i, 0].cpu().numpy()
+                        medsam_mask = medsam.infer_volume(vol_np)
+
+                    report = qc_gate.evaluate_tensor(
+                        volume_id=vol_id,
+                        logit_tensor=logit,
+                        medsam_mask_np=medsam_mask,
+                        threshold=getattr(config, "prediction_threshold", 0.5),
+                    )
+                    tracker.log_metrics({
+                        f"qc/{vol_id}/score": report.score,
+                        f"qc/{vol_id}/passed": int(report.passed),
+                    })
+
+                    if report.passed:
+                        qc_passed.append(vol_id)
+                    else:
+                        qc_failed.append(vol_id)
+                        preseg_path = str(Path(config.preseg_dir) / f"{vol_id}_preseg.nii.gz")
+                        review_queue.add_failed(
+                            volume_id=vol_id,
+                            qc_flags=report.flags,
+                            qc_score=report.score,
+                            sha256_hash=report.sha256_hash,
+                            round_num=round_num,
+                            preseg_path=preseg_path if Path(preseg_path).exists() else None,
+                        )
+
+        print(f"\n  QC Gate Results:")
+        print(f"    ✓ Passed : {len(qc_passed)}/{len(queried_ids)}")
+        print(f"    ✗ Failed : {len(qc_failed)}/{len(queried_ids)} → routed to human review queue")
+        if qc_failed:
+            review_queue.print_summary()
+
     tracker.finish()
 
 

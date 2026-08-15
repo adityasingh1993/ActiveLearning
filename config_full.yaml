@@ -54,6 +54,21 @@ enable_crypto_ledger: true        # SHA-256 cryptographic transaction hashing fo
 net_b_backbone: "res_dynunet"     # Secondary network backbone ("res_dynunet" Dual-CNN or "swinunetr")
 swinunetr_feature_size: 48        # Secondary network feature size (Secondary network for 24GB mode)
 
+# ─── QC Gate ──────────────────────────────────────────────────────────────
+enable_qc_gate: true              # Automated quality control gate after inference
+qc_uncertainty_threshold: 0.35   # Max mean foreground entropy before flagging
+qc_volume_min_voxels: 500         # Anatomical prior: minimum bladder volume (voxels)
+qc_volume_max_voxels: 150000      # Anatomical prior: maximum bladder volume (voxels)
+qc_max_cc_count: 3                # Max connected components before flagging
+qc_surface_convexity_min: 0.70    # Minimum surface convexity ratio (0–1)
+
+# ─── MedSAM Foundation Model ──────────────────────────────────────────────
+medsam_enabled: false             # Set true to enable; downloads weights on first use (~2–5GB)
+medsam_variant: "sam_med3d"       # "sam_med3d" | "medsam2" (medsam2 for full 24GB mode)
+medsam_checkpoint_dir: "./checkpoints/medsam"
+medsam_qc_dice_threshold: 0.50   # Min Dice vs. MedSAM before QC flag
+medsam_bootstrap_rounds: 1        # Use MedSAM pseudo-labels for rounds 0..N
+
 # ─── SSL Pre-training (Phase 2) ───────────────────────────────────────
 ssl_epochs: 200                   # More epochs for full mode pre-training
 ssl_lr: 0.0001

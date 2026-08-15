@@ -74,6 +74,27 @@ HASSL comes with two pre-configured master configuration files:
 | `net_b_backbone` | `str` | `"res_dynunet"` | Secondary network backbone (`"res_dynunet"` Dual-CNN or `"swinunetr"`). |
 | `swinunetr_feature_size` | `int` | `48` | Feature size parameter for secondary network. |
 
+### QC Gate
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `enable_qc_gate` | `bool` | `true` | Automated quality control gate after inference. |
+| `qc_uncertainty_threshold` | `float` | `0.35` | Max mean foreground entropy before flagging. Lower = stricter. |
+| `qc_volume_min_voxels` | `int` | `500` | Anatomical prior: minimum organ volume in voxels. |
+| `qc_volume_max_voxels` | `int` | `150000` | Anatomical prior: maximum organ volume in voxels. |
+| `qc_max_cc_count` | `int` | `3` | Max connected components before flagging as fragmented. |
+| `qc_surface_convexity_min` | `float` | `0.70` | Minimum surface convexity ratio (0–1). Lower = more tolerant. |
+
+### MedSAM Foundation Model
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `medsam_enabled` | `bool` | `false` | Opt-in flag. Downloads ~2–5GB weights on first use when `true`. |
+| `medsam_variant` | `str` | `"sam_med3d"` | `"sam_med3d"` (3D volumetric) or `"medsam2"` (slice propagation). |
+| `medsam_checkpoint_dir` | `str` | `"./checkpoints/medsam"` | Local directory for cached model weights. |
+| `medsam_qc_dice_threshold` | `float` | `0.50` | Min Dice vs. MedSAM reference before QC cross-check fails. |
+| `medsam_bootstrap_rounds` | `int` | `1` | Use MedSAM pseudo-labels for rounds `0..N` (cold-start bootstrap). |
+
 ### SSL Pre-training (Phase 2)
 
 | Parameter | Type | Default | Description |
