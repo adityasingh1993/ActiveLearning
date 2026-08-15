@@ -136,18 +136,21 @@ class CombinedSegLoss(nn.Module):
     """Configurable segmentation loss for supervised training (Generalized Dice Focal Loss or DiceCE).
 
     Fixes applied:
-    - include_background=False always: background Dice is trivially high (~0.97) for
-      sparse foreground structures (bladder 2-5% of volume), drowning the gradient
-      signal for the actual target class.
+    - include_background for binary (num_classes==1): True.
+      With a single foreground class the background Dice IS meaningful — skipping it
+      (include_background=False) removes all gradient signal from the overwhelming
+      false-positive background voxels, allowing the model to collapse to all-ones at
+      epoch 0 (Rec≈1, Prec≈0). include_background=True feeds that signal back.
+    - include_background for multiclass (num_classes>1): False.
+      Background Dice is trivially high (~0.97) for sparse structures (bladder 2-5%
+      of volume), drowning the gradient signal for the actual target classes.
     - to_onehot_y=True for multiclass: MONAI DiceLoss requires one-hot encoded targets.
       Without this, integer class indices (e.g. 2) are treated as probability activations
       (2.0), making Dice computation mathematically invalid for multi-class tasks.
     - Default loss_type="generalized_dice_focal": combines Generalized Dice Loss (class weighting)
       with Focal Loss for improved convergence on difficult boundaries and high class imbalance.
-    - lambda_focal=0.25 & lambda_gdl=1.0: rebalances Focal Loss vs GDL. In 3D medical volumes with
-      99% background, unweighted Focal Loss (lambda_focal=1.0) accumulates massive background
-      gradients that push all predictions to 0 (pred_fg = 0.00001). Lowering lambda_focal allows GDL
-      to pull predictions into foreground regions.
+    - lambda_focal=0.5 & lambda_gdl=1.0: Focal weight raised from 0.25→0.5 so the focal
+      term contributes meaningfully to penalising false positives during early training.
     """
 
     def __init__(
@@ -158,7 +161,7 @@ class CombinedSegLoss(nn.Module):
         boundary_weight: float = 0.5,
         reduction: str = 'mean',
         lambda_gdl: float = 1.0,
-        lambda_focal: float = 0.25,
+        lambda_focal: float = 0.5,
         gamma: float = 2.0,
     ):
         super().__init__()
@@ -174,12 +177,19 @@ class CombinedSegLoss(nn.Module):
         softmax = num_classes > 1
         to_onehot_y = num_classes > 1  # Required for multiclass: converts int targets to one-hot
 
+        # Binary: include_background=True so false-positive background voxels contribute a
+        # gradient signal. Without this the model collapses to all-ones at epoch 0 because
+        # GDL with include_background=False gives zero gradient for FP background predictions.
+        # Multiclass: include_background=False — background Dice is trivially ~0.97 for sparse
+        # organs and drowns the class-specific gradient signal.
+        include_background = (num_classes == 1)
+
         # MONAI loss reduction accepts 'mean' or 'sum'
         monai_reduction = reduction if reduction in ('mean', 'sum') else 'mean'
 
         if loss_type == "generalized_dice_focal":
             self.dice_ce = GeneralizedDiceFocalLoss(
-                include_background=False,  # Always exclude background — foreground Dice is what matters
+                include_background=include_background,
                 to_onehot_y=to_onehot_y,   # Required for multiclass integer-label targets
                 sigmoid=sigmoid,
                 softmax=softmax,
@@ -190,7 +200,7 @@ class CombinedSegLoss(nn.Module):
             )
         else:
             self.dice_ce = DiceCELoss(
-                include_background=False,  # Always exclude background — foreground Dice is what matters
+                include_background=include_background,
                 to_onehot_y=to_onehot_y,   # Required for multiclass integer-label targets
                 sigmoid=sigmoid,
                 softmax=softmax,

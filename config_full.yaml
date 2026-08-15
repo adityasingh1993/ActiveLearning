@@ -42,7 +42,9 @@ dynunet_deep_supervision: true    # Enable deep supervision auxiliary loss heads
 dropout: 0.2                      # Dropout rate for MC Dropout during uncertainty estimation
 loss_type: "generalized_dice_focal"# "generalized_dice_focal" (Generalized Dice + Focal) or "dice_ce"
 loss_lambda_gdl: 1.0              # Generalized Dice Loss weight (volume-normalized)
-loss_lambda_focal: 0.25           # Focal Loss weight (0.25 prevents 99% background mode collapse)
+loss_lambda_focal: 0.5             # Focal Loss weight — raised to 0.5 (from 0.25) so focal term
+                                   # meaningfully penalises false-positive background voxels and
+                                   # prevents all-positive collapse at epoch 0 (Rec≈1, Prec≈0).
 loss_focal_gamma: 2.0             # Focal Loss focusing exponent
 include_boundary: true            # Distance transform boundary loss for sharp organ surface alignment
 boundary_weight: 0.5              # Weight multiplier for Boundary Loss
