@@ -222,3 +222,18 @@ Predicted Mask: (B, 1, 128, 128, 128) uint8
   1. **`BoundaryLoss`**: Guarded with `if pred.sum() == 0 or target.sum() == 0: return torch.tensor(1.0)`.
   2. **`HD95` Aggregation**: Guarded `hd95_metric.aggregate()` with `torch.isnan` and `torch.isinf` checks in `trainer.py`, replacing invalid outputs with clean `NaN`.
   3. **Relative Volume Error (`RVE`)**: Guarded `(pred_vol - gt_vol) / gt_vol` against zero-division when `gt_vol == 0`.
+
+---
+
+## 7. Precision, Recall, and Dice Optimization Strategy
+
+### 7.1 3D Binary Hole Filling in Post-Processing (`lcc_fill_holes`)
+- **Problem**: Neural networks occasionally predict tiny false-negative interior holes inside solid 3D organs (bladder/prostate), which degrades **Recall** and **Dice** despite high exterior precision.
+- **Solution**: Integrated 3D binary hole filling (`scipy.ndimage.binary_fill_holes`) inside `apply_keep_largest_cc`. After extracting the top $N=1$ largest connected component, interior holes are automatically filled with $1.0$, boosting **Recall** and **Dice** without creating exterior false positives.
+
+### 7.2 Student-Teacher Ensemble Validation
+- **Problem**: Single student model predictions can suffer from frame-to-frame boundary jitter, causing high false positive boundary noise (**Precision** loss).
+- **Solution**: In prototype (UA-Mean Teacher) mode, `validate()` computes an ensemble probability map:
+  $$P_{\text{ensemble}} = \frac{1}{2} \left( \sigma(P_{\text{student}}) + \sigma(P_{\text{teacher}}) \right)$$
+  Blending student and EMA teacher shadow probabilities cancels out single-model prediction spikes, boosting **Precision** and overall **Dice**.
+
