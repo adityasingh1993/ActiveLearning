@@ -5,9 +5,32 @@ from hassl.data.data_engine import (
     build_unlabeled_dataset,
     build_dataloaders,
     get_base_transforms,
-    build_all_volumes_loader
+    build_all_volumes_loader,
+    _strip_suffix,
 )
 from hassl.config import HASSLConfig
+
+
+def test_strip_suffix_simple():
+    """_strip_suffix must only remove a trailing suffix, not mid-string occurrences."""
+    assert _strip_suffix("volume_0.mha", ".mha") == "volume_0"
+
+
+def test_strip_suffix_dotted_filename():
+    """Dotted filenames like sonoeq.transducer.frameacquasition.mha must strip correctly."""
+    assert _strip_suffix("sonoeq.transducer.frameacquasition.mha", ".mha") == "sonoeq.transducer.frameacquasition"
+
+
+def test_strip_suffix_no_mid_replacement():
+    """str.replace would break 'scan.mha.backup.mha' → only trailing .mha removed."""
+    assert _strip_suffix("scan.mha.backup.mha", ".mha") == "scan.mha.backup"
+
+
+def test_strip_suffix_no_match():
+    """If suffix not present, filename returned unchanged."""
+    assert _strip_suffix("volume_0.nrrd", ".mha") == "volume_0.nrrd"
+
+
 
 
 def test_build_labeled_dataset(synthetic_data_dir, sample_config):

@@ -11,6 +11,26 @@ from hassl.compat import ORIENTATIOND_RAS_LABELS
 
 logger = logging.getLogger(__name__)
 
+
+def _strip_suffix(filename: str, suffix: str) -> str:
+    """Strip *suffix* from *filename* only if it appears at the trailing end.
+
+    ``str.replace(suffix, "")`` removes ALL occurrences of the suffix, which
+    corrupts volume IDs derived from filenames that contain the suffix string
+    mid-name (e.g. 'sonoeq.transducer.frameacquasition.mha' with image_suffix
+    '.mha' is fine, but a hypothetical 'scan.mha.backup.mha' would become
+    'scan.backup' with replace, vs 'scan.mha.backup' with this helper).
+
+    Also uses ``removesuffix`` (Python 3.9+) as the primary path, with a
+    manual endswith/rstrip fallback for older Python versions.
+    """
+    if hasattr(filename, 'removesuffix'):
+        return filename.removesuffix(suffix)
+    # Fallback for Python < 3.9
+    if suffix and filename.endswith(suffix):
+        return filename[:-len(suffix)]
+    return filename
+
 from monai.data import CacheDataset, PersistentDataset, Dataset, DataLoader as MonaiDataLoader
 from monai.transforms import (
     Compose,
@@ -109,7 +129,7 @@ def get_or_create_frozen_splits(
 
     patient_map = {}
     for img_path in image_files:
-        base_name = os.path.basename(img_path).replace(image_suffix, "")
+        base_name = _strip_suffix(os.path.basename(img_path), image_suffix)
         lbl_path = str(data_dir_path / "labels" / f"{base_name}{label_suffix}")
         if not os.path.exists(lbl_path):
             lbl_path = str(Path(img_path).parent / f"{base_name}{label_suffix}")
@@ -197,7 +217,7 @@ def build_labeled_dataset(data_dir: str, image_suffix: str, label_suffix: str,
     labeled_ids = set()
 
     for img_path in image_files:
-        base_name = os.path.basename(img_path).replace(image_suffix, "")
+        base_name = _strip_suffix(os.path.basename(img_path), image_suffix)
 
         if include_ids is not None and base_name not in include_ids:
             continue
@@ -256,7 +276,7 @@ def build_unlabeled_dataset(data_dir: str, image_suffix: str, labeled_ids: set,
 
     data_dicts = []
     for img_path in image_files:
-        base_name = os.path.basename(img_path).replace(image_suffix, "")
+        base_name = _strip_suffix(os.path.basename(img_path), image_suffix)
         if base_name not in exclude_set:
             data_dicts.append({
                 "image": img_path,
@@ -409,7 +429,7 @@ def build_dataloaders(config):
     val_data_dicts: list = []
     data_dir_path_val = Path(config.data_dir)
     for img_path in sorted(glob.glob(str(data_dir_path_val / f"**/*{config.image_suffix}"), recursive=True)):
-        base_name = os.path.basename(img_path).replace(config.image_suffix, "")
+        base_name = _strip_suffix(os.path.basename(img_path), config.image_suffix)
         if base_name not in set(splits.get("val_ids", [])):
             continue
         lbl_path = str(data_dir_path_val / "labels" / f"{base_name}{config.label_suffix}")
@@ -426,7 +446,7 @@ def build_dataloaders(config):
 
     available_train_labeled = []
     for img_path in all_image_files:
-        base_name = os.path.basename(img_path).replace(config.image_suffix, "")
+        base_name = _strip_suffix(os.path.basename(img_path), config.image_suffix)
         if base_name in val_ids_set or base_name in test_ids_set:
             continue
         available_train_labeled.append(base_name)
@@ -487,7 +507,7 @@ def build_all_volumes_loader(config):
 
     data_dicts = []
     for img_path in image_files:
-        base_name = os.path.basename(img_path).replace(config.image_suffix, "")
+        base_name = _strip_suffix(os.path.basename(img_path), config.image_suffix)
         if base_name not in test_ids_set:
             data_dicts.append({
                 "image": img_path,
