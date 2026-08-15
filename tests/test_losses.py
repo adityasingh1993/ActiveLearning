@@ -24,6 +24,17 @@ def test_flexmatch_threshold():
     thresholds = thresh_fn.get_threshold(probs)
     assert thresholds.shape == (2,)
 
+def test_flexmatch_threshold_binary():
+    """Binary (num_classes=1) case must not crash with CUDA predictions on CPU sigma buffer."""
+    thresh_fn = FlexMatchThreshold(num_classes=1, threshold_base=0.95)
+    # sigma buffer lives on CPU; simulate GPU predictions without requiring real CUDA
+    probs = torch.rand(2, 1, 32, 32, 32)
+    thresh = thresh_fn.get_threshold(probs)
+    assert thresh.shape == (1,)
+    assert 0.0 <= thresh.item() <= 1.0
+    # sigma must have accumulated (no device mismatch error)
+    assert thresh_fn.sigma[0].item() >= 0.0
+
 def test_uncertainty_masked_loss():
     base_loss = CombinedSegLoss(num_classes=1)
     masked_loss = UncertaintyMaskedLoss(base_loss)

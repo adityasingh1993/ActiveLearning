@@ -19,7 +19,9 @@ class FlexMatchThreshold(nn.Module):
         with torch.no_grad():
             if self.num_classes == 1:
                 pred = predictions.detach()
-                high_conf = (pred > self.threshold_base).float().sum()
+                # Accumulate high-confidence count on sigma's own device (CPU buffer).
+                # predictions live on CUDA; direct += would crash with device mismatch.
+                high_conf = (pred > self.threshold_base).float().sum().to(self.sigma.device)
                 self.sigma[0] += high_conf
                 beta = 1.0  # Single class normalized
                 threshold = self.threshold_base * beta
@@ -30,7 +32,7 @@ class FlexMatchThreshold(nn.Module):
 
                 for c in range(self.num_classes):
                     mask = (pred_class == c) & (pred_prob > self.threshold_base)
-                    self.sigma[c] += mask.float().sum()
+                    self.sigma[c] += mask.float().sum().to(self.sigma.device)
 
                 # Normalize per-class counts by max count across all classes (FlexMatch paper)
                 max_sigma = max(1.0, float(self.sigma.max().item()))
