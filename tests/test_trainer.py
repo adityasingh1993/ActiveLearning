@@ -17,6 +17,10 @@ def test_build_network_swinunetr(sample_config):
     net = build_network('swinunetr', sample_config.num_classes, sample_config.dropout)
     assert net is not None
 
+def test_build_network_res_dynunet(sample_config):
+    net = build_network('res_dynunet', sample_config.num_classes, sample_config.dropout)
+    assert net is not None
+
 def test_unet_forward_pass(sample_config, sample_volume):
     sample_config.unet_backbone = 'unet'
     net = build_network(sample_config.unet_backbone, sample_config.num_classes, sample_config.dropout)

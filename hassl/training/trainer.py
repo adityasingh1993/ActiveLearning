@@ -46,13 +46,25 @@ def build_network(backbone: str, num_classes: int, dropout: float) -> nn.Module:
             dropout=dropout, norm_name='instance',
             deep_supervision=True
         )
+    elif backbone == 'res_dynunet':
+        # Residual DynUNet: DynUNet with res_block=True for better gradient flow.
+        # Used as the secondary (net_B) backbone in full 24GB CPS mode.
+        return DynUNet(
+            spatial_dims=3, in_channels=1, out_channels=num_classes,
+            kernel_size=[[3, 3, 3]] * 5,
+            strides=[[1, 1, 1], [2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 2]],
+            upsample_kernel_size=[[2, 2, 2]] * 4,
+            filters=[16, 32, 64, 128, 256],
+            dropout=dropout, norm_name='instance',
+            deep_supervision=True, res_block=True
+        )
     elif backbone == 'swinunetr':
         return SwinUNETR(
             in_channels=1, out_channels=num_classes,
             feature_size=48, use_checkpoint=True
         )
     else:
-        raise ValueError(f"Unknown backbone: {backbone}")
+        raise ValueError(f"Unknown backbone: {backbone}. Choose from: unet, dynunet, res_dynunet, swinunetr")
 
 
 def compute_multiscale_loss(criterion, preds, target):
