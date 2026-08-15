@@ -321,7 +321,13 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
         )
 
     transforms = [
-        LoadImaged(keys=keys, image_only=False),
+        # image_only=True: metadata (affine, transform history) is embedded in the
+        # MetaTensor rather than added as a separate '{filename_stem}' dict key.
+        # image_only=False caused MONAI to inject the file's basename as an extra key
+        # (e.g. 'SonoEQ.Transducer.frame_acquisition') into every data dict. When
+        # batching two items with different filenames, list_data_collate tries to access
+        # item_0's filename key from item_1's dict → KeyError in DataLoader worker 0.
+        LoadImaged(keys=keys, image_only=True),
         EnsureChannelFirstd(keys=keys),
         Orientationd(keys=keys, axcodes="RAS", labels=ORIENTATIOND_RAS_LABELS),
     ]
