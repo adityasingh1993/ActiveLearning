@@ -64,7 +64,15 @@ HASSL comes with two pre-configured master configuration files:
 | `loss_lambda_gdl` | `float` | `1.0` | Weight for Generalized Dice Loss (volume-normalized). |
 | `loss_lambda_focal` | `float` | `0.25` | Weight for Focal Loss (0.25 prevents 99% background mode collapse). |
 | `loss_focal_gamma` | `float` | `2.0` | Focusing parameter for Focal Loss. |
-| `swinunetr_feature_size` | `int` | `48` | Full mode additional network parameter. |
+| `include_boundary` | `bool` | `true` | Distance transform boundary loss for sharp organ surface alignment. |
+| `boundary_weight` | `float` | `0.5` | Weight multiplier for Boundary Loss. |
+| `include_cldice` | `bool` | `false` | Soft Centerline Dice (clDice) loss for 3D topology preservation. |
+| `cldice_weight` | `float` | `0.3` | Weight multiplier for clDice Loss. |
+| `prediction_threshold` | `float` | `0.5` | Probability decision threshold for binary segmentation. |
+| `lcc_fill_holes` | `bool` | `true` | Apply 3D binary hole filling inside LCC organ predictions. |
+| `enable_crypto_ledger` | `bool` | `true` | SHA-256 cryptographic transaction hashing for data lineage. |
+| `net_b_backbone` | `str` | `"res_dynunet"` | Secondary network backbone (`"res_dynunet"` Dual-CNN or `"swinunetr"`). |
+| `swinunetr_feature_size` | `int` | `48` | Feature size parameter for secondary network. |
 
 ### SSL Pre-training (Phase 2)
 
