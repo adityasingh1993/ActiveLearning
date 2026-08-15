@@ -183,7 +183,8 @@ class HASSLTrainer:
             self.scheduler = self._build_scheduler(self.optimizer)
         else:
             self.net_A = build_network(config.unet_backbone, self.num_classes, config.dropout).to(self.device)
-            self.net_B = build_network('swinunetr', self.num_classes, 0.0).to(self.device)
+            net_b_backbone = getattr(config, 'net_b_backbone', 'res_dynunet')
+            self.net_B = build_network(net_b_backbone, self.num_classes, 0.0).to(self.device)
             self.optimizer_A = torch.optim.AdamW(
                 self.net_A.parameters(), lr=config.train_lr, weight_decay=config.train_weight_decay
             )
@@ -220,6 +221,9 @@ class HASSLTrainer:
         self.start_epoch = 0
 
         # Pre-instantiate spatial and intensity augmentations for spatially aligned Mean Teacher view (V7-1, V8-1 fix)
+        # Keys must be ["image"] ONLY — unlabeled batches never contain a "label" key.
+        # Passing ["image", "label"] here causes a KeyError: 'label' in DataLoader worker 0
+        # when _make_unlabeled_views applies the transform to an image-only dict.
         from ..data.augmentations import get_spatial_augmentation, get_intensity_augmentation
         self.spatial_aug = get_spatial_augmentation(keys=["image"])
         self.intensity_aug = get_intensity_augmentation(keys=["image"])
