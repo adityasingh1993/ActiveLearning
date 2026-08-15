@@ -704,12 +704,6 @@ class HASSLTrainer:
                 to_tensor=True,
             ) if should_log_image else None
 
-            # Fix 1: extract affine-derived voxel volume ONCE per sample, BEFORE try/except.
-            # Previously, the fallback path used config.spacing (default 1.0,1.0,1.0 mm) which
-            # produced wrong mm³ units and made val_volume_r2 meaningless. Now both the Invertd
-            # success path and the fallback use the same scanner-native voxel volume.
-            lcc_min_size = getattr(self.config, 'lcc_min_size_voxels', 100)
-
             for b, sample in enumerate(decollated_samples):
                 # --- Affine-derived voxel volume (scanner-native mm³) ---
                 voxel_vol_mm3 = None

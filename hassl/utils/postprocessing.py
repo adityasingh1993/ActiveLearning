@@ -7,7 +7,7 @@ Connected component filtering and morphological post-processing utilities for 3D
 import numpy as np
 import scipy.ndimage as ndi
 import torch
-from typing import List, Optional, Union
+from typing import Optional
 
 
 def apply_keep_largest_cc(

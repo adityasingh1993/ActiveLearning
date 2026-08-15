@@ -547,22 +547,13 @@ async def lasso_cut_3d(vol_id: str, body: dict):
     val = 1 if action == "fill" else 0
     if ax == 0:
         for i in range(num_slices):
-            if action == "fill":
-                mask_3d[i, poly_mask > 0] = 1
-            else:
-                mask_3d[i, poly_mask > 0] = 0
+            mask_3d[i, poly_mask > 0] = val
     elif ax == 1:
         for i in range(num_slices):
-            if action == "fill":
-                mask_3d[:, i, :][poly_mask > 0] = 1
-            else:
-                mask_3d[:, i, :][poly_mask > 0] = 0
+            mask_3d[:, i, :][poly_mask > 0] = val
     else:
         for i in range(num_slices):
-            if action == "fill":
-                mask_3d[:, :, i][poly_mask > 0] = 1
-            else:
-                mask_3d[:, :, i][poly_mask > 0] = 0
+            mask_3d[:, :, i][poly_mask > 0] = val
 
     _state["cached_presegs"][vol_id] = mask_3d
     return {"message": f"3D Lasso Cut applied across all {num_slices} slices along {axis} axis", "slices_affected": num_slices}
