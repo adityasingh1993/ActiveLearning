@@ -203,10 +203,13 @@ class HASSLTrainer:
         lambda_gdl = getattr(config, 'loss_lambda_gdl', 1.0)
         lambda_focal = getattr(config, 'loss_lambda_focal', 0.25)
         gamma = getattr(config, 'loss_focal_gamma', 2.0)
+        include_boundary = getattr(config, 'include_boundary', True)
+        boundary_weight = getattr(config, 'boundary_weight', 0.5)
         self.criterion = CombinedSegLoss(
             self.num_classes,
             loss_type=loss_type,
-            include_boundary=False,
+            include_boundary=include_boundary,
+            boundary_weight=boundary_weight,
             lambda_gdl=lambda_gdl,
             lambda_focal=lambda_focal,
             gamma=gamma,
@@ -579,6 +582,8 @@ class HASSLTrainer:
             inputs = batch_data['image'].to(self.device)
             targets = batch_data['label'].to(self.device)
 
+            pred_thresh = getattr(self.config, 'prediction_threshold', 0.5)
+
             with torch.amp.autocast(self.device_type, enabled=(self.device_type == 'cuda')):
                 # --- Student forward ---
                 preds = inferer(inputs, self.net_A)
@@ -587,24 +592,38 @@ class HASSLTrainer:
                 elif preds.ndim == 6:
                     preds = preds[:, 0]
 
-                if self.num_classes == 1:
-                    preds_binary = (torch.sigmoid(preds) > 0.5).float()
-                else:
-                    preds_binary = torch.argmax(preds, dim=1, keepdim=True).float()
-
-                # --- Teacher forward (prototype mode only, no grad already via @torch.no_grad) ---
+                # --- Teacher forward & Ensemble blending (prototype mode) ---
                 if has_teacher:
                     t_preds = inferer(inputs, self.teacher.shadow)
                     if isinstance(t_preds, (list, tuple)): t_preds = t_preds[0]
                     elif t_preds.ndim == 6: t_preds = t_preds[:, 0]
                     if self.num_classes == 1:
-                        t_binary = (torch.sigmoid(t_preds) > 0.5).float()
+                        s_prob = torch.sigmoid(preds)
+                        t_prob = torch.sigmoid(t_preds)
+                        ens_prob = 0.5 * (s_prob + t_prob)
+                        preds_binary = (ens_prob > pred_thresh).float()
+                        t_binary = (t_prob > pred_thresh).float()
                     else:
-                        t_binary = torch.argmax(t_preds, dim=1, keepdim=True).float()
+                        s_prob = torch.softmax(preds, dim=1)
+                        t_prob = torch.softmax(t_preds, dim=1)
+                        ens_prob = 0.5 * (s_prob + t_prob)
+                        preds_binary = torch.argmax(ens_prob, dim=1, keepdim=True).float()
+                        t_binary = torch.argmax(t_prob, dim=1, keepdim=True).float()
                     teacher_dice_metric(y_pred=t_binary, y=targets)
+                else:
+                    if self.num_classes == 1:
+                        preds_binary = (torch.sigmoid(preds) > pred_thresh).float()
+                    else:
+                        preds_binary = torch.argmax(preds, dim=1, keepdim=True).float()
 
-            lcc_min_size_voxels = getattr(self.config, 'lcc_min_size_voxels', 100)
-            preds_binary_lcc = apply_keep_largest_cc(preds_binary, min_size_voxels=lcc_min_size_voxels)
+            lcc_min_size_voxels = getattr(self.config, 'lcc_min_size_voxels', 0)
+            lcc_fill_holes = getattr(self.config, 'lcc_fill_holes', True)
+            preds_binary_lcc = apply_keep_largest_cc(
+                preds_binary,
+                n_components=1,
+                min_size_voxels=lcc_min_size_voxels,
+                fill_holes=lcc_fill_holes,
+            )
 
             if first_batch_sample is None and should_log_image:
                 # Compute MC Dropout epistemic variance & TTA aleatoric variance 3D maps for sample 0

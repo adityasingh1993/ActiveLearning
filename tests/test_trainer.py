@@ -68,4 +68,24 @@ def test_apply_keep_largest_cc_n_components_1_no_voxel_cutoff():
     assert filtered[0, 0, 10:12, 10:12, 10:11].sum() == 0
     assert filtered.sum() == 12
 
+def test_apply_keep_largest_cc_fill_holes():
+    from hassl.utils.postprocessing import apply_keep_largest_cc
+    # Construct a 3D box (5x5x5 = 125 voxels) with an internal 1x1x1 hole at center (3,3,3)
+    t = torch.zeros(1, 1, 10, 10, 10)
+    t[0, 0, 1:6, 1:6, 1:6] = 1.0
+    t[0, 0, 3, 3, 3] = 0.0  # Internal false-negative hole
+
+    # With fill_holes=True (default)
+    filled = apply_keep_largest_cc(t, fill_holes=True)
+    # The internal 1x1x1 hole at (3,3,3) must be filled (now 1.0)
+    assert filled[0, 0, 3, 3, 3] == 1.0
+    assert filled.sum() == 125
+
+    # With fill_holes=False
+    unfilled = apply_keep_largest_cc(t, fill_holes=False)
+    # The internal hole remains 0.0
+    assert unfilled[0, 0, 3, 3, 3] == 0.0
+    assert unfilled.sum() == 124
+
+
 

@@ -65,6 +65,10 @@ class HASSLConfig:
     loss_lambda_gdl: float = 1.0  # Weight for Generalized Dice Loss
     loss_lambda_focal: float = 0.25  # Weight for Focal Loss (0.25 prevents 99% bg mode collapse)
     loss_focal_gamma: float = 2.0  # Gamma focusing parameter for Focal Loss
+    include_boundary: bool = True  # Distance transform boundary loss for sharp edge contours
+    boundary_weight: float = 0.5  # Weight multiplier for Boundary Loss
+    prediction_threshold: float = 0.5  # Probability decision threshold for binary segmentation
+    lcc_fill_holes: bool = True  # Apply 3D binary hole filling inside LCC organ masks
 
     # Full mode additional network
     swinunetr_feature_size: int = 48

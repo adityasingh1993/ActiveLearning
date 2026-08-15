@@ -44,6 +44,10 @@ loss_type: "generalized_dice_focal"# "generalized_dice_focal" (Generalized Dice 
 loss_lambda_gdl: 1.0              # Generalized Dice Loss weight (volume-normalized)
 loss_lambda_focal: 0.25           # Focal Loss weight (0.25 prevents 99% background mode collapse)
 loss_focal_gamma: 2.0             # Focal Loss focusing exponent
+include_boundary: true            # Distance transform boundary loss for sharp organ surface alignment
+boundary_weight: 0.5              # Weight multiplier for Boundary Loss
+prediction_threshold: 0.5         # Probability decision threshold for binary segmentation
+lcc_fill_holes: true              # Apply 3D binary hole filling inside LCC organ predictions
 swinunetr_feature_size: 48        # Secondary network feature size (SwinUNETR for 24GB mode)
 
 # ─── SSL Pre-training (Phase 2) ───────────────────────────────────────
