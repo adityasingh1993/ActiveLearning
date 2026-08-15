@@ -51,6 +51,17 @@ def build_network(backbone: str, num_classes: int, dropout: float) -> nn.Module:
             in_channels=1, out_channels=num_classes,
             feature_size=48, use_checkpoint=True
         )
+    elif backbone == 'res_dynunet':
+        return DynUNet(
+            spatial_dims=3, in_channels=1, out_channels=num_classes,
+            kernel_size=[[3, 3, 3]] * 5,
+            strides=[[1, 1, 1], [2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 2]],
+            upsample_kernel_size=[[2, 2, 2]] * 4,
+            filters=[32, 64, 128, 256, 512],
+            res_block=True,
+            dropout=dropout, norm_name='instance',
+            deep_supervision=True
+        )
     else:
         raise ValueError(f"Unknown backbone: {backbone}")
 
@@ -182,8 +193,9 @@ class HASSLTrainer:
             )
             self.scheduler = self._build_scheduler(self.optimizer)
         else:
+            net_b_backbone = getattr(config, 'net_b_backbone', 'res_dynunet')
             self.net_A = build_network(config.unet_backbone, self.num_classes, config.dropout).to(self.device)
-            self.net_B = build_network('swinunetr', self.num_classes, 0.0).to(self.device)
+            self.net_B = build_network(net_b_backbone, self.num_classes, 0.0).to(self.device)
             self.optimizer_A = torch.optim.AdamW(
                 self.net_A.parameters(), lr=config.train_lr, weight_decay=config.train_weight_decay
             )
@@ -205,11 +217,15 @@ class HASSLTrainer:
         gamma = getattr(config, 'loss_focal_gamma', 2.0)
         include_boundary = getattr(config, 'include_boundary', True)
         boundary_weight = getattr(config, 'boundary_weight', 0.5)
+        include_cldice = getattr(config, 'include_cldice', False)
+        cldice_weight = getattr(config, 'cldice_weight', 0.3)
         self.criterion = CombinedSegLoss(
             self.num_classes,
             loss_type=loss_type,
             include_boundary=include_boundary,
             boundary_weight=boundary_weight,
+            include_cldice=include_cldice,
+            cldice_weight=cldice_weight,
             lambda_gdl=lambda_gdl,
             lambda_focal=lambda_focal,
             gamma=gamma,

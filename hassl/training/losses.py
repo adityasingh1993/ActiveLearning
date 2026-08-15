@@ -130,6 +130,45 @@ class BoundaryLoss(nn.Module):
         return 1.0 - dice.mean()
 
 
+class SoftCLDiceLoss(nn.Module):
+    """Soft Centerline Dice (clDice) loss for 3D topology preservation (homotopy equivalence)."""
+
+    def __init__(self, num_classes: int = 1, iters: int = 3):
+        super().__init__()
+        self.num_classes = num_classes
+        self.iters = iters
+
+    def _soft_skeleton(self, v: torch.Tensor) -> torch.Tensor:
+        import torch.nn.functional as F
+        for _ in range(self.iters):
+            v1 = F.max_pool3d(v, kernel_size=3, stride=1, padding=1)
+            v2 = 1.0 - F.max_pool3d(1.0 - v, kernel_size=3, stride=1, padding=1)
+            v = v1 * v2
+        return v
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        import torch.nn.functional as F
+        if self.num_classes == 1:
+            pred_prob = torch.sigmoid(y_pred)
+            target = y_true.float()
+        else:
+            pred_prob = torch.softmax(y_pred, dim=1)
+            target = F.one_hot(y_true.squeeze(1).long(), num_classes=self.num_classes).permute(0, 4, 1, 2, 3).float()
+            pred_prob = pred_prob[:, 1:]
+            target = target[:, 1:]
+
+        if pred_prob.sum() == 0 or target.sum() == 0:
+            return torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
+
+        skel_pred = self._soft_skeleton(pred_prob)
+        skel_true = self._soft_skeleton(target)
+
+        tprec = (torch.sum(skel_pred * target) + 1e-5) / (torch.sum(skel_pred) + 1e-5)
+        tsens = (torch.sum(skel_true * pred_prob) + 1e-5) / (torch.sum(skel_true) + 1e-5)
+        cldice = 2.0 * tprec * tsens / (tprec + tsens + 1e-5)
+        return 1.0 - cldice
+
+
 class CombinedSegLoss(nn.Module):
     """Configurable segmentation loss for supervised training (Generalized Dice Focal Loss or DiceCE).
 
@@ -154,6 +193,8 @@ class CombinedSegLoss(nn.Module):
         loss_type: str = "generalized_dice_focal",
         include_boundary: bool = False,
         boundary_weight: float = 0.5,
+        include_cldice: bool = False,
+        cldice_weight: float = 0.3,
         reduction: str = 'mean',
         lambda_gdl: float = 1.0,
         lambda_focal: float = 0.25,
@@ -164,6 +205,8 @@ class CombinedSegLoss(nn.Module):
         self.loss_type = loss_type
         self.include_boundary = include_boundary
         self.boundary_weight = boundary_weight
+        self.include_cldice = include_cldice
+        self.cldice_weight = cldice_weight
         self.lambda_gdl = lambda_gdl
         self.lambda_focal = lambda_focal
         self.gamma = gamma
@@ -198,10 +241,15 @@ class CombinedSegLoss(nn.Module):
         if include_boundary:
             self.boundary_loss = BoundaryLoss(num_classes)
 
+        if include_cldice:
+            self.cldice_loss = SoftCLDiceLoss(num_classes)
+
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         loss = self.dice_ce(pred, target)
         if loss.ndim > 0:
             loss = loss.mean()
         if self.include_boundary:
             loss = loss + self.boundary_weight * self.boundary_loss(pred, target)
+        if self.include_cldice:
+            loss = loss + self.cldice_weight * self.cldice_loss(pred, target)
         return loss

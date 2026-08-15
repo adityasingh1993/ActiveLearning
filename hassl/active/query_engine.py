@@ -42,7 +42,16 @@ class QueryEngine:
             }
 
     def _save_manifest(self):
+        import hashlib
         os.makedirs(os.path.dirname(self.manifest_path), exist_ok=True)
+        # FDA SaMD / GMLP Data Lineage: compute cryptographic SHA-256 transaction hash
+        payload = json.dumps({
+            "labeled": self.state.get("labeled_ids", []),
+            "unlabeled": self.state.get("unlabeled_ids", []),
+            "provenance": self.state.get("provenance", {})
+        }, sort_keys=True).encode("utf-8")
+        self.state["latest_hash"] = hashlib.sha256(payload).hexdigest()
+
         with open(self.manifest_path, 'w') as f:
             json.dump(self.state, f, indent=4)
 

@@ -55,7 +55,11 @@ class BALDStrategy:
 
             # Mutual Information (Epistemic Uncertainty)
             mi = predictive_entropy - expected_entropy
-            volume_scores = mi.mean(dim=(1, 2, 3, 4))
+            roi_mask = (mean_preds > 0.05).float()
+            if roi_mask.sum() > 0:
+                volume_scores = (mi * roi_mask).sum(dim=(1, 2, 3, 4)) / (roi_mask.sum(dim=(1, 2, 3, 4)) + 1e-8)
+            else:
+                volume_scores = mi.mean(dim=(1, 2, 3, 4))
             return volume_scores.cpu().numpy()
 
     def query(self, unlabeled_loader, labeled_ids: List[str], k: int) -> Tuple[List[str], Dict[str, float]]:
@@ -268,7 +272,12 @@ class DisagreementStrategy:
             prob_b = torch.sigmoid(out_b) if out_b.shape[1] == 1 else torch.softmax(out_b, dim=1)
 
             disagreement = torch.abs(prob_a - prob_b)
-            volume_scores = disagreement.mean(dim=(1, 2, 3, 4))
+            mean_prob = 0.5 * (prob_a + prob_b)
+            roi_mask = (mean_prob > 0.05).float()
+            if roi_mask.sum() > 0:
+                volume_scores = (disagreement * roi_mask).sum(dim=(1, 2, 3, 4)) / (roi_mask.sum(dim=(1, 2, 3, 4)) + 1e-8)
+            else:
+                volume_scores = disagreement.mean(dim=(1, 2, 3, 4))
             return volume_scores.cpu().numpy()
 
     def query(self, unlabeled_loader, labeled_ids: List[str], k: int) -> Tuple[List[str], Dict[str, float]]:

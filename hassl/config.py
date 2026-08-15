@@ -67,10 +67,14 @@ class HASSLConfig:
     loss_focal_gamma: float = 2.0  # Gamma focusing parameter for Focal Loss
     include_boundary: bool = True  # Distance transform boundary loss for sharp edge contours
     boundary_weight: float = 0.5  # Weight multiplier for Boundary Loss
+    include_cldice: bool = False  # Soft Centerline Dice (clDice) loss for 3D topology preservation
+    cldice_weight: float = 0.3  # Weight multiplier for clDice Loss
     prediction_threshold: float = 0.5  # Probability decision threshold for binary segmentation
     lcc_fill_holes: bool = True  # Apply 3D binary hole filling inside LCC organ masks
+    enable_crypto_ledger: bool = True  # SHA-256 cryptographic transaction hashing for data lineage
 
     # Full mode additional network
+    net_b_backbone: str = "res_dynunet"  # "res_dynunet" (Dual-CNN CPS) or "swinunetr"
     swinunetr_feature_size: int = 48
 
     # ─── SSL Pre-training (Phase 2) ─────────────────────────────────────

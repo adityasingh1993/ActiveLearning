@@ -46,8 +46,12 @@ loss_lambda_focal: 0.25           # Focal Loss weight (0.25 prevents 99% backgro
 loss_focal_gamma: 2.0             # Focal Loss focusing exponent
 include_boundary: true            # Distance transform boundary loss for sharp organ surface alignment
 boundary_weight: 0.5              # Weight multiplier for Boundary Loss
+include_cldice: false             # Soft Centerline Dice (clDice) loss for 3D topology preservation
+cldice_weight: 0.3                # Weight multiplier for clDice Loss
 prediction_threshold: 0.5         # Probability decision threshold for binary segmentation
 lcc_fill_holes: true              # Apply 3D binary hole filling inside LCC organ predictions
+enable_crypto_ledger: true        # SHA-256 cryptographic transaction hashing for data lineage
+net_b_backbone: "res_dynunet"     # Secondary network backbone ("res_dynunet" Dual-CNN or "swinunetr")
 swinunetr_feature_size: 48        # Secondary network feature size (used when compute_mode == "full")
 
 # ─── SSL Pre-training (Phase 2) ───────────────────────────────────────

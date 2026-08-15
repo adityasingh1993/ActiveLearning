@@ -43,3 +43,20 @@ def test_boundary_loss():
     loss = loss_fn(pred, target)
     assert loss.dim() == 0
     assert loss.item() >= 0
+
+def test_soft_cldice_loss():
+    from hassl.training.losses import SoftCLDiceLoss
+    cldice_fn = SoftCLDiceLoss(num_classes=1)
+    pred = torch.rand(2, 1, 16, 16, 16)
+    target = torch.randint(0, 2, (2, 1, 16, 16, 16)).float()
+    loss = cldice_fn(pred, target)
+    assert loss.dim() == 0
+    assert loss.item() >= 0
+
+def test_combined_seg_loss_with_cldice():
+    loss_fn = CombinedSegLoss(num_classes=1, include_cldice=True, cldice_weight=0.3)
+    pred = torch.rand(2, 1, 16, 16, 16)
+    target = torch.randint(0, 2, (2, 1, 16, 16, 16)).float()
+    loss = loss_fn(pred, target)
+    assert loss.dim() == 0
+    assert loss.item() >= 0
