@@ -64,7 +64,7 @@ def apply_keep_largest_cc(
                             keep_mask = np.isin(labeled_arr, top_labels)
                             if fill_holes:
                                 keep_mask = ndi.binary_fill_holes(keep_mask)
-                            out[b, 0] = np.where(keep_mask, arr[b, 0] if not is_discrete else 1, 0).astype(arr.dtype)
+                            out[b, 0] = np.where(keep_mask, 1.0 if not is_discrete else 1, 0).astype(arr.dtype)
             else:
                 # Multi-channel: filter non-background channels (c >= 1) or target_class
                 for c in range(num_channels):
@@ -89,7 +89,7 @@ def apply_keep_largest_cc(
                                 keep_mask = np.isin(labeled_arr, top_labels)
                                 if fill_holes:
                                     keep_mask = ndi.binary_fill_holes(keep_mask)
-                                out[b, c] = np.where(keep_mask, arr[b, c] if not is_discrete else 1, 0).astype(arr.dtype)
+                                out[b, c] = np.where(keep_mask, 1.0 if not is_discrete else 1, 0).astype(arr.dtype)
 
         elif arr.ndim == 4:
             # Shape [B, D, H, W] discrete integer label map
