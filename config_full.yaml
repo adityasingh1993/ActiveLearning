@@ -11,9 +11,14 @@ label_names: null                  # Multi-class label map: {0: 'background', 1:
                                    # null = binary mode (AsDiscreted threshold=0.5)
                                    # dict = NormalizeLabelsInDatasetd remaps to contiguous 0,1,2,...
 spatial_size: [128, 128, 128]     # Resized spatial target dimensions
-preprocessing_mode: "resize"      # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
+# See config.yaml for the full rationale: "resize" mode downsamples the whole volume and can
+# shrink a small/sparse foreground structure below what GDL+Focal can recover from (observed:
+# val_pred_fg_fraction ~ 0 in both prototype and full mode). "patch" mode guarantees
+# foreground-centered crops via RandCropByPosNegLabeld regardless of structure size.
+preprocessing_mode: "patch"       # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
 patch_size: [96, 96, 96]          # Patch crop size when preprocessing_mode == "patch"
-pos_neg_ratio: 1.0                # Positive/negative sample ratio for RandCropByPosNegLabeld (patch mode)
+pos_neg_ratio: 2.0                # Raised from 1.0 -> 2.0 to bias sampling further toward
+                                   # foreground-containing crops given the observed collapse.
 val_split: 5                      # Number of labeled volumes held out for validation
 cache_dir: "./cache"
 use_cache_dataset: true           # Cache preprocessed tensors in RAM for fast training epochs

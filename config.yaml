@@ -11,9 +11,23 @@ label_names: null                  # Multi-class label map: {0: 'background', 1:
                                    # null = binary mode (AsDiscreted threshold=0.5)
                                    # dict = NormalizeLabelsInDatasetd remaps to contiguous 0,1,2,...
 spatial_size: [128, 128, 128]     # Resized spatial target dimensions
-preprocessing_mode: "resize"      # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
+# preprocessing_mode: "resize" downsamples the WHOLE volume to spatial_size before it ever
+# reaches the network. For a small/sparse foreground structure this can shrink the target
+# down to a handful of voxels (or fewer) inside a 128^3 grid, which is exactly the setup
+# that causes GDL+Focal to still collapse to all-background (val_pred_fg_fraction ~ 0) even
+# though lambda_focal is already tuned down. "patch" mode instead crops fixed-size patches
+# via RandCropByPosNegLabeld, which guarantees a configurable fraction of training patches
+# are centered on foreground voxels regardless of how small the structure is relative to the
+# full volume — this is the standard fix (used by nnU-Net et al.) for foreground collapse on
+# imbalanced 3D medical segmentation. Validation still uses whole-volume Resized + sliding
+# window inference either way (see get_base_transforms), so this only changes what the
+# network sees during training.
+preprocessing_mode: "patch"       # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
 patch_size: [96, 96, 96]          # Patch crop size when preprocessing_mode == "patch"
-pos_neg_ratio: 1.0                # Positive/negative sample ratio for RandCropByPosNegLabeld (patch mode)
+pos_neg_ratio: 2.0                # Positive/negative sample ratio for RandCropByPosNegLabeld (patch mode).
+                                   # Raised from 1.0 -> 2.0: with a rarely-occurring foreground structure,
+                                   # a 1:1 pos:neg ratio still lets purely-background patches dominate the
+                                   # training signal. 2:1 biases sampling toward foreground-containing crops.
 val_split: 5                      # Number of labeled volumes held out for validation
 cache_dir: "./cache"
 use_cache_dataset: true           # Cache preprocessed tensors in RAM for fast training epochs

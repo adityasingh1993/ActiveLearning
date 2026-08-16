@@ -1173,9 +1173,13 @@ class HASSLTrainer:
 
             # --- Per-epoch diagnostics: foreground fraction & zero-prediction alert ---
             try:
-                fg_fracs, pred_fracs = [], []
+                fg_fracs, fg_voxels, total_voxels = [], [], []
+                pred_fracs, pred_voxels = [], []
                 for bd in self.labeled_loader:
-                    fg_fracs.append(float(bd['label'].float().mean().item()))
+                    lbl = bd['label'].float()
+                    fg_fracs.append(float(lbl.mean().item()))
+                    fg_voxels.append(float(lbl.sum().item()))
+                    total_voxels.append(float(lbl.numel()))
                     break  # only first batch for speed
                 if self.val_loader is not None:
                     for bd in self.val_loader:
@@ -1186,16 +1190,33 @@ class HASSLTrainer:
                             elif _p.ndim == 6: _p = _p[:, 0]
                             _pb = (torch.sigmoid(_p) > 0.5).float()
                             pred_fracs.append(float(_pb.mean().item()))
+                            pred_voxels.append(float(_pb.sum().item()))
                         self.net_A.train()
                         break
                 fg_mean  = np.mean(fg_fracs)  if fg_fracs  else float('nan')
                 pf_mean  = np.mean(pred_fracs) if pred_fracs else float('nan')
+                fg_vox_mean = np.mean(fg_voxels) if fg_voxels else float('nan')
+                pred_vox_mean = np.mean(pred_voxels) if pred_voxels else float('nan')
+                # Absolute voxel counts are much easier to reason about than fractions when
+                # diagnosing foreground collapse: e.g. "23 foreground voxels out of 2,097,152"
+                # immediately tells you whether "resize" mode has shrunk a small structure to
+                # near-nothing, vs. the model genuinely predicting zero on a healthy-sized target.
+                if fg_voxels and not np.isnan(fg_vox_mean) and fg_vox_mean < 50:
+                    print(f"  [HASSL WARN] Epoch {epoch}: labeled batch has only "
+                          f"{fg_vox_mean:.0f} foreground voxels out of {total_voxels[0]:.0f} "
+                          f"({fg_mean:.5f} fraction) after preprocessing. If this is much smaller "
+                          f"than the structure looks in the source volume, 'resize' mode is likely "
+                          f"shrinking it below what the loss can learn from — switch "
+                          f"preprocessing_mode to 'patch'.")
                 if not np.isnan(pf_mean) and pf_mean < 1e-4:
                     print(f"  [HASSL WARN] Epoch {epoch}: model producing near-ZERO predictions "
-                          f"(pred_fg={pf_mean:.5f}). Possible mode collapse or extreme class imbalance.")
+                          f"(pred_fg={pf_mean:.5f}, ~{pred_vox_mean:.0f} voxels). "
+                          f"Possible mode collapse or extreme class imbalance.")
                 self.tracker.log_metrics({
                     'train_fg_fraction': fg_mean,
+                    'train_fg_voxels': fg_vox_mean,
                     'val_pred_fg_fraction': pf_mean,
+                    'val_pred_fg_voxels': pred_vox_mean,
                 }, step=epoch)
             except Exception:
                 pass

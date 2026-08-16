@@ -36,9 +36,14 @@ class HASSLConfig:
                                     # 100 is safe for medium targets (bladder/prostate ~1000-10000 voxels at 128^3)
                                     # Set to 0 to disable
     spatial_size: Tuple[int, int, int] = (128, 128, 128)  # Resize target (used in "resize" mode and for val/inference)
-    preprocessing_mode: str = "resize"  # "resize" (Spacingd+Resized) or "patch" (Spacingd+RandCropByPosNegLabeld)
+    # Default changed "resize" -> "patch": whole-volume resize can shrink a small/sparse
+    # foreground structure below what GDL+Focal can recover from, producing all-background
+    # collapse (val_pred_fg_fraction ~ 0) even with tuned loss weights. Patch mode guarantees
+    # foreground-centered crops via RandCropByPosNegLabeld. See config.yaml for full rationale.
+    preprocessing_mode: str = "patch"  # "resize" (Spacingd+Resized) or "patch" (Spacingd+RandCropByPosNegLabeld)
     patch_size: Tuple[int, int, int] = (96, 96, 96)  # Training crop size when preprocessing_mode == "patch"
-    pos_neg_ratio: float = 1.0  # Positive/negative sample ratio for RandCropByPosNegLabeld (patch mode only)
+    pos_neg_ratio: float = 2.0  # Positive/negative sample ratio for RandCropByPosNegLabeld (patch mode only).
+                                 # Raised from 1.0 to bias sampling further toward foreground-containing crops.
     val_split: int = 5  # Number of labeled volumes held out for validation
     cache_dir: str = "./cache"  # PersistentDataset cache
     use_cache_dataset: bool = True  # Cache preprocessed tensors in RAM/CacheDataset
