@@ -6,7 +6,17 @@ data_dir: "./data"
 image_suffix: ".mha"
 label_suffix: ".seg.nrrd"
 num_classes: 1                    # 1 = binary segmentation (sigmoid), >1 = multi-class (softmax)
-spacing: [1.0, 1.0, 1.0]           # Spacingd pixdim — 3D volume voxel resolution (mm per voxel)
+# spacing lowered 1.0 -> 0.1mm/voxel: measured native acquisition spacing on this dataset is
+# ~(0.06-0.1, 0.04-0.06, 0.1-0.13) mm across two scanner profiles. Resampling to 1.0mm was
+# collapsing labeled structures from tens-of-thousands of raw foreground voxels down to only
+# 14-156 voxels post-Spacingd+threshold (confirmed via diagnose_label_foreground.py) — this
+# was the actual root cause of val_pred_fg_fraction ~ 0 / Dice stuck near 0, not a loss-
+# weighting or patch-vs-resize issue. 0.1mm is the finest value get_base_transforms' own OOM
+# guard allows (values < 0.1mm skip Spacingd entirely to avoid runaway memory on large
+# volumes) — physical extents here are modest (mostly 13-53mm/axis) so this stays affordable.
+# NOTE: if use_cache_dataset RAM usage becomes a problem at this resolution, set it to false
+# to fall back to disk-backed PersistentDataset instead of reducing spacing back down.
+spacing: [0.1, 0.1, 0.1]           # Spacingd pixdim — 3D volume voxel resolution (mm per voxel)
 label_names: null                  # Multi-class label map: {0: 'background', 1: 'bladder', 3: 'urethra'}
                                    # null = binary mode (AsDiscreted threshold=0.5)
                                    # dict = NormalizeLabelsInDatasetd remaps to contiguous 0,1,2,...

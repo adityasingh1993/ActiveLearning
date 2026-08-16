@@ -6,7 +6,9 @@ data_dir: "./data"
 image_suffix: ".mha"
 label_suffix: ".seg.nrrd"
 num_classes: 1                    # 1 = binary segmentation (sigmoid), >1 = multi-class (softmax)
-spacing: [1.0, 1.0, 1.0]           # Spacingd pixdim — 3D volume voxel resolution (mm per voxel)
+# See config.yaml for full rationale: native acquisition spacing on this dataset measured at
+# ~0.04-0.13mm; 1.0mm was collapsing labels to 14-156 foreground voxels post-preprocessing.
+spacing: [0.1, 0.1, 0.1]           # Spacingd pixdim — 3D volume voxel resolution (mm per voxel)
 label_names: null                  # Multi-class label map: {0: 'background', 1: 'bladder', 3: 'urethra'}
                                    # null = binary mode (AsDiscreted threshold=0.5)
                                    # dict = NormalizeLabelsInDatasetd remaps to contiguous 0,1,2,...

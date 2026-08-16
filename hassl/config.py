@@ -28,7 +28,11 @@ class HASSLConfig:
     image_suffix: str = ".mha"
     label_suffix: str = ".seg.nrrd"
     num_classes: int = 1  # 1 = binary (sigmoid), >1 = multi-class (softmax)
-    spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)  # Spacingd pixdim (mm per voxel)
+    # Lowered 1.0 -> 0.1mm: measured native spacing was ~0.04-0.13mm, so resampling to 1.0mm
+    # collapsed labeled structures to 14-156 foreground voxels post-preprocessing (confirmed
+    # root cause of Dice stuck near 0). 0.1mm is the finest value the OOM guard in
+    # data_engine.get_base_transforms allows before it skips Spacingd entirely.
+    spacing: Tuple[float, float, float] = (0.1, 0.1, 0.1)  # Spacingd pixdim (mm per voxel)
     label_names: Optional[Dict[int, str]] = None  # Multi-class label map {0:'bg',1:'bladder',3:'urethra'}
                                                    # None = binary mode (AsDiscreted threshold=0.5)
                                                    # dict = NormalizeLabelsInDatasetd remaps non-contiguous values
