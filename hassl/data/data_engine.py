@@ -285,7 +285,7 @@ def build_unlabeled_dataset(data_dir: str, image_suffix: str, labeled_ids: set,
 
     if use_cache_dataset and len(data_dicts) > 0:
         try:
-            return CacheDataset(data=data_dicts, transform=transform, cache_rate=1.0, copy_cache=False)
+            return CacheDataset(data=data_dicts, transform=transform, cache_rate=1.0, copy_cache=False), labeled_ids
         except Exception as e:
             print(f"[DataEngine Warning] CacheDataset failed ({type(e).__name__}: {e}). Falling back to PersistentDataset/Dataset.")
 
@@ -301,9 +301,9 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
 
     Supports two strategies controlled by config.preprocessing_mode:
     - "resize" (default): Spacingd → Resized(spatial_size). Whole-volume fixed-grid pipeline.
-    - "patch": Spacingd only, then RandCropByPosNegLabeld (labeled training) or
-      RandSpatialCropd (unlabeled/image-only training). Validation always uses
-      Resized regardless of mode for OOM-safe whole-volume inference.
+    - "patch": Spacingd → training crop for train data, while validation keeps the
+      full post-Spacingd volume and uses SlidingWindowInferer at patch_size. This keeps
+      train and validation windows at the same physical voxel scale.
     """
     mode = tuple(["bilinear" if k == "image" else "nearest" for k in keys])
     resize_mode = tuple(["trilinear" if k == "image" else "nearest" for k in keys])
@@ -357,45 +357,37 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
             channel_wise=True
         ))
 
-    if preprocessing_mode == "patch" and is_training:
-        # Patch mode: random crop instead of resize.
-        # Validation always falls through to Resized (below) for consistent
-        # whole-volume inference with SlidingWindowInferer.
+    if preprocessing_mode == "patch":
         patch_size = getattr(config, 'patch_size', (96, 96, 96))
         pos_neg_ratio = getattr(config, 'pos_neg_ratio', 1.0)
 
-        # Guard: RandCropByPosNegLabeld / RandSpatialCropd raise a hard ValueError
-        # ("proposed random crop ROI is larger than the image size") whenever ANY axis of
-        # the post-Spacingd volume is smaller than patch_size — and volume size after
-        # Spacingd varies per sample, so no single patch_size is guaranteed safe for every
-        # volume in the dataset. Zero-pad up to at least patch_size first so the crop
-        # transforms always have a big-enough canvas; this is a no-op for volumes already
-        # >= patch_size in every dimension.
+        # Both train and validation must be at least patch_size so the training crop and
+        # SlidingWindowInferer can operate safely on small volumes. Validation is padded
+        # only; it is NOT globally resized, preserving the post-Spacingd physical scale.
         transforms.append(SpatialPadd(keys=keys, spatial_size=patch_size, method="symmetric", mode="constant"))
 
-        if "label" in keys:
-            # Labeled stream: crop centred on positive voxels
-            transforms.append(RandCropByPosNegLabeld(
-                keys=keys,
-                label_key="label",
-                spatial_size=patch_size,
-                pos=pos_neg_ratio,
-                neg=1.0,
-                num_samples=1,
-            ))
-        else:
-            # Unlabeled / image-only stream: random spatial crop
-            transforms.append(RandSpatialCropd(
-                keys=keys,
-                roi_size=patch_size,
-                random_size=False,
-            ))
+        if is_training:
+            if "label" in keys:
+                # Labeled stream: crop centred on positive voxels with explicit negatives.
+                transforms.append(RandCropByPosNegLabeld(
+                    keys=keys,
+                    label_key="label",
+                    spatial_size=patch_size,
+                    pos=pos_neg_ratio,
+                    neg=1.0,
+                    num_samples=1,
+                ))
+            else:
+                # Unlabeled / image-only stream: random spatial crop.
+                transforms.append(RandSpatialCropd(
+                    keys=keys,
+                    roi_size=patch_size,
+                    random_size=False,
+                ))
     else:
-        # Spatial normalisation to fixed grid for whole-volume inference.
+        # Resize mode: spatial normalisation to a fixed whole-volume grid.
         # When Spacingd ran (use_spacingd=True): voxel pitch is already uniform so isotropic
-        # resize is appropriate.
-        # When Spacingd was skipped (micro-spacing): use aspect-ratio-preserving resize + pad
-        # so anatomy is not distorted by squishing e.g. 1200x800x400 → 128x128x128 isotropically.
+        # resize is appropriate. When Spacingd was skipped (micro-spacing), preserve aspect ratio.
         if use_spacingd:
             transforms.append(Resized(keys=keys, spatial_size=config.spatial_size, mode=resize_mode))
         else:
@@ -517,7 +509,6 @@ def build_all_volumes_loader(config):
     test_ids_set = set(splits.get("test_ids", []))
 
     unlabeled_transforms = get_base_transforms(config, keys=["image"], is_training=False)
-
     data_dir_path = Path(config.data_dir)
     image_files = sorted(glob.glob(str(data_dir_path / f"**/*{config.image_suffix}"), recursive=True))
 
