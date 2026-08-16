@@ -34,7 +34,6 @@ def test_flexmatch_threshold_binary_counts_two_sided_confidence():
     thresh = thresh_fn.get_threshold(probs)
     assert thresh.shape == (1,)
     assert thresh.item() == pytest.approx(0.95)
-    # Both 0.99 foreground and 0.01 background are 99% confident.
     assert thresh_fn.sigma[0].item() == pytest.approx(2.0)
 
 
@@ -51,31 +50,27 @@ def test_uncertainty_masked_loss():
     assert loss1.item() >= 0
 
 
-def test_binary_masked_loss_keeps_confident_background():
+def test_uncertainty_masked_loss_preserves_caller_mask():
     base_loss = CombinedSegLoss(num_classes=1)
-    masked_loss = UncertaintyMaskedLoss(base_loss, binary_confidence_threshold=0.95)
+    masked_loss = UncertaintyMaskedLoss(base_loss)
 
-    # logits -> probabilities approximately [0.99, 0.01, 0.50]
-    pred = torch.tensor([[[[[4.595, -4.595, 0.0]]]]], requires_grad=True)
+    pred = torch.tensor([[[[[4.0, -4.0, 0.0]]]]], requires_grad=True)
     target = torch.tensor([[[[[1.0, 0.0, 1.0]]]]])
-    # Simulate the historical foreground-only caller mask. The loss must rebuild
-    # it symmetrically so the confident background voxel is still supervised.
-    foreground_only_mask = torch.tensor([[[[[1.0, 0.0, 0.0]]]]])
+    # Only the first voxel is selected by the caller. The loss must not replace
+    # this mask based on its own confidence calculation.
+    caller_mask = torch.tensor([[[[[1.0, 0.0, 0.0]]]]])
 
-    loss = masked_loss(pred, target, foreground_only_mask)
+    loss = masked_loss(pred, target, caller_mask)
     loss.backward()
 
-    assert loss.item() >= 0
     assert pred.grad is not None
-    assert abs(pred.grad[0, 0, 0, 0, 1].item()) > 0
-    # The uncertain p=0.5 voxel must remain masked out.
+    assert abs(pred.grad[0, 0, 0, 0, 0].item()) > 0
+    assert pred.grad[0, 0, 0, 0, 1].item() == pytest.approx(0.0)
     assert pred.grad[0, 0, 0, 0, 2].item() == pytest.approx(0.0)
 
 
 def test_boundary_loss_uses_probabilities_and_stays_bounded():
     loss_fn = BoundaryLoss(num_classes=1)
-    # Deliberately include large negative/positive logits; raw-logit Dice can
-    # become invalid here, while probability-space Dice remains bounded.
     pred = torch.tensor([[[[[-12.0, 12.0], [8.0, -8.0]]]]], requires_grad=True)
     target = torch.tensor([[[[[0.0, 1.0], [1.0, 0.0]]]]])
     loss = loss_fn(pred, target)
