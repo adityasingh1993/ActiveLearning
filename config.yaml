@@ -51,8 +51,10 @@ cache_dir: "./cache"
 use_cache_dataset: true           # Cache preprocessed tensors in RAM for fast training epochs
 patient_id_regex: null            # Custom regex for extracting patient ID prefix from volume filename
 server_cache_max_volumes: 20      # Max 3D volumes held in server LRU image/mask cache
-lcc_min_size_voxels: 100          # LCC satellite filter: discard CCs smaller than this at spatial_size resolution
-                                   # Set to 0 to disable
+lcc_min_size_voxels: 100          # LCC satellite filter: discard connected components smaller than
+                                   # this (voxel count at spatial_size resolution). 100 is safe for
+                                   # medium targets (bladder/prostate ~1000-10000 voxels at 128^3).
+                                   # Set to 0 to disable filtering entirely.
 
 # ─── Compute ──────────────────────────────────────────────────────────
 compute_mode: "prototype"         # "prototype" (8GB VRAM) or "full" (24GB VRAM)
@@ -87,7 +89,7 @@ ssl_weight_decay: 0.00001
 ssl_mask_ratio: 0.3               # Fraction of volume to mask in masked spatial autoencoding
 ssl_mask_cube_size: 16            # Size of each sub-cube mask
 ssl_contrastive_temp: 0.07        # Temperature for InfoNCE contrastive loss
-ssl_embedding_dim: 128            # Projection head output dim
+ssl_embedding_dim: 128            # Projection head embedding dim
 ssl_use_early_stopping: true      # Stop SSL early if contrastive loss stops improving
 ssl_early_stopping_patience: 20   # Epochs to wait before early stopping in SSL
 
@@ -110,27 +112,27 @@ ema_decay: 0.99                   # EMA teacher momentum coefficient.
 flexmatch_threshold: 0.95         # Confidence threshold for semi-supervised pseudo-labeling
 mc_dropout_passes: 5              # MC Dropout forward passes (5 for 8GB, 10 for 24GB)
 consistency_rampup_epochs: 80     # Linear rampup duration for unsupervised loss weight.
-                                   # At epoch 30 the EMA teacher is still producing noisy labels.
+                                   # At epoch 30 the EMA teacher is still noisy on small datasets.
                                    # 80 epochs allows ~800 steps (batch_size=1, ~10 vols) for the
-                                   # teacher to converge before full unsupervised weight.
-pseudo_label_weight: 0.5          # Weight multiplier for pseudo-labeled approved samples
-save_every_n_epochs: 20           # Checkpoint frequency
-log_image_every_n_epochs: 10      # Log sample predictions
+                                   # teacher to converge before the unsupervised loss reaches full weight.
+pseudo_label_weight: 0.5          # Weight multiplier for pseudo-labeled approved samples (0.5 = safe)
+save_every_n_epochs: 20           # Checkpoint saving frequency
+log_image_every_n_epochs: 10      # WandB/MLflow 6-panel uncertainty slice preview logging frequency
 
-# ─── Active Learning (Phase 4) ────────────────────────────────────────
-al_query_size: 10                 # Volumes to query per round
-al_rounds: 3                      # Total AL rounds
-al_strategy: "hybrid"             # "bald", "coreset", "disagreement", "hybrid"
-al_hybrid_weights: [0.4, 0.3, 0.3]# BALD, CoreSet, Disagreement
+# ─── Active Learning (Phase 4) ───────────────────────────────────────
+al_query_size: 10                 # Number of volumes to query/promote per round
+al_rounds: 3                      # Total Active Learning rounds
+al_strategy: "hybrid"             # Query strategy: "bald", "coreset", "disagreement", "hybrid"
+al_hybrid_weights: [0.4, 0.3, 0.3]# Weights for (BALD, CoreSet, Disagreement) in hybrid mode
 
-# ─── Pseudo-Label Auto-Promotion Quality Gates ───────────────────────
-pseudo_confidence_threshold: 0.85 # Min foreground certainty to promote
-pseudo_mc_passes: 5               # MC Dropout passes for epistemic gate
-pseudo_mc_var_threshold: 0.05     # Max allowed MC Dropout variance
-pseudo_tta_passes: 8              # TTA passes for aleatoric gate
-pseudo_tta_var_threshold: 0.02    # Max allowed TTA variance
-pseudo_tta_flip: true             # Random flips during TTA
-pseudo_tta_intensity_std: 0.02    # Gaussian intensity jitter std
+# ─── Pseudo-Label Auto-Promotion Quality Gates ────────────────────────
+pseudo_confidence_threshold: 0.85 # Gate 1: Min foreground certainty (85%)
+pseudo_mc_passes: 5               # Gate 2: Epistemic MC Dropout forward passes
+pseudo_mc_var_threshold: 0.05     # Gate 2: Max allowed MC Dropout variance (epistemic)
+pseudo_tta_passes: 8              # Gate 3: Aleatoric TTA augmented passes
+pseudo_tta_var_threshold: 0.02    # Gate 3: Max allowed TTA variance (aleatoric)
+pseudo_tta_flip: true             # Gate 3: Random spatial axis flips during TTA
+pseudo_tta_intensity_std: 0.02    # Gate 3: Gaussian intensity jitter std during TTA
 
 # ─── Experiment Tracking (Phase 5) ───────────────────────────────────
 tracker: "wandb"                  # "wandb", "mlflow", or "none"
