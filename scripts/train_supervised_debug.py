@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Run HASSL supervised diagnostics with deterministic Train Dice every epoch.
+"""Run a minimal supervised HASSL diagnostic with deterministic Train Dice.
 
-Use this while isolating the base segmentation path. It keeps the production trainer,
-but wraps validation so the student is also evaluated on the frozen labeled training
-split with the exact same deterministic preprocessing and sliding-window scale used
-for validation.
+This script intentionally removes semi-supervised and augmentation complexity so we can
+answer one question first: can the base binary segmentation model fit the labeled data?
 """
 
 import argparse
@@ -160,8 +158,21 @@ def _install_train_metric_hook():
     HASSLTrainer.validate = validate_with_train_metrics
 
 
-def _install_labeled_only_loader_hook():
-    """Return an empty DataLoader instead of None when no unlabeled cases exist."""
+def _install_minimal_data_hook():
+    """Disable strong train augmentation and normalize an empty unlabeled stream."""
+    original_get_transforms = data_engine.get_base_transforms
+
+    def get_transforms_no_strong_aug(config, keys=["image", "label"], is_training=False, apply_strong_aug=True):
+        # Force augmentation off for the diagnostic training path. Validation was already deterministic.
+        return original_get_transforms(
+            config,
+            keys=keys,
+            is_training=is_training,
+            apply_strong_aug=False,
+        )
+
+    data_engine.get_base_transforms = get_transforms_no_strong_aug
+
     original_build = data_engine.build_dataloaders
 
     def build_with_empty_unlabeled(config):
@@ -170,27 +181,44 @@ def _install_labeled_only_loader_hook():
             unlabeled_loader = DataLoader(Dataset([]), batch_size=1, shuffle=False, num_workers=0)
         return labeled_loader, unlabeled_loader, val_loader, val_transforms
 
-    # Patch both references: data_engine's function and the copy imported by hassl.pipeline.
     data_engine.build_dataloaders = build_with_empty_unlabeled
     pipeline_module.build_dataloaders = build_with_empty_unlabeled
 
 
+def _apply_diagnostic_overrides(config):
+    """Make the supervised sanity check intentionally simple and easy to overfit."""
+    config.loss_type = "dice_ce"          # full BCE background pressure + Dice overlap
+    config.include_boundary = False
+    config.lambda_unsup = 0.0
+    config.pos_neg_ratio = 1.0             # balanced positive/negative patch sampling
+    config.dropout = 0.0                   # remove stochastic regularization for overfit test
+    config.train_lr = 1e-4
+    config.lr_scheduler = "none"           # fixed LR; remove warmup/scheduler as a variable
+    config.lr_warmup_epochs = 0
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Run supervised HASSL debug training with deterministic Train Dice")
+    parser = argparse.ArgumentParser(description="Run minimal supervised HASSL debug training with deterministic Train Dice")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--round", type=int, default=0)
     parser.add_argument("--pretrained", default=None)
     args = parser.parse_args()
 
     config = HASSLConfig.from_yaml(args.config)
+    _apply_diagnostic_overrides(config)
     _install_train_metric_hook()
-    _install_labeled_only_loader_hook()
+    _install_minimal_data_hook()
 
     print("=" * 60)
-    print("HASSL supervised diagnostic run")
+    print("HASSL minimal supervised diagnostic run")
     print(f"Config: {args.config}")
     print(f"Patch size: {config.patch_size}")
     print(f"Spacing: {config.spacing}")
+    print(f"Loss: {config.loss_type}")
+    print(f"Pos/neg ratio: {config.pos_neg_ratio}:1")
+    print(f"Dropout: {config.dropout}")
+    print(f"LR: {config.train_lr} (fixed)")
+    print("Strong augmentation: disabled")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
     print("Train Dice will be evaluated deterministically every epoch.")
     print("=" * 60)
