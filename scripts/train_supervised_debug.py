@@ -25,9 +25,9 @@ from monai.inferers import SlidingWindowInferer
 
 from hassl.config import HASSLConfig
 import hassl.data.data_engine as data_engine
+import hassl.pipeline as pipeline_module
 from hassl.data.data_engine import get_or_create_frozen_splits, get_base_transforms, _strip_suffix
 from hassl.training.trainer import HASSLTrainer
-from hassl.pipeline import run_train
 
 
 def _training_cases(config):
@@ -161,12 +161,7 @@ def _install_train_metric_hook():
 
 
 def _install_labeled_only_loader_hook():
-    """Return an empty DataLoader instead of None when no unlabeled cases exist.
-
-    The production trainer already understands an empty unlabeled dataset, but the current
-    pipeline status print accesses ``unlabeled_loader.dataset`` unconditionally. Supplying
-    an empty loader keeps this diagnostic compatible without inventing unlabeled samples.
-    """
+    """Return an empty DataLoader instead of None when no unlabeled cases exist."""
     original_build = data_engine.build_dataloaders
 
     def build_with_empty_unlabeled(config):
@@ -175,7 +170,9 @@ def _install_labeled_only_loader_hook():
             unlabeled_loader = DataLoader(Dataset([]), batch_size=1, shuffle=False, num_workers=0)
         return labeled_loader, unlabeled_loader, val_loader, val_transforms
 
+    # Patch both references: data_engine's function and the copy imported by hassl.pipeline.
     data_engine.build_dataloaders = build_with_empty_unlabeled
+    pipeline_module.build_dataloaders = build_with_empty_unlabeled
 
 
 def main():
@@ -198,7 +195,7 @@ def main():
     print("Train Dice will be evaluated deterministically every epoch.")
     print("=" * 60)
 
-    run_train(config, round_num=args.round, pretrained_weights=args.pretrained)
+    pipeline_module.run_train(config, round_num=args.round, pretrained_weights=args.pretrained)
 
 
 if __name__ == "__main__":
