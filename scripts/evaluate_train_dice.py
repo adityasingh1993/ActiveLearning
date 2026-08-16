@@ -43,14 +43,12 @@ def _build_training_cases(config: HASSLConfig):
         label_path = root / "labels" / f"{case_id}{config.label_suffix}"
         if not label_path.exists():
             label_path = Path(img_path).parent / f"{case_id}{config.label_suffix}"
-        if not label_path.exists():
-            continue
-
-        cases.append({"image": img_path, "label": str(label_path), "id": case_id})
+        if label_path.exists():
+            cases.append({"image": img_path, "label": str(label_path), "id": case_id})
     return cases
 
 
-def _main_prediction(output: torch.Tensor) -> torch.Tensor:
+def _main_prediction(output):
     if isinstance(output, (list, tuple)):
         return output[0]
     if torch.is_tensor(output) and output.ndim == 6:
@@ -58,8 +56,11 @@ def _main_prediction(output: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def evaluate(config_path: str, checkpoint_path: str):
+def evaluate(config_path: str, checkpoint_path: str | None = None):
     config = HASSLConfig.from_yaml(config_path)
+    if checkpoint_path is None:
+        checkpoint_path = str(Path(config.checkpoint_dir) / "best_checkpoint.pth")
+
     device = torch.device(
         "cuda" if torch.cuda.is_available() and config.device == "cuda" else "cpu"
     )
@@ -68,8 +69,6 @@ def evaluate(config_path: str, checkpoint_path: str):
     if not cases:
         raise RuntimeError("No labeled training cases were found after excluding val/test IDs.")
 
-    # Deterministic transform. In patch mode this now preserves the full post-Spacingd
-    # volume (padding only when needed); there is no random crop or strong augmentation.
     transform = get_base_transforms(
         config,
         keys=["image", "label"],
@@ -114,7 +113,6 @@ def evaluate(config_path: str, checkpoint_path: str):
                 )
 
             pred = (torch.sigmoid(logits) > threshold).float()
-
             tp = (pred * target).sum().item()
             pred_sum = pred.sum().item()
             gt_sum = target.sum().item()
@@ -150,8 +148,8 @@ if __name__ == "__main__":
     parser.add_argument("--config", default="config.yaml", help="Path to HASSL YAML config")
     parser.add_argument(
         "--checkpoint",
-        default="./experiments/checkpoints/best_checkpoint.pth",
-        help="Path to checkpoint containing net_A",
+        default=None,
+        help="Checkpoint containing net_A; defaults to <config.checkpoint_dir>/best_checkpoint.pth",
     )
     args = parser.parse_args()
     evaluate(args.config, args.checkpoint)
