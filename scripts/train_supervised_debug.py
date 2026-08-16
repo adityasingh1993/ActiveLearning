@@ -18,6 +18,7 @@ from monai.data import Dataset, DataLoader
 from monai.inferers import SlidingWindowInferer
 
 from hassl.config import HASSLConfig
+import hassl.data.data_engine as data_engine
 from hassl.data.data_engine import get_or_create_frozen_splits, get_base_transforms, _strip_suffix
 from hassl.training.trainer import HASSLTrainer
 from hassl.pipeline import run_train
@@ -153,6 +154,24 @@ def _install_train_metric_hook():
     HASSLTrainer.validate = validate_with_train_metrics
 
 
+def _install_labeled_only_loader_hook():
+    """Return an empty DataLoader instead of None when no unlabeled cases exist.
+
+    The production trainer already understands an empty unlabeled dataset, but the current
+    pipeline status print accesses ``unlabeled_loader.dataset`` unconditionally. Supplying
+    an empty loader keeps this diagnostic compatible without inventing unlabeled samples.
+    """
+    original_build = data_engine.build_dataloaders
+
+    def build_with_empty_unlabeled(config):
+        labeled_loader, unlabeled_loader, val_loader, val_transforms = original_build(config)
+        if unlabeled_loader is None:
+            unlabeled_loader = DataLoader(Dataset([]), batch_size=1, shuffle=False, num_workers=0)
+        return labeled_loader, unlabeled_loader, val_loader, val_transforms
+
+    data_engine.build_dataloaders = build_with_empty_unlabeled
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run supervised HASSL debug training with deterministic Train Dice")
     parser.add_argument("--config", default="config.yaml")
@@ -162,6 +181,7 @@ def main():
 
     config = HASSLConfig.from_yaml(args.config)
     _install_train_metric_hook()
+    _install_labeled_only_loader_hook()
 
     print("=" * 60)
     print("HASSL supervised diagnostic run")
