@@ -163,18 +163,20 @@ def _install_train_metric_hook():
 
 
 def _select_nonempty_train_index(config, labeled_dataset, deterministic_transform):
-    """Find a training case whose deterministic post-spacing label contains foreground."""
+    """Find a training case whose deterministic transformed label contains foreground."""
     source_data = getattr(labeled_dataset, "data", None)
     if source_data is None:
         raise RuntimeError("Overfit-one diagnostic requires a dataset exposing its source `data` list.")
 
     for idx, case in enumerate(source_data):
         sample = deterministic_transform(dict(case))
-        label = sample["label"]
-        fg_voxels = float(torch.as_tensor(label).sum().item())
+        label = torch.as_tensor(sample["label"])
+        fg_voxels = float(label.sum().item())
+        total_voxels = int(label.numel())
         if fg_voxels > 0:
             case_id = case.get("id") or _strip_suffix(os.path.basename(case["image"]), config.image_suffix)
-            return idx, str(case_id), fg_voxels
+            fg_fraction = fg_voxels / max(1, total_voxels)
+            return idx, str(case_id), fg_voxels, total_voxels, fg_fraction
 
     raise RuntimeError("Could not find a non-empty labeled training case for --overfit-one.")
 
@@ -205,14 +207,15 @@ def _install_minimal_data_hook(overfit_one=False, overfit_repeats=16):
                 is_training=False,
                 apply_strong_aug=False,
             )
-            idx, case_id, fg_voxels = _select_nonempty_train_index(
+            idx, case_id, fg_voxels, total_voxels, fg_fraction = _select_nonempty_train_index(
                 config, labeled_loader.dataset, deterministic_transform
             )
             config._debug_overfit_case_id = case_id
 
-            # Repeat the same dataset index. CacheDataset/PersistentDataset still executes
-            # random crop transforms on every __getitem__, giving multiple fresh 64^3 crops
-            # from one source volume without caching duplicate full volumes.
+            # Repeat the same source case to create multiple optimizer steps per epoch.
+            # In patch mode this also produces fresh random crops on each __getitem__.
+            # In resize mode it deliberately repeats the identical whole 128^3 volume so
+            # we can test whether the network can memorize one fixed image/label pair.
             repeated = Subset(labeled_loader.dataset, [idx] * int(overfit_repeats))
             labeled_loader = DataLoader(
                 repeated,
@@ -221,8 +224,8 @@ def _install_minimal_data_hook(overfit_one=False, overfit_repeats=16):
                 num_workers=config.num_workers,
             )
             print(
-                f"  [OVERFIT-ONE] case={case_id} | deterministic FG voxels={fg_voxels:.0f} | "
-                f"updates/epoch={len(repeated)}"
+                f"  [OVERFIT-ONE] case={case_id} | deterministic FG={fg_voxels:.0f}/{total_voxels} "
+                f"({fg_fraction:.5%}) | updates/epoch={len(repeated)}"
             )
 
         if unlabeled_loader is None or len(unlabeled_loader.dataset) == 0:
@@ -257,6 +260,16 @@ def _apply_random_init_namespace(config):
     config.experiment_name = f"{config.experiment_name}-random-init"
 
 
+def _apply_resize_namespace(config, resize_size):
+    """Switch the diagnostic to whole-volume Spacingd -> Resize training with isolated state."""
+    resize_size = int(resize_size)
+    config.preprocessing_mode = "resize"
+    config.spatial_size = (resize_size, resize_size, resize_size)
+    config.checkpoint_dir = _append_namespace(config.checkpoint_dir, f"_resize{resize_size}")
+    config.cache_dir = _append_namespace(config.cache_dir, f"_resize{resize_size}")
+    config.experiment_name = f"{config.experiment_name}-resize{resize_size}"
+
+
 def _apply_overfit_one_namespace(config):
     """Keep one-case sanity-check checkpoints separate and prevent val early stopping."""
     config.checkpoint_dir = _append_namespace(config.checkpoint_dir, "_overfit1")
@@ -286,17 +299,34 @@ def main():
         default=16,
         help="Number of optimizer updates per epoch from the selected case (default: 16).",
     )
+    parser.add_argument(
+        "--resize-overfit",
+        action="store_true",
+        help="Use whole-volume Spacingd -> Resize training for the overfit diagnostic instead of patch crops.",
+    )
+    parser.add_argument(
+        "--resize-size",
+        type=int,
+        default=128,
+        help="Cubic whole-volume resize dimension for --resize-overfit (default: 128).",
+    )
     args = parser.parse_args()
 
     if args.random_init and args.pretrained:
         parser.error("--random-init and --pretrained are mutually exclusive")
     if args.overfit_repeats < 1:
         parser.error("--overfit-repeats must be >= 1")
+    if args.resize_size < 16:
+        parser.error("--resize-size must be >= 16")
+    if args.resize_overfit and not args.overfit_one:
+        parser.error("--resize-overfit requires --overfit-one so the resize test stays a controlled one-case diagnostic")
 
     config = HASSLConfig.from_yaml(args.config)
     _apply_diagnostic_overrides(config)
     if args.random_init:
         _apply_random_init_namespace(config)
+    if args.resize_overfit:
+        _apply_resize_namespace(config, args.resize_size)
     if args.overfit_one:
         _apply_overfit_one_namespace(config)
 
@@ -312,10 +342,14 @@ def main():
     print("HASSL minimal supervised diagnostic run")
     print(f"Config: {args.config}")
     print(f"Initialization: {init_mode}")
-    print(f"Patch size: {config.patch_size}")
+    print(f"Preprocessing mode: {config.preprocessing_mode}")
     print(f"Spacing: {config.spacing}")
+    if config.preprocessing_mode == "resize":
+        print(f"Whole-volume resize: {tuple(config.spatial_size)}")
+    else:
+        print(f"Patch size: {config.patch_size}")
+        print(f"Pos/neg ratio: {config.pos_neg_ratio}:1")
     print(f"Loss: {config.loss_type}")
-    print(f"Pos/neg ratio: {config.pos_neg_ratio}:1")
     print(f"Dropout: {config.dropout}")
     print(f"LR: {config.train_lr} (fixed)")
     print("Strong augmentation: disabled")
