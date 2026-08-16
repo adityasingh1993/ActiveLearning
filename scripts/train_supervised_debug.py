@@ -163,7 +163,6 @@ def _install_minimal_data_hook():
     original_get_transforms = data_engine.get_base_transforms
 
     def get_transforms_no_strong_aug(config, keys=["image", "label"], is_training=False, apply_strong_aug=True):
-        # Force augmentation off for the diagnostic training path. Validation was already deterministic.
         return original_get_transforms(
             config,
             keys=keys,
@@ -187,14 +186,23 @@ def _install_minimal_data_hook():
 
 def _apply_diagnostic_overrides(config):
     """Make the supervised sanity check intentionally simple and easy to overfit."""
-    config.loss_type = "dice_ce"          # full BCE background pressure + Dice overlap
+    config.loss_type = "dice_ce"
     config.include_boundary = False
     config.lambda_unsup = 0.0
-    config.pos_neg_ratio = 1.0             # balanced positive/negative patch sampling
-    config.dropout = 0.0                   # remove stochastic regularization for overfit test
+    config.pos_neg_ratio = 1.0
+    config.dropout = 0.0
     config.train_lr = 1e-4
-    config.lr_scheduler = "none"           # fixed LR; remove warmup/scheduler as a variable
+    config.lr_scheduler = "none"
     config.lr_warmup_epochs = 0
+
+
+def _apply_random_init_namespace(config):
+    """Use isolated state so random-init A/B cannot auto-resume or auto-load SSL weights."""
+    config.checkpoint_dir = str(Path(config.checkpoint_dir).with_name(Path(config.checkpoint_dir).name + "_random_init"))
+    config.cache_dir = str(Path(config.cache_dir).with_name(Path(config.cache_dir).name + "_random_init"))
+    config.experiment_name = f"{config.experiment_name}-random-init"
+    Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    Path(config.cache_dir).mkdir(parents=True, exist_ok=True)
 
 
 def main():
@@ -202,16 +210,30 @@ def main():
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--round", type=int, default=0)
     parser.add_argument("--pretrained", default=None)
+    parser.add_argument(
+        "--random-init",
+        action="store_true",
+        help="Force random initialization and use isolated cache/checkpoint directories for a clean A/B test.",
+    )
     args = parser.parse_args()
+
+    if args.random_init and args.pretrained:
+        parser.error("--random-init and --pretrained are mutually exclusive")
 
     config = HASSLConfig.from_yaml(args.config)
     _apply_diagnostic_overrides(config)
+    if args.random_init:
+        _apply_random_init_namespace(config)
+
     _install_train_metric_hook()
     _install_minimal_data_hook()
+
+    init_mode = "RANDOM INIT" if args.random_init else (f"PRETRAINED: {args.pretrained}" if args.pretrained else "DEFAULT/NO EXPLICIT PRETRAIN")
 
     print("=" * 60)
     print("HASSL minimal supervised diagnostic run")
     print(f"Config: {args.config}")
+    print(f"Initialization: {init_mode}")
     print(f"Patch size: {config.patch_size}")
     print(f"Spacing: {config.spacing}")
     print(f"Loss: {config.loss_type}")
@@ -220,10 +242,14 @@ def main():
     print(f"LR: {config.train_lr} (fixed)")
     print("Strong augmentation: disabled")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
+    print(f"Cache dir: {config.cache_dir}")
     print("Train Dice will be evaluated deterministically every epoch.")
     print("=" * 60)
 
-    pipeline_module.run_train(config, round_num=args.round, pretrained_weights=args.pretrained)
+    # In random-init mode we deliberately pass None. The isolated checkpoint directory
+    # prevents run_train from finding either ssl_pretrained.pth or round0_latest.pth.
+    pretrained_weights = None if args.random_init else args.pretrained
+    pipeline_module.run_train(config, round_num=args.round, pretrained_weights=pretrained_weights)
 
 
 if __name__ == "__main__":
