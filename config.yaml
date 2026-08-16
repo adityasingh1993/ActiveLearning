@@ -23,7 +23,15 @@ spatial_size: [128, 128, 128]     # Resized spatial target dimensions
 # window inference either way (see get_base_transforms), so this only changes what the
 # network sees during training.
 preprocessing_mode: "patch"       # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
-patch_size: [96, 96, 96]          # Patch crop size when preprocessing_mode == "patch"
+# patch_size lowered 96 -> 32: at spacing=[1,1,1]mm, real observed volumes post-Spacingd were
+# as small as (38, 21, 22) voxels — a 96^3 patch cannot fit in that at all and crashes
+# RandCropByPosNegLabeld. get_base_transforms now zero-pads up to at least patch_size before
+# cropping so this can no longer hard-crash regardless of the value here, but if patch_size is
+# still much bigger than your actual volumes, most of each "patch" is wasted padding rather
+# than useful crop diversity. 32^3 is a safer starting point given the one real sample seen so
+# far — check your own volume dimensions after Spacingd (e.g. via the data_preview log) and
+# raise this if your volumes are consistently larger.
+patch_size: [32, 32, 32]          # Patch crop size when preprocessing_mode == "patch"
 pos_neg_ratio: 2.0                # Positive/negative sample ratio for RandCropByPosNegLabeld (patch mode).
                                    # Raised from 1.0 -> 2.0: with a rarely-occurring foreground structure,
                                    # a 1:1 pos:neg ratio still lets purely-background patches dominate the

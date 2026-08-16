@@ -41,7 +41,10 @@ class HASSLConfig:
     # collapse (val_pred_fg_fraction ~ 0) even with tuned loss weights. Patch mode guarantees
     # foreground-centered crops via RandCropByPosNegLabeld. See config.yaml for full rationale.
     preprocessing_mode: str = "patch"  # "resize" (Spacingd+Resized) or "patch" (Spacingd+RandCropByPosNegLabeld)
-    patch_size: Tuple[int, int, int] = (96, 96, 96)  # Training crop size when preprocessing_mode == "patch"
+    # Lowered 96 -> 32: observed real volumes as small as (38,21,22) voxels post-Spacingd, so a
+    # 96^3 patch was mostly wasted zero-padding (get_base_transforms now pads-before-crop so it
+    # no longer hard-crashes, but a patch much bigger than the volume still isn't useful).
+    patch_size: Tuple[int, int, int] = (32, 32, 32)  # Training crop size when preprocessing_mode == "patch"
     pos_neg_ratio: float = 2.0  # Positive/negative sample ratio for RandCropByPosNegLabeld (patch mode only).
                                  # Raised from 1.0 to bias sampling further toward foreground-containing crops.
     val_split: int = 5  # Number of labeled volumes held out for validation

@@ -16,7 +16,11 @@ spatial_size: [128, 128, 128]     # Resized spatial target dimensions
 # val_pred_fg_fraction ~ 0 in both prototype and full mode). "patch" mode guarantees
 # foreground-centered crops via RandCropByPosNegLabeld regardless of structure size.
 preprocessing_mode: "patch"       # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
-patch_size: [96, 96, 96]          # Patch crop size when preprocessing_mode == "patch"
+# Lowered 96 -> 32: real volumes at spacing=[1,1,1]mm observed as small as (38,21,22) voxels
+# post-Spacingd. get_base_transforms now pads before cropping so oversized patch_size can no
+# longer crash, but 32 avoids most of each patch being wasted padding. Check your actual
+# volume dimensions and raise this if they're consistently larger. See config.yaml for detail.
+patch_size: [32, 32, 32]          # Patch crop size when preprocessing_mode == "patch"
 pos_neg_ratio: 2.0                # Raised from 1.0 -> 2.0 to bias sampling further toward
                                    # foreground-containing crops given the observed collapse.
 val_split: 5                      # Number of labeled volumes held out for validation

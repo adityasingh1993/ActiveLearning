@@ -363,6 +363,16 @@ def get_base_transforms(config, keys=["image", "label"], is_training: bool = Fal
         # whole-volume inference with SlidingWindowInferer.
         patch_size = getattr(config, 'patch_size', (96, 96, 96))
         pos_neg_ratio = getattr(config, 'pos_neg_ratio', 1.0)
+
+        # Guard: RandCropByPosNegLabeld / RandSpatialCropd raise a hard ValueError
+        # ("proposed random crop ROI is larger than the image size") whenever ANY axis of
+        # the post-Spacingd volume is smaller than patch_size — and volume size after
+        # Spacingd varies per sample, so no single patch_size is guaranteed safe for every
+        # volume in the dataset. Zero-pad up to at least patch_size first so the crop
+        # transforms always have a big-enough canvas; this is a no-op for volumes already
+        # >= patch_size in every dimension.
+        transforms.append(SpatialPadd(keys=keys, spatial_size=patch_size, method="symmetric", mode="constant"))
+
         if "label" in keys:
             # Labeled stream: crop centred on positive voxels
             transforms.append(RandCropByPosNegLabeld(
