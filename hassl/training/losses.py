@@ -38,7 +38,6 @@ class FlexMatchThreshold(nn.Module):
                     mask = (pred_class == c) & (pred_prob > self.threshold_base)
                     self.sigma[c] += mask.float().sum().to(self.sigma.device)
 
-                # Normalize per-class counts by max count across all classes (FlexMatch paper)
                 max_sigma = max(1.0, float(self.sigma.max().item()))
                 beta = self.sigma / max_sigma
                 thresholds = self.threshold_base * beta
@@ -46,47 +45,23 @@ class FlexMatchThreshold(nn.Module):
 
 
 class UncertaintyMaskedLoss(nn.Module):
-    """Applies a voxel-wise confidence mask to pseudo-label consistency loss.
+    """Apply a caller-provided voxel-wise mask to pseudo-label BCE loss.
 
-    Uses BCE-with-logits (reduction='none') as the per-voxel loss so that the
-    spatial mask can be applied before averaging. Dice-style losses inherently
-    reduce spatially and therefore cannot implement a true voxel-wise mask.
-
-    Important binary safeguard:
-    the existing CPS caller historically constructs ``mask = probs > threshold``.
-    For a one-channel sigmoid this is foreground-only and drops confident
-    background voxels, which can drive an all-foreground collapse. For binary
-    predictions we therefore rebuild the mask symmetrically from the receiving
-    network's probability: ``max(p, 1-p) > threshold``. This keeps both confident
-    foreground and confident background in the consistency objective.
+    The mask semantics belong to the caller. In UA-Mean-Teacher it represents
+    teacher epistemic uncertainty; in CPS it represents pseudo-label confidence.
+    This loss must not replace or reinterpret that mask, otherwise the Mean
+    Teacher uncertainty gate is silently disabled.
     """
 
-    def __init__(self, base_loss: nn.Module, binary_confidence_threshold: float = 0.95):
+    def __init__(self, base_loss: nn.Module):
         super().__init__()
         self.base_loss = base_loss  # kept for API compatibility, not used in forward
-        self.binary_confidence_threshold = binary_confidence_threshold
         self._bce = nn.BCEWithLogitsLoss(reduction='none')
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Compute masked BCE loss over confident voxels only.
-
-        Args:
-            pred:   Logit predictions [B, C, D, H, W] (NOT activated).
-            target: Pseudo-labels, binary for C=1 or one-hot/broadcastable for C>1.
-            mask:   Caller-provided confidence mask. For binary predictions this
-                    is replaced with a symmetric confidence mask to avoid the
-                    foreground-only selection bug in the CPS caller.
-        """
+        """Compute BCE averaged over caller-selected confident voxels only."""
         if pred.ndim < 3:
             raise ValueError(f"Expected segmentation logits with >=3 dims, got shape {tuple(pred.shape)}")
-
-        if pred.shape[1] == 1:
-            with torch.no_grad():
-                probs = torch.sigmoid(pred.detach())
-                confidence = torch.maximum(probs, 1.0 - probs)
-                mask = (confidence > self.binary_confidence_threshold).to(dtype=pred.dtype)
-        elif mask.shape != pred.shape:
-            mask = mask.expand_as(pred)
 
         if mask.shape != pred.shape:
             mask = mask.expand_as(pred)
@@ -116,7 +91,6 @@ class BoundaryLoss(nn.Module):
         """Compute Euclidean Distance Transform weights."""
         res = np.zeros_like(target, dtype=np.float32)
         if target.ndim == 5:
-            # Shape [B, C, D, H, W]
             for b in range(target.shape[0]):
                 for c in range(target.shape[1]):
                     t = target[b, c]
@@ -127,7 +101,6 @@ class BoundaryLoss(nn.Module):
                     else:
                         res[b, c] = 1.0
         elif target.ndim == 4:
-            # Shape [B, D, H, W]
             for b in range(target.shape[0]):
                 t = target[b]
                 if t.any() and not t.all():
@@ -155,7 +128,6 @@ class BoundaryLoss(nn.Module):
                 target_prob = F.one_hot(target_idx, num_classes=self.num_classes)
                 target_prob = target_prob.movedim(-1, 1).float()
 
-        # A completely empty GT mask provides no meaningful boundary target.
         if target_prob.sum() == 0:
             return pred.sum() * 0.0
 
@@ -203,12 +175,7 @@ class CombinedSegLoss(nn.Module):
         sigmoid = num_classes == 1
         softmax = num_classes > 1
         to_onehot_y = num_classes > 1
-
-        # With one sigmoid output MONAI has no separate background channel, so
-        # include_background has no practical effect. Keep True for binary and
-        # exclude background only in genuine multi-class softmax segmentation.
         include_background = (num_classes == 1)
-
         monai_reduction = reduction if reduction in ('mean', 'sum') else 'mean'
 
         if loss_type == "generalized_dice_focal":
