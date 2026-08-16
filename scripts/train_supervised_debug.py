@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import numpy as np
 import torch
+from torch.utils.data import Subset
 from monai.data import Dataset, DataLoader
 from monai.inferers import SlidingWindowInferer
 
@@ -38,12 +39,15 @@ def _training_cases(config):
         val_split=getattr(config, "val_split", 5),
     )
     held_out = set(splits.get("val_ids", [])) | set(splits.get("test_ids", []))
+    only_case_id = getattr(config, "_debug_overfit_case_id", None)
 
     root = Path(config.data_dir)
     cases = []
     for img_path in sorted(glob.glob(str(root / f"**/*{config.image_suffix}"), recursive=True)):
         case_id = _strip_suffix(os.path.basename(img_path), config.image_suffix)
         if case_id in held_out:
+            continue
+        if only_case_id is not None and case_id != only_case_id:
             continue
 
         label_path = root / "labels" / f"{case_id}{config.label_suffix}"
@@ -158,8 +162,25 @@ def _install_train_metric_hook():
     HASSLTrainer.validate = validate_with_train_metrics
 
 
-def _install_minimal_data_hook():
-    """Disable strong train augmentation and normalize an empty unlabeled stream."""
+def _select_nonempty_train_index(config, labeled_dataset, deterministic_transform):
+    """Find a training case whose deterministic post-spacing label contains foreground."""
+    source_data = getattr(labeled_dataset, "data", None)
+    if source_data is None:
+        raise RuntimeError("Overfit-one diagnostic requires a dataset exposing its source `data` list.")
+
+    for idx, case in enumerate(source_data):
+        sample = deterministic_transform(dict(case))
+        label = sample["label"]
+        fg_voxels = float(torch.as_tensor(label).sum().item())
+        if fg_voxels > 0:
+            case_id = case.get("id") or _strip_suffix(os.path.basename(case["image"]), config.image_suffix)
+            return idx, str(case_id), fg_voxels
+
+    raise RuntimeError("Could not find a non-empty labeled training case for --overfit-one.")
+
+
+def _install_minimal_data_hook(overfit_one=False, overfit_repeats=16):
+    """Disable strong augmentation, normalize empty unlabeled data, optionally overfit one case."""
     original_get_transforms = data_engine.get_base_transforms
 
     def get_transforms_no_strong_aug(config, keys=["image", "label"], is_training=False, apply_strong_aug=True):
@@ -176,7 +197,35 @@ def _install_minimal_data_hook():
 
     def build_with_empty_unlabeled(config):
         labeled_loader, unlabeled_loader, val_loader, val_transforms = original_build(config)
-        if unlabeled_loader is None:
+
+        if overfit_one:
+            deterministic_transform = original_get_transforms(
+                config,
+                keys=["image", "label"],
+                is_training=False,
+                apply_strong_aug=False,
+            )
+            idx, case_id, fg_voxels = _select_nonempty_train_index(
+                config, labeled_loader.dataset, deterministic_transform
+            )
+            config._debug_overfit_case_id = case_id
+
+            # Repeat the same dataset index. CacheDataset/PersistentDataset still executes
+            # random crop transforms on every __getitem__, giving multiple fresh 64^3 crops
+            # from one source volume without caching duplicate full volumes.
+            repeated = Subset(labeled_loader.dataset, [idx] * int(overfit_repeats))
+            labeled_loader = DataLoader(
+                repeated,
+                batch_size=1,
+                shuffle=True,
+                num_workers=config.num_workers,
+            )
+            print(
+                f"  [OVERFIT-ONE] case={case_id} | deterministic FG voxels={fg_voxels:.0f} | "
+                f"updates/epoch={len(repeated)}"
+            )
+
+        if unlabeled_loader is None or len(unlabeled_loader.dataset) == 0:
             unlabeled_loader = DataLoader(Dataset([]), batch_size=1, shuffle=False, num_workers=0)
         return labeled_loader, unlabeled_loader, val_loader, val_transforms
 
@@ -196,13 +245,24 @@ def _apply_diagnostic_overrides(config):
     config.lr_warmup_epochs = 0
 
 
+def _append_namespace(path_value, suffix):
+    path = Path(path_value)
+    return str(path.with_name(path.name + suffix))
+
+
 def _apply_random_init_namespace(config):
     """Use isolated state so random-init A/B cannot auto-resume or auto-load SSL weights."""
-    config.checkpoint_dir = str(Path(config.checkpoint_dir).with_name(Path(config.checkpoint_dir).name + "_random_init"))
-    config.cache_dir = str(Path(config.cache_dir).with_name(Path(config.cache_dir).name + "_random_init"))
+    config.checkpoint_dir = _append_namespace(config.checkpoint_dir, "_random_init")
+    config.cache_dir = _append_namespace(config.cache_dir, "_random_init")
     config.experiment_name = f"{config.experiment_name}-random-init"
-    Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-    Path(config.cache_dir).mkdir(parents=True, exist_ok=True)
+
+
+def _apply_overfit_one_namespace(config):
+    """Keep one-case sanity-check checkpoints separate and prevent val early stopping."""
+    config.checkpoint_dir = _append_namespace(config.checkpoint_dir, "_overfit1")
+    config.cache_dir = _append_namespace(config.cache_dir, "_overfit1")
+    config.experiment_name = f"{config.experiment_name}-overfit1"
+    config.use_early_stopping = False
 
 
 def main():
@@ -215,18 +275,36 @@ def main():
         action="store_true",
         help="Force random initialization and use isolated cache/checkpoint directories for a clean A/B test.",
     )
+    parser.add_argument(
+        "--overfit-one",
+        action="store_true",
+        help="Train repeatedly on one confirmed non-empty labeled case as a decisive pipeline sanity check.",
+    )
+    parser.add_argument(
+        "--overfit-repeats",
+        type=int,
+        default=16,
+        help="Number of optimizer updates per epoch from the selected case (default: 16).",
+    )
     args = parser.parse_args()
 
     if args.random_init and args.pretrained:
         parser.error("--random-init and --pretrained are mutually exclusive")
+    if args.overfit_repeats < 1:
+        parser.error("--overfit-repeats must be >= 1")
 
     config = HASSLConfig.from_yaml(args.config)
     _apply_diagnostic_overrides(config)
     if args.random_init:
         _apply_random_init_namespace(config)
+    if args.overfit_one:
+        _apply_overfit_one_namespace(config)
+
+    Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    Path(config.cache_dir).mkdir(parents=True, exist_ok=True)
 
     _install_train_metric_hook()
-    _install_minimal_data_hook()
+    _install_minimal_data_hook(overfit_one=args.overfit_one, overfit_repeats=args.overfit_repeats)
 
     init_mode = "RANDOM INIT" if args.random_init else (f"PRETRAINED: {args.pretrained}" if args.pretrained else "DEFAULT/NO EXPLICIT PRETRAIN")
 
@@ -241,6 +319,8 @@ def main():
     print(f"Dropout: {config.dropout}")
     print(f"LR: {config.train_lr} (fixed)")
     print("Strong augmentation: disabled")
+    if args.overfit_one:
+        print(f"Overfit-one: enabled ({args.overfit_repeats} updates/epoch; early stopping disabled)")
     print(f"Checkpoint dir: {config.checkpoint_dir}")
     print(f"Cache dir: {config.cache_dir}")
     print("Train Dice will be evaluated deterministically every epoch.")
