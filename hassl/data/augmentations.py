@@ -10,7 +10,12 @@ from monai.transforms import (
     RandGaussianSmoothd,
     RandGaussianNoised,
     RandScaleIntensityd,
-    RandAdjustContrastd
+    RandAdjustContrastd,
+    RandCoarseDropoutd,
+    RandCoarseShuffled,
+    RandGaussianSharpend,
+    RandGibbsNoised,
+    RandKSpaceSpikeNoised,
 )
 
 
@@ -80,6 +85,13 @@ def get_intensity_augmentation(keys=["image"]):
     All transforms are followed by SafeClampIntensityd to ensure image values stay in [0,1].
     Without this clamp, RandScaleIntensityd and RandAdjustContrastd push values above 1.0
     (measured max=1.0179), causing out-of-distribution inputs that degrade convergence.
+
+    RandCoarseDropoutd/RandCoarseShuffled/RandGaussianSharpend/RandGibbsNoised/
+    RandKSpaceSpikeNoised were ported in from the reference DeepEdit-style pipeline's
+    `random_augment` block (transforms.py get_train_pre_transforms) at the user's request.
+    Dropout/shuffle hole sizing (holes=2, spatial_size=4, max_holes=8, max_spatial_size=16)
+    is reused as-is from that reference since hassl's spatial_size is also (128,128,128) by
+    default, so the same hole-size-relative-to-volume-size assumption holds.
     """
     image_keys = [k for k in keys if k == "image"]
     return Compose([
@@ -88,6 +100,18 @@ def get_intensity_augmentation(keys=["image"]):
         RandGaussianNoised(keys=image_keys, prob=0.2, mean=0.0, std=0.02),  # Additive Gaussian noise for US background robustness
         RandScaleIntensityd(keys=image_keys, factors=0.1, prob=0.5),
         RandAdjustContrastd(keys=image_keys, prob=0.5, gamma=(0.7, 1.5)),
+        # --- Ported from reference pipeline's random_augment block ---
+        RandCoarseDropoutd(
+            keys=image_keys, holes=2, spatial_size=4, dropout_holes=True,
+            max_holes=8, max_spatial_size=16, prob=0.2,
+        ),
+        RandCoarseShuffled(
+            keys=image_keys, holes=2, spatial_size=4, max_holes=8, max_spatial_size=16, prob=0.2,
+        ),
+        RandGaussianSharpend(keys=image_keys, prob=0.1),
+        RandGibbsNoised(keys=image_keys, prob=0.1, alpha=(0.0, 1.0)),
+        RandKSpaceSpikeNoised(keys=image_keys, prob=0.1),
+        # --- end ported block ---
         SafeClampIntensityd(keys=image_keys, minv=0.0, maxv=1.0),  # Clamp after aug: prevents >1.0 inputs to network
     ])
 

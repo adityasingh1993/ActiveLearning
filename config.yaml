@@ -21,18 +21,17 @@ label_names: null                  # Multi-class label map: {0: 'background', 1:
                                    # null = binary mode (AsDiscreted threshold=0.5)
                                    # dict = NormalizeLabelsInDatasetd remaps to contiguous 0,1,2,...
 spatial_size: [128, 128, 128]     # Resized spatial target dimensions
-# preprocessing_mode: "resize" downsamples the WHOLE volume to spatial_size before it ever
-# reaches the network. For a small/sparse foreground structure this can shrink the target
-# down to a handful of voxels (or fewer) inside a 128^3 grid, which is exactly the setup
-# that causes GDL+Focal to still collapse to all-background (val_pred_fg_fraction ~ 0) even
-# though lambda_focal is already tuned down. "patch" mode instead crops fixed-size patches
-# via RandCropByPosNegLabeld, which guarantees a configurable fraction of training patches
-# are centered on foreground voxels regardless of how small the structure is relative to the
-# full volume — this is the standard fix (used by nnU-Net et al.) for foreground collapse on
-# imbalanced 3D medical segmentation. Validation still uses whole-volume Resized + sliding
-# window inference either way (see get_base_transforms), so this only changes what the
-# network sees during training.
-preprocessing_mode: "patch"       # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
+# Switched back to "resize" per user request, on this branch only (feature/deepedit-inspired-
+# resize-pipeline). "resize" downsamples the WHOLE volume to spatial_size before it reaches
+# the network. The original risk this posed — a small/sparse foreground structure shrinking
+# below what GDL+Focal can recover from — is substantially mitigated now that spacing is
+# correctly set to 0.1mm (see above): the target occupies a far larger voxel footprint before
+# any resize happens, vs. the old 1.0mm-spacing setup where this collapse was first observed.
+# This also matches the reference DeepEdit-style pipeline (transforms.py get_train_pre_/
+# get_val_pre_transforms), which always resizes/crops to one fixed grid rather than relying
+# on patch sampling. Watch val_pred_fg_fraction on the next run: if it collapses toward 0
+# again, that's the signal to switch preprocessing_mode back to "patch".
+preprocessing_mode: "resize"      # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
 # patch_size lowered 96 -> 32: at spacing=[1,1,1]mm, real observed volumes post-Spacingd were
 # as small as (38, 21, 22) voxels — a 96^3 patch cannot fit in that at all and crashes
 # RandCropByPosNegLabeld. get_base_transforms now zero-pads up to at least patch_size before

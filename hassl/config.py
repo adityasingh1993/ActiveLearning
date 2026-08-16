@@ -40,11 +40,16 @@ class HASSLConfig:
                                     # 100 is safe for medium targets (bladder/prostate ~1000-10000 voxels at 128^3)
                                     # Set to 0 to disable
     spatial_size: Tuple[int, int, int] = (128, 128, 128)  # Resize target (used in "resize" mode and for val/inference)
-    # Default changed "resize" -> "patch": whole-volume resize can shrink a small/sparse
-    # foreground structure below what GDL+Focal can recover from, producing all-background
-    # collapse (val_pred_fg_fraction ~ 0) even with tuned loss weights. Patch mode guarantees
-    # foreground-centered crops via RandCropByPosNegLabeld. See config.yaml for full rationale.
-    preprocessing_mode: str = "patch"  # "resize" (Spacingd+Resized) or "patch" (Spacingd+RandCropByPosNegLabeld)
+    # Switched back "patch" -> "resize" per user request: this now assumes spacing is
+    # correctly set (0.1mm, see above) so the foreground-collapse risk that originally
+    # motivated "patch" mode is largely mitigated by the spacing fix itself — resampling
+    # to native-scale spacing means the structure occupies a much larger voxel footprint
+    # even after a whole-volume Resized(spatial_size). Whole-volume resize also matches the
+    # reference DeepEdit-style pipeline (get_train_pre_transforms / get_val_pre_transforms),
+    # which always resizes/crops to a single fixed grid rather than relying on patch
+    # sampling. If val_pred_fg_fraction collapses toward 0 again after this switch, that is
+    # the signal to revert to "patch" mode.
+    preprocessing_mode: str = "resize"  # "resize" (Spacingd+Resized) or "patch" (Spacingd+RandCropByPosNegLabeld)
     # Lowered 96 -> 32: observed real volumes as small as (38,21,22) voxels post-Spacingd, so a
     # 96^3 patch was mostly wasted zero-padding (get_base_transforms now pads-before-crop so it
     # no longer hard-crashes, but a patch much bigger than the volume still isn't useful).

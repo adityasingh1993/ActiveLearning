@@ -13,11 +13,10 @@ label_names: null                  # Multi-class label map: {0: 'background', 1:
                                    # null = binary mode (AsDiscreted threshold=0.5)
                                    # dict = NormalizeLabelsInDatasetd remaps to contiguous 0,1,2,...
 spatial_size: [128, 128, 128]     # Resized spatial target dimensions
-# See config.yaml for the full rationale: "resize" mode downsamples the whole volume and can
-# shrink a small/sparse foreground structure below what GDL+Focal can recover from (observed:
-# val_pred_fg_fraction ~ 0 in both prototype and full mode). "patch" mode guarantees
-# foreground-centered crops via RandCropByPosNegLabeld regardless of structure size.
-preprocessing_mode: "patch"       # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
+# Switched back to "resize" per user request, on this branch only (feature/deepedit-inspired-
+# resize-pipeline) — see config.yaml for the full rationale (spacing fix mitigates the
+# original foreground-collapse risk; matches the reference DeepEdit-style pipeline's design).
+preprocessing_mode: "resize"      # "resize" (Spacingd+Resized whole-volume) or "patch" (Spacingd+RandCrop)
 # Lowered 96 -> 32: real volumes at spacing=[1,1,1]mm observed as small as (38,21,22) voxels
 # post-Spacingd. get_base_transforms now pads before cropping so oversized patch_size can no
 # longer crash, but 32 avoids most of each patch being wasted padding. Check your actual
