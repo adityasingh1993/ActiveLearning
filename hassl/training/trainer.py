@@ -592,7 +592,21 @@ class HASSLTrainer:
         first_batch_native_sample = None
 
         sw_bs = 1 if self.mode == 'prototype' else getattr(self.config, 'sw_batch_size', 2)
-        inferer = SlidingWindowInferer(roi_size=self.config.spatial_size, sw_batch_size=sw_bs, overlap=0.25)
+        # Validation images are always resized to config.spatial_size (get_base_transforms
+        # falls back to whole-volume Resized for is_training=False regardless of
+        # preprocessing_mode). roi_size == the resized image size means SlidingWindowInferer
+        # degenerates to a single non-sliding forward pass over the whole volume — in "patch"
+        # mode that's a real train/val mismatch: the network was trained on config.patch_size
+        # local crops (e.g. 32^3 at native-ish resolution) but validated on one shot over the
+        # full globally-downsampled volume, a different effective scale than anything it was
+        # trained on. Use patch_size as the sliding window in patch mode so validation tiles
+        # the resized volume the same way the network actually learned to look at data; keep
+        # spatial_size (the prior, correct behavior) for resize-mode training.
+        if getattr(self.config, 'preprocessing_mode', 'resize') == 'patch':
+            roi_size = getattr(self.config, 'patch_size', self.config.spatial_size)
+        else:
+            roi_size = self.config.spatial_size
+        inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=sw_bs, overlap=0.25)
 
         for batch_idx, batch_data in enumerate(self.val_loader):
             inputs = batch_data['image'].to(self.device)
