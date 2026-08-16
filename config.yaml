@@ -89,7 +89,7 @@ ssl_weight_decay: 0.00001
 ssl_mask_ratio: 0.3               # Fraction of volume to mask in masked spatial autoencoding
 ssl_mask_cube_size: 16            # Size of each sub-cube mask
 ssl_contrastive_temp: 0.07        # Temperature for InfoNCE contrastive loss
-ssl_embedding_dim: 128            # Projection head embedding dim
+ssl_embedding_dim: 128            # Projection head output dim
 ssl_use_early_stopping: true      # Stop SSL early if contrastive loss stops improving
 ssl_early_stopping_patience: 20   # Epochs to wait before early stopping in SSL
 
