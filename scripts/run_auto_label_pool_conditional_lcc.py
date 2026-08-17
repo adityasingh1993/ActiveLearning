@@ -19,7 +19,6 @@ High-confidence outputs remain pseudo-label candidates only; this is development
 
 import argparse
 import json
-import pickle
 import shutil
 import sys
 from pathlib import Path
@@ -135,7 +134,6 @@ def main():
     bundle = load_qc_bundle(qc_bundle_path)
     policy_payload, accept_p, accept_dice, active_p, active_dice = load_policy(policy_path)
 
-    # Hard-check that this really is the conditional-LCC QC schema, not the old 72-feature bundle.
     required_v2_features = {
         "raw_component_count",
         "raw_largest_component_fraction",
@@ -155,7 +153,8 @@ def main():
         config, input_dir, source_labeled_ids, limit=args.limit
     )
 
-    # Use one concrete forward Compose for both Dataset and Invertd trace matching.
+    # One concrete forward Compose instance is shared by Dataset and Invertd.
+    # MONAI 1.5+ inversion depends on the matching MetaTensor transform trace.
     transform = get_base_transforms(
         config, keys=["image"], is_training=False, apply_strong_aug=False
     )
@@ -250,10 +249,18 @@ def main():
                 active_dice,
             )
 
-            # Invert the FINAL post-processed binary mask, not the raw probability mask.
-            final_pred_t = torch.from_numpy(
-                final_pred_np[None, None].astype(np.float32)
+            # IMPORTANT: do not recreate the final mask with torch.from_numpy(). That produces
+            # a plain Tensor and discards MONAI MetaTensor.applied_operations, so Invertd cannot
+            # undo Resize/Spacing/Orientation. Clone the already traced ensemble MetaTensor and
+            # replace only its voxel values with the conditional-LCC binary mask.
+            final_pred_t = ensemble_prob_t.clone()
+            final_values_t = torch.as_tensor(
+                final_pred_np[None, None],
+                dtype=final_pred_t.dtype,
+                device=final_pred_t.device,
             )
+            final_pred_t.copy_(final_values_t)
+
             native_pred = invert_prediction_exact(
                 final_pred_t,
                 batch,
@@ -386,7 +393,7 @@ def main():
         "prediction_source": "student_teacher_50_50_ensemble",
         "saved_mask": "final conditional-LCC mask",
         "native_geometry_validation": (
-            "exact forward Compose + decollated MetaTensor trace for Invertd; MONAI XYZ to "
+            "exact forward Compose + traced MetaTensor carrier for Invertd; MONAI XYZ to "
             "SimpleITK ZYX axis-order normalization without resampling; strict saved geometry check"
         ),
         "policy_thresholds": {
