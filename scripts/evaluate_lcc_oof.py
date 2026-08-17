@@ -9,6 +9,8 @@ It replays the exact frozen 5-fold held-out inference, then compares:
 
 The purpose is to decide, using held-out evidence, whether LCC should become part of the
 official segmentation post-processing before rebuilding QC and rerunning the unlabeled pool.
+If LCC is adopted, the current 10-case annotation batch must be treated as provisional and
+reselected after QC recalibration and rerunning the 56-case pool.
 
 Outputs:
   experiments/lcc_oof_evaluation/lcc_oof_case_comparison.csv
