@@ -36,7 +36,6 @@ import numpy as np
 
 try:
     from scipy.stats import pearsonr, spearmanr
-    from sklearn.compose import TransformedTargetRegressor
     from sklearn.ensemble import ExtraTreesRegressor
     from sklearn.impute import SimpleImputer
     from sklearn.linear_model import LogisticRegression
@@ -83,19 +82,15 @@ def to_float(value):
 
 
 def load_matrix(rows, feature_columns):
-    matrix = np.asarray(
+    return np.asarray(
         [[to_float(row.get(column)) for column in feature_columns] for row in rows],
-        dtype=np.float64,
+        dtype=float,
     )
-    if matrix.shape != (len(rows), len(feature_columns)):
-        raise RuntimeError("Unexpected QC feature-matrix shape")
-    return matrix
 
 
 def regression_model(seed):
-    # Conservative depth/min-leaf limits matter with only ~37 training rows/fold.
     return Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
+        ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
         (
             "model",
             ExtraTreesRegressor(
@@ -111,71 +106,64 @@ def regression_model(seed):
 
 
 def failure_model(seed):
-    # Strong L2 regularization + balanced class weights for 12/47 failures.
     return Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
+        ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
+        ("scale", StandardScaler()),
         (
             "model",
             LogisticRegression(
                 C=0.1,
-                penalty="l2",
-                solver="liblinear",
                 class_weight="balanced",
                 max_iter=5000,
+                solver="liblinear",
                 random_state=seed,
             ),
         ),
     ])
 
 
-def safe_corr(fn, actual, predicted):
+def safe_corr(fn, y_true, y_pred):
+    if len(y_true) < 2 or np.std(y_true) == 0 or np.std(y_pred) == 0:
+        return float("nan")
     try:
-        value = float(fn(actual, predicted)[0])
-        return value if math.isfinite(value) else float("nan")
+        result = fn(y_true, y_pred)
+        value = result.statistic if hasattr(result, "statistic") else result[0]
+        return float(value)
     except Exception:
         return float("nan")
 
 
-def regression_metrics(actual, predicted):
-    actual = np.asarray(actual, dtype=float)
-    predicted = np.asarray(predicted, dtype=float)
+def regression_metrics(y_true, y_pred):
     return {
-        "mae": float(mean_absolute_error(actual, predicted)),
-        "rmse": float(math.sqrt(mean_squared_error(actual, predicted))),
-        "r2": float(r2_score(actual, predicted)),
-        "pearson": safe_corr(pearsonr, actual, predicted),
-        "spearman": safe_corr(spearmanr, actual, predicted),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "rmse": float(math.sqrt(mean_squared_error(y_true, y_pred))),
+        "r2": float(r2_score(y_true, y_pred)) if len(y_true) >= 2 else float("nan"),
+        "pearson": safe_corr(pearsonr, y_true, y_pred),
+        "spearman": safe_corr(spearmanr, y_true, y_pred),
     }
 
 
-def classification_metrics(actual, probability, decision_threshold=0.5):
-    actual = np.asarray(actual, dtype=int)
-    probability = np.asarray(probability, dtype=float)
-    predicted = (probability >= float(decision_threshold)).astype(int)
-
-    tn, fp, fn, tp = confusion_matrix(actual, predicted, labels=[0, 1]).ravel()
-    metrics = {
-        "prevalence": float(actual.mean()),
-        "decision_threshold": float(decision_threshold),
-        "accuracy": float(accuracy_score(actual, predicted)),
-        "precision": float(precision_score(actual, predicted, zero_division=0)),
-        "recall": float(recall_score(actual, predicted, zero_division=0)),
-        "f1": float(f1_score(actual, predicted, zero_division=0)),
-        "specificity": float(tn / max(tn + fp, 1)),
-        "brier": float(brier_score_loss(actual, probability)),
+def classification_metrics(y_true, prob, decision_threshold=0.5):
+    pred = (prob >= decision_threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
+    result = {
+        "accuracy": float(accuracy_score(y_true, pred)),
+        "precision": float(precision_score(y_true, pred, zero_division=0)),
+        "recall": float(recall_score(y_true, pred, zero_division=0)),
+        "f1": float(f1_score(y_true, pred, zero_division=0)),
+        "brier": float(brier_score_loss(y_true, prob)),
         "tn": int(tn),
         "fp": int(fp),
         "fn": int(fn),
         "tp": int(tp),
     }
-    if len(np.unique(actual)) == 2:
-        metrics["auroc"] = float(roc_auc_score(actual, probability))
-        metrics["auprc"] = float(average_precision_score(actual, probability))
+    if len(np.unique(y_true)) == 2:
+        result["auroc"] = float(roc_auc_score(y_true, prob))
+        result["auprc"] = float(average_precision_score(y_true, prob))
     else:
-        metrics["auroc"] = float("nan")
-        metrics["auprc"] = float("nan")
-    return metrics
+        result["auroc"] = float("nan")
+        result["auprc"] = float("nan")
+    return result
 
 
 def top_regression_features(model, feature_columns, limit=15):
@@ -281,7 +269,6 @@ def main():
         reg.fit(X[train_idx], y_dice[train_idx])
         clf.fit(X[train_idx], y_failure[train_idx])
 
-        # Dice is bounded by definition. Clipping prevents impossible regression outputs.
         fold_dice_pred = np.clip(reg.predict(X[test_idx]), 0.0, 1.0)
         fold_failure_prob = clf.predict_proba(X[test_idx])[:, 1]
         dice_pred[test_idx] = fold_dice_pred
@@ -317,7 +304,6 @@ def main():
         decision_threshold=args.failure_prob_threshold,
     )
 
-    # Train deployable-development bundle only after OOF evaluation is complete.
     final_reg = regression_model(args.seed)
     final_failure = failure_model(args.seed)
     final_reg.fit(X, y_dice)
