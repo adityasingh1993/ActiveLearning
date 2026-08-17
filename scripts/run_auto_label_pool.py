@@ -33,6 +33,8 @@ Important safeguards
 - QC feature names must exactly match the saved bundle schema.
 - A teacher must exist in the final checkpoint; student-only inference would shift the QC
   feature distribution because several features depend on student/teacher disagreement.
+- Native inversion must return the exact source voxel grid; model-space fallback is rejected.
+- Saved .seg.nrrd geometry is verified against the source image after writing.
 - The policy file is treated as DEVELOPMENT calibration, not a production guarantee.
 
 Default inputs:
@@ -65,6 +67,11 @@ import numpy as np
 import torch
 from monai.data import DataLoader, Dataset
 from monai.inferers import SlidingWindowInferer
+
+try:
+    import SimpleITK as sitk
+except ImportError as exc:
+    raise ImportError("run_auto_label_pool.py requires SimpleITK for strict native-geometry validation") from exc
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -225,6 +232,43 @@ def qc_predict(bundle, features):
     return predicted_dice, failure_probability
 
 
+def verify_native_mask_before_write(native_pred: np.ndarray, reference_image_path: str):
+    ref = sitk.ReadImage(str(reference_image_path))
+    expected_shape = tuple(reversed(ref.GetSize()))
+    actual_shape = tuple(np.squeeze(native_pred).shape)
+    if actual_shape != expected_shape:
+        raise RuntimeError(
+            "Native inversion did not return the exact source voxel grid. Refusing fallback resampling.\n"
+            f"Reference: {reference_image_path}\n"
+            f"Expected numpy shape: {expected_shape}\n"
+            f"Inverted prediction:  {actual_shape}\n"
+            "This usually means MONAI transform-trace metadata was lost during inversion."
+        )
+    return ref
+
+
+def verify_saved_geometry(segmentation_path: Path, reference_image):
+    saved = sitk.ReadImage(str(segmentation_path))
+    checks = {
+        "size": (saved.GetSize(), reference_image.GetSize()),
+        "spacing": (saved.GetSpacing(), reference_image.GetSpacing()),
+        "origin": (saved.GetOrigin(), reference_image.GetOrigin()),
+        "direction": (saved.GetDirection(), reference_image.GetDirection()),
+    }
+    failures = []
+    for name, (actual, expected) in checks.items():
+        if name == "size":
+            equal = tuple(actual) == tuple(expected)
+        else:
+            equal = bool(np.allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6, atol=1e-6))
+        if not equal:
+            failures.append(f"{name}: saved={actual} reference={expected}")
+    if failures:
+        raise RuntimeError(
+            f"Saved segmentation geometry mismatch: {segmentation_path}\n" + "\n".join(failures)
+        )
+
+
 def main_prediction(output):
     return cv.main_prediction(output)
 
@@ -335,6 +379,7 @@ def main():
 
     manifest_rows = []
     feature_rows = []
+    case_path_by_id = {case["id"]: case["image"] for case in cases}
 
     print("=" * 110)
     print("UNLABELED AUTO-LABEL + QC POOL INFERENCE")
@@ -363,7 +408,7 @@ def main():
             image_t = batch["image"].to(device)
             case_raw = batch.get("id")
             case_id = case_raw[0] if isinstance(case_raw, (list, tuple)) else str(case_raw)
-            source_path = next(case["image"] for case in cases if case["id"] == case_id)
+            source_path = case_path_by_id[case_id]
 
             with torch.amp.autocast(device.type, enabled=device.type == "cuda"):
                 student_prob_t = torch.sigmoid(main_prediction(inferer(image_t, student)))
@@ -392,13 +437,16 @@ def main():
                 active_dice,
             )
 
-            # Invert the ensemble mask into the native source grid before export.
+            # Invert the ensemble mask into the native source grid before export. QueryEngine's
+            # helper has a compatibility fallback, but this script deliberately rejects that
+            # fallback unless the returned numpy grid already matches the native source exactly.
             native_pred = inverter._invert_prediction(
                 ensemble_prob_t,
                 image_t,
                 batch,
                 0,
             )
+            reference_image = verify_native_mask_before_write(native_pred, source_path)
             bucket_dir = output_dir / BUCKET_DIR[bucket]
             seg_path = bucket_dir / f"{case_id}_pred{config.label_suffix}"
             write_mask_with_spatial_geometry(
@@ -406,6 +454,7 @@ def main():
                 native_pred,
                 reference_image_path=source_path,
             )
+            verify_saved_geometry(seg_path, reference_image)
 
             probability_path = ""
             if args.save_probabilities:
@@ -511,6 +560,7 @@ def main():
         "feature_schema": list(bundle["feature_columns"]),
         "segmentation_threshold": float(args.seg_threshold),
         "prediction_source": "student_teacher_50_50_ensemble",
+        "native_geometry_validation": "strict source-grid shape before write + size/spacing/origin/direction after write",
         "policy_thresholds": {
             "high_confidence_failure_probability_lte": accept_p,
             "high_confidence_predicted_dice_gte": accept_dice,
