@@ -265,83 +265,43 @@ pytest tests/
 
 ---
 
-## QC-Gated Auto-Label Development Workflow
+## 🧪 QC-Gated Auto-Label / Active-Learning Development Workflow
 
-The current development branch adds a leak-safe QC layer on top of the frozen 47-label supervised segmentation baseline:
+The current development workflow freezes a 47-label supervised baseline, builds fold-aware OOF QC features, trains a tabular failure/quality model, derives a conservative development policy, trains one final 47-label segmentation model, and applies the combined segmentation+QC stack to the unlabeled pool.
 
-```text
-47-case OOF predictions
-        ↓
-build_oof_qc_dataset.py
-        ↓
-train_qc_oof.py
-        ↓
-analyze_qc_auto_label_policy.py
-        ↓
-train_final_supervised_47.py
-        ↓
-run_auto_label_pool.py
-```
-
-### Build/evaluate QC
-
-```bash
-python scripts/build_oof_qc_dataset.py --config config_resize128.yaml
-python scripts/train_qc_oof.py
-python scripts/analyze_qc_auto_label_policy.py
-```
-
-The QC feature dataset contains only deployment-available inputs; all GT-derived values remain `target_*` fields. Policy thresholds derived from these development OOF rows are calibration only and require future locked-set validation before production auto-accept.
-
-### Train the final 47-label segmentation model
-
-```bash
-python scripts/train_final_supervised_47.py \
-  --config config_resize128.yaml
-```
-
-The deployment source is the fixed-epoch `final_checkpoint.pth`, where the training duration is chosen from the median best epoch across the frozen CV folds.
-
-### Run the unlabeled pool
-
-Start with a 3-case smoke test:
-
-```bash
-python scripts/run_auto_label_pool.py \
-  --config config_resize128.yaml \
-  --limit 3
-```
-
-If the strict native-geometry checks pass, run the full pool:
-
-```bash
-python scripts/run_auto_label_pool.py \
-  --config config_resize128.yaml \
-  --overwrite
-```
-
-For a separate unlabeled directory:
-
-```bash
-python scripts/run_auto_label_pool.py \
-  --config config_resize128.yaml \
-  --input-dir /path/to/unlabeled/images \
-  --overwrite
-```
-
-Outputs:
+Current development policy:
 
 ```text
-experiments/auto_label_pool_v1/
-├── auto_label_manifest.csv
-├── unlabeled_qc_features.csv
-├── run_metadata.json
-├── high_confidence_pseudo_label/
-├── review/
-└── active_learning_priority/
+HIGH_CONFIDENCE_PSEUDO_LABEL
+  if P(failure) <= 0.2412 AND predicted Dice >= 0.8015
+
+ACTIVE_LEARN_PRIORITY
+  if P(failure) >= 0.50 OR predicted Dice <= 0.70
+
+otherwise REVIEW
 ```
 
-`HIGH_CONFIDENCE_PSEUDO_LABEL` remains a candidate bucket rather than production auto-accept. The script runs the final student + EMA teacher 50/50 ensemble, enforces the saved QC feature schema, and verifies native segmentation size/spacing/origin/direction against the source image before accepting each exported `.seg.nrrd`.
+These thresholds are development-calibrated only. High-confidence outputs are pseudo-label candidates, not production auto-accepts, until a future locked validation set confirms acceptable failure risk.
+
+Current 56-case unlabeled-pool run:
+
+```text
+HIGH_CONFIDENCE_PSEUDO_LABEL  21
+REVIEW                        17
+ACTIVE_LEARN_PRIORITY         18
+mean predicted Dice           0.7487
+mean P(failure)               0.4192
+```
+
+For the first annotation batch, run a deterministic risk+diversity selector rather than taking the top-N failures blindly:
+
+```bash
+python scripts/select_active_learning_batch.py \
+  --pool-dir experiments/auto_label_pool_v1 \
+  --batch-size 10
+```
+
+The default selector seeds the highest-risk case, then uses 65% risk and 35% minimum distance in robust-scaled QC feature space. This is `QC-feature diversity v1`; future encoder/CoreSet diversity should be compared as a controlled experiment rather than substituted silently.
 
 ---
 
