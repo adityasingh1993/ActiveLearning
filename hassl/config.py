@@ -182,7 +182,7 @@ class HASSLConfig:
         Returns:
             HASSLConfig instance with values from YAML overriding defaults.
         """
-        with open(yaml_path, "r") as f:
+        with open(yaml_path, "r", encoding="utf-8") as f:
             yaml_config = yaml.safe_load(f) or {}
 
         # Convert nested tuples from YAML lists
@@ -205,7 +205,7 @@ class HASSLConfig:
                 config_dict[key] = list(value)
 
         Path(yaml_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(yaml_path, "w") as f:
+        with open(yaml_path, "w", encoding="utf-8") as f:
             yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
     def to_dict(self) -> dict:

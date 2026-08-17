@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import scipy.ndimage as ndimage
 from monai.losses import DiceCELoss, GeneralizedDiceFocalLoss
@@ -15,17 +16,20 @@ class FlexMatchThreshold(nn.Module):
         self.register_buffer("sigma", torch.zeros(num_classes))
 
     def get_threshold(self, predictions: torch.Tensor) -> torch.Tensor:
-        """Compute per-class thresholds normalized by max learning status (M-7 fix)."""
+        """Compute per-class thresholds normalized by max learning status.
+
+        Binary segmentation is special: confidence is two-sided. A foreground
+        probability of 0.99 and a background probability of 0.01 are both 99%
+        confident. Track binary confidence symmetrically so diagnostics do not
+        silently count only foreground-confidence.
+        """
         with torch.no_grad():
             if self.num_classes == 1:
                 pred = predictions.detach()
-                # Accumulate high-confidence count on sigma's own device (CPU buffer).
-                # predictions live on CUDA; direct += would crash with device mismatch.
-                high_conf = (pred > self.threshold_base).float().sum().to(self.sigma.device)
+                confidence = torch.maximum(pred, 1.0 - pred)
+                high_conf = (confidence > self.threshold_base).float().sum().to(self.sigma.device)
                 self.sigma[0] += high_conf
-                beta = 1.0  # Single class normalized
-                threshold = self.threshold_base * beta
-                return torch.tensor([threshold], device=predictions.device)
+                return torch.tensor([self.threshold_base], device=predictions.device)
             else:
                 pred_class = predictions.argmax(dim=1)
                 pred_prob = predictions.max(dim=1).values
@@ -34,7 +38,6 @@ class FlexMatchThreshold(nn.Module):
                     mask = (pred_class == c) & (pred_prob > self.threshold_base)
                     self.sigma[c] += mask.float().sum().to(self.sigma.device)
 
-                # Normalize per-class counts by max count across all classes (FlexMatch paper)
                 max_sigma = max(1.0, float(self.sigma.max().item()))
                 beta = self.sigma / max_sigma
                 thresholds = self.threshold_base * beta
@@ -42,15 +45,12 @@ class FlexMatchThreshold(nn.Module):
 
 
 class UncertaintyMaskedLoss(nn.Module):
-    """Applies a voxel-wise confidence mask to suppress uncertain pseudo-label regions.
+    """Apply a caller-provided voxel-wise mask to pseudo-label BCE loss.
 
-    Uses BCE-with-logits (reduction='none') as the per-voxel loss so that the spatial
-    mask can be applied before averaging.  DiceLoss inherently reduces to a scalar per
-    volume, so it cannot be masked per-voxel; CE is a strictly per-voxel signal and
-    sufficient for the unsupervised consistency term.
-
-    The supervised loss (clean GT labels) continues using the full DiceCELoss / GeneralizedDiceFocalLoss — no
-    masking is needed there because ground-truth masks are reliable.
+    The mask semantics belong to the caller. In UA-Mean-Teacher it represents
+    teacher epistemic uncertainty; in CPS it represents pseudo-label confidence.
+    This loss must not replace or reinterpret that mask, otherwise the Mean
+    Teacher uncertainty gate is silently disabled.
     """
 
     def __init__(self, base_loss: nn.Module):
@@ -59,18 +59,10 @@ class UncertaintyMaskedLoss(nn.Module):
         self._bce = nn.BCEWithLogitsLoss(reduction='none')
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Compute masked BCE loss over confident voxels only.
+        """Compute BCE averaged over caller-selected confident voxels only."""
+        if pred.ndim < 3:
+            raise ValueError(f"Expected segmentation logits with >=3 dims, got shape {tuple(pred.shape)}")
 
-        Args:
-            pred:   Logit predictions  [B, C, D, H, W]  (NOT sigmoid-activated)
-            target: Binary pseudo-labels [B, C, D, H, W] float {0, 1}
-            mask:   Confidence mask      [B, C, D, H, W] or broadcastable; 1=confident 0=uncertain
-
-        Returns:
-            Scalar loss averaged over confident voxels only.
-            Returns 0 when no confident voxels exist (avoids NaN on fully-masked batches).
-        """
-        # Expand mask to match pred if needed (e.g. mask is [B, 1, D, H, W])
         if mask.shape != pred.shape:
             mask = mask.expand_as(pred)
 
@@ -79,21 +71,26 @@ class UncertaintyMaskedLoss(nn.Module):
         mask_sum = mask.sum()
         if mask_sum > 0:
             return masked_loss.sum() / mask_sum
-        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        return pred.sum() * 0.0
 
 
 class BoundaryLoss(nn.Module):
-    """Distance-transform weighted Dice loss (M-8 fix)."""
+    """Distance-transform weighted Dice loss operating on probabilities.
+
+    Network outputs are logits. Using raw logits inside a Dice ratio makes the
+    intersection/union unbounded and can produce invalid gradients, especially
+    early in training when logits are negative. Convert logits to probabilities
+    before the weighted Dice calculation.
+    """
 
     def __init__(self, num_classes: int):
         super().__init__()
         self.num_classes = num_classes
 
     def compute_edt(self, target: np.ndarray) -> np.ndarray:
-        """Compute Euclidean Distance Transform weights (M-8 fix)."""
+        """Compute Euclidean Distance Transform weights."""
         res = np.zeros_like(target, dtype=np.float32)
         if target.ndim == 5:
-            # Shape [B, C, D, H, W]
             for b in range(target.shape[0]):
                 for c in range(target.shape[1]):
                     t = target[b, c]
@@ -104,7 +101,6 @@ class BoundaryLoss(nn.Module):
                     else:
                         res[b, c] = 1.0
         elif target.ndim == 4:
-            # Shape [B, D, H, W]
             for b in range(target.shape[0]):
                 t = target[b]
                 if t.any() and not t.all():
@@ -116,41 +112,44 @@ class BoundaryLoss(nn.Module):
         return res
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Guard against zero-foreground or all-background predictions/targets
-        if pred.sum() == 0 or target.sum() == 0:
-            return torch.tensor(1.0, device=pred.device, requires_grad=True)
+        if self.num_classes == 1:
+            probs = torch.sigmoid(pred)
+            target_prob = target.float()
+            if target_prob.ndim == probs.ndim - 1:
+                target_prob = target_prob.unsqueeze(1)
+        else:
+            probs = torch.softmax(pred, dim=1)
+            if target.ndim == pred.ndim and target.shape[1] == self.num_classes:
+                target_prob = target.float()
+            else:
+                target_idx = target.long()
+                if target_idx.ndim == pred.ndim and target_idx.shape[1] == 1:
+                    target_idx = target_idx.squeeze(1)
+                target_prob = F.one_hot(target_idx, num_classes=self.num_classes)
+                target_prob = target_prob.movedim(-1, 1).float()
+
+        if target_prob.sum() == 0:
+            return pred.sum() * 0.0
 
         with torch.no_grad():
-            edt = self.compute_edt(target.cpu().numpy())
-            edt_weights = torch.from_numpy(edt).to(pred.device)
+            edt = self.compute_edt(target_prob.detach().cpu().numpy())
+            edt_weights = torch.from_numpy(edt).to(device=pred.device, dtype=probs.dtype)
             edt_weights = 1.0 + edt_weights / (edt_weights.max() + 1e-5)
 
-        dims = list(range(2, pred.ndim))
-        intersection = (pred * target * edt_weights).sum(dim=dims)
-        union = (pred * edt_weights).sum(dim=dims) + (target * edt_weights).sum(dim=dims)
-        dice = 2.0 * intersection / (union + 1e-5)
+        dims = list(range(2, probs.ndim))
+        intersection = (probs * target_prob * edt_weights).sum(dim=dims)
+        union = (probs * edt_weights).sum(dim=dims) + (target_prob * edt_weights).sum(dim=dims)
+        dice = (2.0 * intersection + 1e-5) / (union + 1e-5)
         return 1.0 - dice.mean()
 
 
 class CombinedSegLoss(nn.Module):
-    """Configurable segmentation loss for supervised training (Generalized Dice Focal Loss or DiceCE).
+    """Configurable segmentation loss for supervised training.
 
-    Fixes applied:
-    - include_background for binary (num_classes==1): True.
-      With a single foreground class the background Dice IS meaningful — skipping it
-      (include_background=False) removes all gradient signal from the overwhelming
-      false-positive background voxels, allowing the model to collapse to all-ones at
-      epoch 0 (Rec≈1, Prec≈0). include_background=True feeds that signal back.
-    - include_background for multiclass (num_classes>1): False.
-      Background Dice is trivially high (~0.97) for sparse structures (bladder 2-5%
-      of volume), drowning the gradient signal for the actual target classes.
-    - to_onehot_y=True for multiclass: MONAI DiceLoss requires one-hot encoded targets.
-      Without this, integer class indices (e.g. 2) are treated as probability activations
-      (2.0), making Dice computation mathematically invalid for multi-class tasks.
-    - Default loss_type="generalized_dice_focal": combines Generalized Dice Loss (class weighting)
-      with Focal Loss for improved convergence on difficult boundaries and high class imbalance.
-    - lambda_focal=0.5 & lambda_gdl=1.0: Focal weight raised from 0.25→0.5 so the focal
-      term contributes meaningfully to penalising false positives during early training.
+    ``GeneralizedDiceFocalLoss`` is the default for the highly imbalanced 3D
+    foreground task. For a single sigmoid output there is no explicit background
+    channel; false-positive background voxels are penalized by the focal/CE term,
+    while multi-class targets are converted to one-hot for MONAI losses.
     """
 
     def __init__(
@@ -175,22 +174,14 @@ class CombinedSegLoss(nn.Module):
 
         sigmoid = num_classes == 1
         softmax = num_classes > 1
-        to_onehot_y = num_classes > 1  # Required for multiclass: converts int targets to one-hot
-
-        # Binary: include_background=True so false-positive background voxels contribute a
-        # gradient signal. Without this the model collapses to all-ones at epoch 0 because
-        # GDL with include_background=False gives zero gradient for FP background predictions.
-        # Multiclass: include_background=False — background Dice is trivially ~0.97 for sparse
-        # organs and drowns the class-specific gradient signal.
+        to_onehot_y = num_classes > 1
         include_background = (num_classes == 1)
-
-        # MONAI loss reduction accepts 'mean' or 'sum'
         monai_reduction = reduction if reduction in ('mean', 'sum') else 'mean'
 
         if loss_type == "generalized_dice_focal":
             self.dice_ce = GeneralizedDiceFocalLoss(
                 include_background=include_background,
-                to_onehot_y=to_onehot_y,   # Required for multiclass integer-label targets
+                to_onehot_y=to_onehot_y,
                 sigmoid=sigmoid,
                 softmax=softmax,
                 reduction=monai_reduction,
@@ -201,7 +192,7 @@ class CombinedSegLoss(nn.Module):
         else:
             self.dice_ce = DiceCELoss(
                 include_background=include_background,
-                to_onehot_y=to_onehot_y,   # Required for multiclass integer-label targets
+                to_onehot_y=to_onehot_y,
                 sigmoid=sigmoid,
                 softmax=softmax,
                 reduction=monai_reduction,

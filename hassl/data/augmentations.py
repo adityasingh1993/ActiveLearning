@@ -41,12 +41,7 @@ class RandMultiplicativeSpeckleNoised(RandomizableTransform):
 
 
 class SafeClampIntensityd(MapTransform):
-    """Clamp image intensity to [minv, maxv] after augmentation to prevent out-of-range values.
-
-    RandScaleIntensityd and RandAdjustContrastd can push pixel values above 1.0 even when the
-    input was in [0,1]. Confirmed experimentally: max=1.0179 after strong augmentation.
-    Out-of-range inputs shift the activation distribution and degrade convergence significantly.
-    """
+    """Clamp image intensity to [minv, maxv] after augmentation."""
 
     def __init__(self, keys, minv: float = 0.0, maxv: float = 1.0, allow_missing_keys: bool = False):
         super().__init__(keys, allow_missing_keys)
@@ -60,45 +55,61 @@ class SafeClampIntensityd(MapTransform):
         return d
 
 
+def _spatial_modes(keys):
+    """Use smooth interpolation for images and nearest-neighbor for discrete masks."""
+    return tuple("bilinear" if key == "image" else "nearest" for key in keys)
+
+
 def get_spatial_augmentation(keys=["image", "label"]):
-    """Pure spatial/geometric transforms (flip, rotation, affine). Shared between teacher and student (V7-1 fix)."""
+    """Pure spatial/geometric transforms shared between image and label.
+
+    Labels must use nearest-neighbor interpolation. Using MONAI's default bilinear
+    interpolation for segmentation masks turns binary {0,1} targets into fractional
+    masks after rotation/affine transforms, because AsDiscreted runs before augmentation.
+    """
+    modes = _spatial_modes(keys)
     return Compose([
         RandFlipd(keys=keys, prob=0.5, spatial_axis=1),
         RandFlipd(keys=keys, prob=0.5, spatial_axis=2),
-        RandRotated(keys=keys, range_x=np.pi / 36, range_y=np.pi / 36, range_z=np.pi / 36, prob=0.5),
+        RandRotated(
+            keys=keys,
+            range_x=np.pi / 36,
+            range_y=np.pi / 36,
+            range_z=np.pi / 36,
+            prob=0.5,
+            mode=modes,
+        ),
         RandAffined(
-            keys=keys, prob=0.5,
+            keys=keys,
+            prob=0.5,
             rotate_range=(np.pi / 36, np.pi / 36, np.pi / 36),
-            translate_range=(3, 3, 3), scale_range=(0.03, 0.03, 0.03),
+            translate_range=(3, 3, 3),
+            scale_range=(0.03, 0.03, 0.03),
+            mode=modes,
         ),
     ])
 
 
 def get_intensity_augmentation(keys=["image"]):
-    """Pure photometric/intensity transforms (speckle, blur, contrast). Applied to student view only (V7-1 fix).
-
-    All transforms are followed by SafeClampIntensityd to ensure image values stay in [0,1].
-    Without this clamp, RandScaleIntensityd and RandAdjustContrastd push values above 1.0
-    (measured max=1.0179), causing out-of-distribution inputs that degrade convergence.
-    """
+    """Pure photometric/intensity transforms applied to image keys only."""
     image_keys = [k for k in keys if k == "image"]
     return Compose([
         RandMultiplicativeSpeckleNoised(keys=image_keys, prob=0.5, std=0.08),
         RandGaussianSmoothd(keys=image_keys, prob=0.3, sigma_x=(0.5, 1.2), sigma_y=(0.5, 1.2), sigma_z=(0.5, 1.2)),
-        RandGaussianNoised(keys=image_keys, prob=0.2, mean=0.0, std=0.02),  # Additive Gaussian noise for US background robustness
+        RandGaussianNoised(keys=image_keys, prob=0.2, mean=0.0, std=0.02),
         RandScaleIntensityd(keys=image_keys, factors=0.1, prob=0.5),
         RandAdjustContrastd(keys=image_keys, prob=0.5, gamma=(0.7, 1.5)),
-        SafeClampIntensityd(keys=image_keys, minv=0.0, maxv=1.0),  # Clamp after aug: prevents >1.0 inputs to network
+        SafeClampIntensityd(keys=image_keys, minv=0.0, maxv=1.0),
     ])
 
 
 def get_weak_augmentation(keys=["image", "label"]):
-    """In-plane ultrasound flip (lateral axis only) + small rotation (§7 fix)."""
+    """In-plane ultrasound flip + small rotation."""
     return get_spatial_augmentation(keys=keys)
 
 
 def get_strong_augmentation(keys=["image", "label"]):
-    """Strong ultrasound augmentations: Spatial + Photometric Speckle & Contrast (§7 fix)."""
+    """Strong ultrasound augmentations: spatial + photometric."""
     return Compose([
         get_spatial_augmentation(keys=keys),
         get_intensity_augmentation(keys=keys),
