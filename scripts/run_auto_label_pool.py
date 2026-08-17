@@ -33,6 +33,8 @@ Important safeguards
 - QC feature names must exactly match the saved bundle schema.
 - A teacher must exist in the final checkpoint; student-only inference would shift the QC
   feature distribution because several features depend on student/teacher disagreement.
+- Native inversion uses the exact same Compose instance as the DataLoader plus the original
+  decollated MetaTensor transform trace; a recreated transform is never used.
 - Native inversion must return the exact source voxel grid; model-space fallback is rejected.
 - Saved .seg.nrrd geometry is verified against the source image after writing.
 - The policy file is treated as DEVELOPMENT calibration, not a production guarantee.
@@ -65,7 +67,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from monai.data import DataLoader, Dataset
+from monai.data import DataLoader, Dataset, decollate_batch
 from monai.inferers import SlidingWindowInferer
 
 try:
@@ -77,7 +79,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from hassl.active.query_engine import QueryEngine
+from hassl.compat import build_invertd
 from hassl.config import HASSLConfig
 from hassl.data.data_engine import _strip_suffix, get_base_transforms
 from hassl.data.nrrd_utils import write_mask_with_spatial_geometry
@@ -232,6 +234,34 @@ def qc_predict(bundle, features):
     return predicted_dice, failure_probability
 
 
+def invert_prediction_exact(prob_tensor, batch_data, inverse_transform, index=0):
+    """Invert one prediction using the original decollated MetaTensor trace.
+
+    MONAI >=1.5 matches inverse operations through MetaTensor.applied_operations and the
+    concrete forward transform instances. Rebuilding get_base_transforms() here creates new
+    Resized/Spacingd objects and breaks that match. Therefore inverse_transform must have
+    been created from the exact Compose instance used by this DataLoader.
+    """
+    try:
+        samples = decollate_batch(batch_data)
+        if index >= len(samples):
+            raise IndexError(f"decollated batch has {len(samples)} samples, requested index {index}")
+        sample = samples[index]
+        sample["pred"] = prob_tensor[index].detach().cpu()
+        inv_out = inverse_transform(sample)
+        inv_pred = inv_out["pred"]
+        if inv_pred.ndim == 4:
+            inv_pred = inv_pred[0]
+        if torch.is_tensor(inv_pred):
+            inv_pred = inv_pred.detach().cpu().numpy()
+        return (np.asarray(inv_pred) > 0.5).astype(np.uint8)
+    except Exception as exc:
+        raise RuntimeError(
+            "Exact MONAI native inversion failed. No resized-space fallback is allowed. "
+            "The prediction was not written."
+        ) from exc
+
+
 def verify_native_mask_before_write(native_pred: np.ndarray, reference_image_path: str):
     ref = sitk.ReadImage(str(reference_image_path))
     expected_shape = tuple(reversed(ref.GetSize()))
@@ -345,8 +375,17 @@ def main():
         config, input_dir, source_labeled_ids, limit=args.limit
     )
 
+    # IMPORTANT: `transform` is a single concrete Compose instance shared by the Dataset and
+    # the Invertd below. Do not call get_base_transforms() again for inversion.
     transform = get_base_transforms(
         config, keys=["image"], is_training=False, apply_strong_aug=False
+    )
+    inverse_transform = build_invertd(
+        keys=["pred"],
+        transform=transform,
+        orig_keys=["image"],
+        nearest_interp=True,
+        to_tensor=True,
     )
     loader = DataLoader(
         Dataset(cases, transform=transform),
@@ -366,10 +405,6 @@ def main():
         )
 
     inferer = SlidingWindowInferer(tuple(config.spatial_size), sw_batch_size=1, overlap=0.25)
-    inverter = QueryEngine(
-        config=config,
-        manifest_path=str(output_dir / "_unused_pool_manifest.json"),
-    )
 
     for dirname in BUCKET_DIR.values():
         (output_dir / dirname).mkdir(parents=True, exist_ok=True)
@@ -437,14 +472,13 @@ def main():
                 active_dice,
             )
 
-            # Invert the ensemble mask into the native source grid before export. QueryEngine's
-            # helper has a compatibility fallback, but this script deliberately rejects that
-            # fallback unless the returned numpy grid already matches the native source exactly.
-            native_pred = inverter._invert_prediction(
+            # Invert using the original CPU batch so MetaTensor.applied_operations from the
+            # forward preprocessing remain intact. The prediction itself can come from GPU.
+            native_pred = invert_prediction_exact(
                 ensemble_prob_t,
-                image_t,
                 batch,
-                0,
+                inverse_transform,
+                index=0,
             )
             reference_image = verify_native_mask_before_write(native_pred, source_path)
             bucket_dir = output_dir / BUCKET_DIR[bucket]
@@ -560,7 +594,10 @@ def main():
         "feature_schema": list(bundle["feature_columns"]),
         "segmentation_threshold": float(args.seg_threshold),
         "prediction_source": "student_teacher_50_50_ensemble",
-        "native_geometry_validation": "strict source-grid shape before write + size/spacing/origin/direction after write",
+        "native_geometry_validation": (
+            "exact forward Compose + decollated MetaTensor trace for Invertd; strict source-grid "
+            "shape before write + size/spacing/origin/direction after write"
+        ),
         "policy_thresholds": {
             "high_confidence_failure_probability_lte": accept_p,
             "high_confidence_predicted_dice_gte": accept_dice,
