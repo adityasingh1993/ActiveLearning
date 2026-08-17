@@ -108,10 +108,8 @@ def risk_coverage_rows(actual_dice, actual_failure, actual_high_quality, failure
     return rows
 
 
-def threshold_values(values, lower_first=False):
+def threshold_values(values):
     unique = sorted(set(float(x) for x in values))
-    if lower_first:
-        return [0.0] + unique + [1.0]
     return [0.0] + unique + [1.0]
 
 
@@ -168,7 +166,6 @@ def search_acceptance_candidates(
                 ),
             })
 
-    # Highest coverage first. For ties, prefer stricter failure probability then higher Dice.
     candidates.sort(
         key=lambda row: (
             -row["coverage"],
@@ -307,7 +304,6 @@ def main():
         accept_dice = float(chosen["accept_predicted_dice_min"])
         policy_source = "max-coverage candidate satisfying development constraints"
     else:
-        # Fail closed: no auto-accept if development data cannot support the requested constraints.
         accept_p = -1.0
         accept_dice = 1.1
         policy_source = "no candidate satisfied constraints; auto-accept disabled"
@@ -322,7 +318,7 @@ def main():
     )
 
     decision_rows = []
-    for i, row in enumerate(rows):
+    for i in range(len(rows)):
         decision_rows.append({
             "fold": int(folds[i]),
             "case_id": str(case_ids[i]),
@@ -344,7 +340,6 @@ def main():
             idx, actual_dice, actual_failure, actual_high_quality
         )
 
-    # Useful ranking diagnostics: most dangerous missed failures and safest accepted cases.
     failure_indices = np.where(actual_failure == 1)[0]
     missed_failure_ranking = [
         {
@@ -427,6 +422,9 @@ def main():
     print("\nTHREE-WAY DEVELOPMENT BUCKETS")
     for bucket in ["AUTO_ACCEPT", "REVIEW", "ACTIVE_LEARN_PRIORITY"]:
         stats = bucket_metrics[bucket]
+        if stats["n"] == 0:
+            print(f"{bucket:<22} n= 0")
+            continue
         print(
             f"{bucket:<22} n={stats['n']:2d} | mean Dice={stats['mean_actual_dice']:.4f} | "
             f"failures={stats['observed_failures']} | HQ rate={stats['high_quality_rate']:.3f}"
