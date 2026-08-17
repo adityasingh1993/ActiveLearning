@@ -35,6 +35,8 @@ Important safeguards
   feature distribution because several features depend on student/teacher disagreement.
 - Native inversion uses the exact same Compose instance as the DataLoader plus the original
   decollated MetaTensor transform trace; a recreated transform is never used.
+- MONAI native spatial arrays are normalized from (X,Y,Z) to SimpleITK numpy (Z,Y,X) before
+  GetImageFromArray; no spatial resampling is used for this axis-order conversion.
 - Native inversion must return the exact source voxel grid; model-space fallback is rejected.
 - Saved .seg.nrrd geometry is verified against the source image after writing.
 - The policy file is treated as DEVELOPMENT calibration, not a production guarantee.
@@ -263,18 +265,44 @@ def invert_prediction_exact(prob_tensor, batch_data, inverse_transform, index=0)
 
 
 def verify_native_mask_before_write(native_pred: np.ndarray, reference_image_path: str):
+    """Validate native grid and normalize MONAI XYZ array order to SimpleITK ZYX order.
+
+    SimpleITK GetSize() reports (X, Y, Z), while GetArrayFromImage()/GetImageFromArray use
+    numpy arrays in (Z, Y, X). MONAI's inverted spatial tensor for these images is in native
+    spatial (X, Y, Z) order. Therefore a shape equal to ref.GetSize() is already correctly
+    inverted and only needs an axis-order transpose before SimpleITK writing.
+    """
     ref = sitk.ReadImage(str(reference_image_path))
-    expected_shape = tuple(reversed(ref.GetSize()))
-    actual_shape = tuple(np.squeeze(native_pred).shape)
-    if actual_shape != expected_shape:
+    source_size_xyz = tuple(int(x) for x in ref.GetSize())
+    expected_sitk_numpy_zyx = tuple(reversed(source_size_xyz))
+    arr = np.squeeze(native_pred).astype(np.uint8, copy=False)
+    actual_shape = tuple(arr.shape)
+
+    if actual_shape == source_size_xyz:
+        # Correct MONAI native grid; convert storage order only, with no interpolation/resampling.
+        arr = np.transpose(arr, (2, 1, 0))
+    elif actual_shape == expected_sitk_numpy_zyx:
+        # Already in SimpleITK numpy array order.
+        pass
+    else:
         raise RuntimeError(
             "Native inversion did not return the exact source voxel grid. Refusing fallback resampling.\n"
             f"Reference: {reference_image_path}\n"
-            f"Expected numpy shape: {expected_shape}\n"
-            f"Inverted prediction:  {actual_shape}\n"
-            "This usually means MONAI transform-trace metadata was lost during inversion."
+            f"Source SimpleITK size (X,Y,Z): {source_size_xyz}\n"
+            f"Expected SITK numpy shape (Z,Y,X): {expected_sitk_numpy_zyx}\n"
+            f"Inverted prediction shape: {actual_shape}\n"
+            "A valid MONAI-native result must match source (X,Y,Z), or already be SITK numpy (Z,Y,X)."
         )
-    return ref
+
+    arr = np.ascontiguousarray(arr)
+    if tuple(arr.shape) != expected_sitk_numpy_zyx:
+        raise RuntimeError(
+            "Axis normalization failed before native segmentation write.\n"
+            f"Reference: {reference_image_path}\n"
+            f"Expected final numpy shape: {expected_sitk_numpy_zyx}\n"
+            f"Got: {tuple(arr.shape)}"
+        )
+    return ref, arr
 
 
 def verify_saved_geometry(segmentation_path: Path, reference_image):
@@ -480,12 +508,14 @@ def main():
                 inverse_transform,
                 index=0,
             )
-            reference_image = verify_native_mask_before_write(native_pred, source_path)
+            reference_image, native_pred_sitk = verify_native_mask_before_write(
+                native_pred, source_path
+            )
             bucket_dir = output_dir / BUCKET_DIR[bucket]
             seg_path = bucket_dir / f"{case_id}_pred{config.label_suffix}"
             write_mask_with_spatial_geometry(
                 str(seg_path),
-                native_pred,
+                native_pred_sitk,
                 reference_image_path=source_path,
             )
             verify_saved_geometry(seg_path, reference_image)
@@ -595,8 +625,9 @@ def main():
         "segmentation_threshold": float(args.seg_threshold),
         "prediction_source": "student_teacher_50_50_ensemble",
         "native_geometry_validation": (
-            "exact forward Compose + decollated MetaTensor trace for Invertd; strict source-grid "
-            "shape before write + size/spacing/origin/direction after write"
+            "exact forward Compose + decollated MetaTensor trace for Invertd; MONAI XYZ to "
+            "SimpleITK ZYX axis-order normalization without resampling; strict source-grid size/spacing/"
+            "origin/direction verification after write"
         ),
         "policy_thresholds": {
             "high_confidence_failure_probability_lte": accept_p,
