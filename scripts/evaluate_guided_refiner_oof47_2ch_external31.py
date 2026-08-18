@@ -77,12 +77,13 @@ from hassl.config import HASSLConfig
 from hassl.data.data_engine import get_base_transforms
 from scripts.build_oof_qc_dataset import load_models
 import scripts.train_supervised_cv as cv
-from scripts.evaluate_oracle_roi_external31 import baseline_ema_rows, oracle_case_rows, summarize
+from scripts.evaluate_oracle_roi_external31 import baseline_ema_rows, summarize
 from scripts.evaluate_predicted_roi_refinement_external31 import (
     build_training_target_prior,
     choose_localization_candidate,
     crop_gt_coverage,
     expanded_roi_from_candidate,
+    oracle_case_rows,
     parse_thresholds,
 )
 from scripts.oracle_roi_utils import paste_crop_into_full
@@ -268,7 +269,6 @@ def main():
     print("External GT is evaluation-only and never selects/repairs the ROI.")
     print("=" * 124)
 
-    # Phase 1: Final62 EMA -> native probability -> automatic ROI.
     full_transform = get_base_transforms(config, keys=["image"], is_training=False, apply_strong_aug=False)
     full_inverse = build_invertd(
         keys=["pred"], transform=full_transform, orig_keys=["image"], nearest_interp=False, to_tensor=True
@@ -356,7 +356,6 @@ def main():
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # Phase 2: [ultrasound, coarse probability] -> 2-channel guided refiner.
     roi_transform = build_guided_infer_transform(config, args.resize_size)
     roi_inverse = build_invertd(
         keys=["pred"], transform=roi_transform, orig_keys=["image"], nearest_interp=False, to_tensor=True
