@@ -4,15 +4,43 @@
 Each case is inferred only by the fold model for which that case was held out. The output
 probability map is inverted back to the exact native image grid and stored as float32 MHA.
 These maps are intended as the second input channel for the offline guided ROI refiner.
+
+Use ``--gpu 0`` or ``--gpu 1`` to select the physical CUDA device. CUDA visibility is set
+before PyTorch/MONAI are imported, so all existing ``cuda`` device logic consistently runs on
+the requested GPU without changing checkpoint contents or the frozen model recipe.
 """
 
 import argparse
 import csv
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
 
+
+def _preconfigure_gpu_from_argv(argv):
+    gpu = None
+    args = list(argv)
+    for i, token in enumerate(args):
+        if token == "--gpu":
+            if i + 1 >= len(args):
+                raise SystemExit("--gpu requires 0 or 1")
+            gpu = args[i + 1]
+            break
+        if token.startswith("--gpu="):
+            gpu = token.split("=", 1)[1]
+            break
+    if gpu is not None:
+        if gpu not in {"0", "1"}:
+            raise SystemExit(f"--gpu must be 0 or 1, got {gpu!r}")
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+    return gpu
+
+
+SELECTED_GPU = _preconfigure_gpu_from_argv(sys.argv)
+
+# Import torch/MONAI only after CUDA visibility is fixed.
 import numpy as np
 import torch
 from monai.data import DataLoader, Dataset
@@ -72,8 +100,12 @@ def main():
     p.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     p.add_argument("--resize-size", type=int, default=128)
     p.add_argument("--threshold", type=float, default=0.50)
+    p.add_argument("--gpu", type=int, choices=[0, 1], default=None, help="Physical CUDA GPU index")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
+
+    if args.gpu is not None and str(args.gpu) != str(SELECTED_GPU):
+        raise RuntimeError("GPU preconfiguration mismatch")
 
     cv_dir = Path(args.cv_dir)
     audit_path = Path(args.audit_metadata)
@@ -116,8 +148,13 @@ def main():
     inverse_transform = build_invertd(
         keys=["pred"], transform=transform, orig_keys=["image"], nearest_interp=False, to_tensor=True
     )
-    device = torch.device("cuda" if torch.cuda.is_available() and config.device == "cuda" else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() and str(config.device).startswith("cuda") else "cpu")
     inferer = SlidingWindowInferer(tuple(config.spatial_size), sw_batch_size=1, overlap=0.25)
+
+    print(
+        f"CUDA selection: physical GPU {SELECTED_GPU if SELECTED_GPU is not None else 'from environment/config'} | "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} | runtime device={device}"
+    )
 
     rows = []
     for fold_spec in manifest["folds"]:
@@ -191,6 +228,7 @@ def main():
         "source_cv_dir": str(cv_dir),
         "source_split_manifest": str(manifest_path),
         "source_audit": str(audit_path),
+        "physical_gpu": int(args.gpu) if args.gpu is not None else None,
         "threshold_for_sanity_metrics": float(args.threshold),
         "mean_oof_ema_dice_at_050": float(np.mean(dices)),
         "median_oof_ema_dice_at_050": float(np.median(dices)),
