@@ -265,6 +265,46 @@ pytest tests/
 
 ---
 
+## 🧪 QC-Gated Auto-Label / Active-Learning Development Workflow
+
+The current development workflow freezes a 47-label supervised baseline, builds fold-aware OOF QC features, trains a tabular failure/quality model, derives a conservative development policy, trains one final 47-label segmentation model, and applies the combined segmentation+QC stack to the unlabeled pool.
+
+Current development policy:
+
+```text
+HIGH_CONFIDENCE_PSEUDO_LABEL
+  if P(failure) <= 0.2412 AND predicted Dice >= 0.8015
+
+ACTIVE_LEARN_PRIORITY
+  if P(failure) >= 0.50 OR predicted Dice <= 0.70
+
+otherwise REVIEW
+```
+
+These thresholds are development-calibrated only. High-confidence outputs are pseudo-label candidates, not production auto-accepts, until a future locked validation set confirms acceptable failure risk.
+
+Current 56-case unlabeled-pool run:
+
+```text
+HIGH_CONFIDENCE_PSEUDO_LABEL  21
+REVIEW                        17
+ACTIVE_LEARN_PRIORITY         18
+mean predicted Dice           0.7487
+mean P(failure)               0.4192
+```
+
+For the first annotation batch, run a deterministic risk+diversity selector rather than taking the top-N failures blindly:
+
+```bash
+python scripts/select_active_learning_batch.py \
+  --pool-dir experiments/auto_label_pool_v1 \
+  --batch-size 10
+```
+
+The default selector seeds the highest-risk case, then uses 65% risk and 35% minimum distance in robust-scaled QC feature space. This is `QC-feature diversity v1`; future encoder/CoreSet diversity should be compared as a controlled experiment rather than substituted silently.
+
+---
+
 ## 📄 License
 
 Distributed under the MIT License. See `LICENSE` for more information.
