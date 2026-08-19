@@ -45,22 +45,90 @@ def load_seg_nrrd(filepath: str) -> Tuple[np.ndarray, Dict[int, Dict[str, Any]]]
     return data.astype(np.uint8), segments
 
 
-def write_mask_with_spatial_geometry(output_path: str, mask_arr: np.ndarray, reference_image_path: Optional[str] = None):
-    """Write segmentation mask preserving physical affine spatial metadata (origin, spacing, direction) (M-1 fix)."""
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+def _slicer_segmentation_metadata(
+    size_xyz,
+    segment_name: str = "Bladder",
+    segment_id: Optional[str] = None,
+    label_value: int = 1,
+    segment_color: str = "0.0 1.0 0.0",
+) -> Dict[str, str]:
+    """Return the 3D Slicer .seg.nrrd key/value metadata required by downstream apps."""
+    segment_id = segment_id or segment_name
+    sx, sy, sz = [int(v) for v in size_xyz]
+
+    # Keep the labelmap on the full native reference extent. This matches the way HASSL writes
+    # native-grid predictions and avoids a cropped-layer offset being interpreted by consumers.
+    extent = f"0 {max(sx - 1, 0)} 0 {max(sy - 1, 0)} 0 {max(sz - 1, 0)}"
+
+    return {
+        "Segmentation_ContainedRepresentationNames": "Binary labelmap|",
+        "Segmentation_MasterRepresentation": "Binary labelmap",
+        "Segmentation_ReferenceImageExtentOffset": "0 0 0",
+        "Segment0_ID": str(segment_id),
+        "Segment0_LabelValue": str(int(label_value)),
+        "Segment0_Layer": "0",
+        "Segment0_Color": str(segment_color),
+        "Segment0_Name": str(segment_name),
+        "Segment0_Extent": extent,
+        "Segment0_Tags": "|",
+    }
+
+
+def _set_slicer_metadata(
+    image,
+    segment_name: str = "Bladder",
+    segment_id: Optional[str] = None,
+    label_value: int = 1,
+    segment_color: str = "0.0 1.0 0.0",
+):
+    """Attach Slicer segmentation metadata to a SimpleITK image before NRRD writing."""
+    metadata = _slicer_segmentation_metadata(
+        image.GetSize(),
+        segment_name=segment_name,
+        segment_id=segment_id,
+        label_value=label_value,
+        segment_color=segment_color,
+    )
+    for key, value in metadata.items():
+        image.SetMetaData(key, value)
+
+
+def write_mask_with_spatial_geometry(
+    output_path: str,
+    mask_arr: np.ndarray,
+    reference_image_path: Optional[str] = None,
+    segment_name: str = "Bladder",
+    segment_id: Optional[str] = None,
+    label_value: int = 1,
+    segment_color: str = "0.0 1.0 0.0",
+):
+    """Write a native-grid Slicer-compatible .seg.nrrd with spatial and segment metadata.
+
+    Geometry fields such as sizes, space directions and space origin are inherited from the
+    reference image. Slicer segmentation key/value fields are written explicitly so consumers
+    can recognize the file as a Binary labelmap segmentation rather than a plain NRRD volume.
+    """
+    parent = os.path.dirname(output_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    clean_arr = np.squeeze(mask_arr).astype(np.uint8)
+    if clean_arr.ndim != 3:
+        raise ValueError(f"Mask array must be 3D after squeeze, got shape {mask_arr.shape}")
 
     if sitk is not None and reference_image_path and os.path.exists(reference_image_path):
         try:
             ref_img = sitk.ReadImage(reference_image_path)
-            # Squeeze extra dimensions (e.g. channel dim C=1) so mask_arr is strictly 3D (Z, Y, X) / (D, H, W)
-            clean_arr = np.squeeze(mask_arr).astype(np.uint8)
-            if clean_arr.ndim != 3:
-                raise ValueError(f"Mask array must be 3D after squeeze, got shape {mask_arr.shape}")
+            if ref_img.GetDimension() != 3:
+                raise ValueError(
+                    f"Reference image must be 3D, got dimension={ref_img.GetDimension()}"
+                )
 
             mask_img = sitk.GetImageFromArray(clean_arr)
 
             if mask_img.GetSize() != ref_img.GetSize():
-                # Compute physical spacing for preprocessed mask
+                # Compute physical spacing for the preprocessed mask before nearest-neighbor
+                # resampling back to the exact native reference grid.
                 ref_size = ref_img.GetSize()
                 ref_spacing = ref_img.GetSpacing()
                 mask_size = mask_img.GetSize()
@@ -74,26 +142,50 @@ def write_mask_with_spatial_geometry(output_path: str, mask_arr: np.ndarray, ref
                 mask_img.SetOrigin(ref_img.GetOrigin())
                 mask_img.SetDirection(ref_img.GetDirection())
 
-                # Resample back into native reference grid
                 resampler = sitk.ResampleImageFilter()
                 resampler.SetReferenceImage(ref_img)
                 resampler.SetInterpolator(sitk.sitkNearestNeighbor)
                 resampler.SetTransform(sitk.Transform())
                 mask_img = resampler.Execute(mask_img)
 
+            mask_img = sitk.Cast(mask_img, sitk.sitkUInt8)
             mask_img.CopyInformation(ref_img)
-            sitk.WriteImage(mask_img, output_path)
+            _set_slicer_metadata(
+                mask_img,
+                segment_name=segment_name,
+                segment_id=segment_id,
+                label_value=label_value,
+                segment_color=segment_color,
+            )
+
+            writer = sitk.ImageFileWriter()
+            writer.SetFileName(output_path)
+            writer.SetUseCompression(True)
+            writer.Execute(mask_img)
             return
         except Exception as e:
-            print(f"[NRRD Utils] Warning: SimpleITK spatial write failed ({type(e).__name__}: {e}), falling back to pynrrd")
+            print(
+                f"[NRRD Utils] Warning: SimpleITK spatial/Slicer write failed "
+                f"({type(e).__name__}: {e}), falling back to pynrrd"
+            )
 
-    # Fallback to pynrrd if SimpleITK fails
+    # Fallback to pynrrd. This path can still carry Slicer tags, but if a readable reference
+    # image is unavailable it cannot guarantee native physical geometry. The normal HASSL
+    # auto-label path uses the SimpleITK branch above with the source image as reference.
+    size_xyz = (clean_arr.shape[2], clean_arr.shape[1], clean_arr.shape[0])
     header = {
         'type': 'uint8',
         'encoding': 'gzip',
         'space': 'left-posterior-superior',
-        'Segment0_Name': 'Organ',
-        'Segment0_LabelValue': '1',
-        'Segment0_Color': '0.3 0.9 0.3',
+        'kinds': ['domain', 'domain', 'domain'],
     }
-    nrrd.write(output_path, mask_arr.astype(np.uint8), header=header)
+    header.update(
+        _slicer_segmentation_metadata(
+            size_xyz,
+            segment_name=segment_name,
+            segment_id=segment_id,
+            label_value=label_value,
+            segment_color=segment_color,
+        )
+    )
+    nrrd.write(output_path, clean_arr, header=header)
