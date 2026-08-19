@@ -41,16 +41,46 @@ class SSLPretrainer:
 
         self.model = self.model.to(self.device)
 
+        # The controlled Final62 SSL experiment uses 4^3=64 spatial tokens instead of 2^3=8.
+        # This keeps the contrastive task non-trivial for batch_size=1 and is configurable for
+        # future experiments without changing the task implementation.
+        self.contrastive_grid_size = int(getattr(config, 'ssl_contrastive_grid_size', 4))
+        if self.contrastive_grid_size < 2:
+            raise ValueError("ssl_contrastive_grid_size must be >= 2")
+
+        # Mild, geometry-preserving ultrasound intensity perturbations. The two contrastive
+        # views are generated independently while retaining voxel-to-voxel spatial alignment,
+        # so token i remains the positive pair for token i.
+        self.contrastive_gamma_min = float(getattr(config, 'ssl_contrastive_gamma_min', 0.8))
+        self.contrastive_gamma_max = float(getattr(config, 'ssl_contrastive_gamma_max', 1.2))
+        self.contrastive_scale_min = float(getattr(config, 'ssl_contrastive_scale_min', 0.9))
+        self.contrastive_scale_max = float(getattr(config, 'ssl_contrastive_scale_max', 1.1))
+        self.contrastive_shift_abs = float(getattr(config, 'ssl_contrastive_shift_abs', 0.05))
+        self.contrastive_noise_std_max = float(getattr(config, 'ssl_contrastive_noise_std_max', 0.05))
+
+        if self.contrastive_gamma_min <= 0 or self.contrastive_gamma_max < self.contrastive_gamma_min:
+            raise ValueError("Invalid SSL contrastive gamma range")
+        if self.contrastive_scale_min <= 0 or self.contrastive_scale_max < self.contrastive_scale_min:
+            raise ValueError("Invalid SSL contrastive intensity-scale range")
+        if self.contrastive_shift_abs < 0 or self.contrastive_noise_std_max < 0:
+            raise ValueError("SSL contrastive shift/noise settings must be non-negative")
+
         # Task heads operating on bottleneck features (H-4 fix)
         self.rot_head = nn.LazyLinear(4).to(self.device)
         self.proj_head = nn.LazyLinear(getattr(config, 'ssl_embedding_dim', 128)).to(self.device)
 
-        # Dry run to initialize LazyLinear heads on bottleneck feature dimensions (H-4 & Sub-Patch InfoNCE fix)
+        # Dry run to initialize LazyLinear heads on bottleneck feature dimensions. 64^3 is used
+        # here so a 4^3 token grid is represented naturally at the deepest DynUNet feature map.
         with torch.no_grad():
-            dummy_x = torch.zeros(1, 1, 32, 32, 32, device=self.device)
+            dummy_x = torch.zeros(1, 1, 64, 64, 64, device=self.device)
             dummy_bottleneck = self._extract_bottleneck_features(dummy_x)
             dummy_rot_feat = F.adaptive_avg_pool3d(dummy_bottleneck, 1).view(1, -1)
-            dummy_patch_feat = F.adaptive_avg_pool3d(dummy_bottleneck, (2, 2, 2)).permute(0, 2, 3, 4, 1).reshape(-1, dummy_bottleneck.size(1))
+            g = self.contrastive_grid_size
+            dummy_patch_feat = (
+                F.adaptive_avg_pool3d(dummy_bottleneck, (g, g, g))
+                .permute(0, 2, 3, 4, 1)
+                .reshape(-1, dummy_bottleneck.size(1))
+            )
             self.rot_head(dummy_rot_feat)
             self.proj_head(dummy_patch_feat)
 
@@ -82,15 +112,13 @@ class SSLPretrainer:
     def _extract_bottleneck_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extract deep bottleneck features from encoder (H-4 fix)."""
         if isinstance(self.model, UNet):
-            # Pass through UNet encoder layers up to bottleneck
             h = x
             for block in self.model.model:
                 h = block(h)
-                if h.shape[1] >= 128:  # Deepest bottleneck
+                if h.shape[1] >= 128:
                     break
             return h
         elif isinstance(self.model, DynUNet):
-            # Pass through DynUNet input block + down blocks to deepest layer
             h = self.model.input_block(x)
             for down in self.model.downsamples:
                 h = down(h)
@@ -100,7 +128,7 @@ class SSLPretrainer:
             return out[0] if isinstance(out, (list, tuple)) else out
 
     def _apply_masking(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate random 3D sub-cube mask (30% volume masking)."""
+        """Generate random 3D sub-cube mask (30% volume masking by default)."""
         mask = torch.ones_like(x)
         b, c, d, h, w = x.shape
         cube_sz = getattr(self.config, 'ssl_mask_cube_size', 16)
@@ -123,7 +151,7 @@ class SSLPretrainer:
         return x * mask, mask
 
     def _apply_rotation(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply random 3D rotations for rotation prediction task."""
+        """Apply random 90-degree in-plane rotations for rotation prediction."""
         b = x.size(0)
         rotated_x = x.clone()
         labels = torch.zeros(b, dtype=torch.long, device=x.device)
@@ -133,14 +161,47 @@ class SSLPretrainer:
             labels[i] = k
         return rotated_x, labels
 
+    def _make_contrastive_view(self, x: torch.Tensor) -> torch.Tensor:
+        """Create an independently perturbed but spatially aligned ultrasound view.
+
+        Spatial transforms are intentionally excluded here because InfoNCE positives are paired
+        by spatial token index. Gamma, scale, shift, and noise make the appearance different
+        without invalidating that correspondence.
+        """
+        b = x.size(0)
+        param_shape = (b, 1, 1, 1, 1)
+        dtype = x.dtype
+        device = x.device
+
+        gamma = torch.empty(param_shape, device=device, dtype=dtype).uniform_(
+            self.contrastive_gamma_min, self.contrastive_gamma_max
+        )
+        scale = torch.empty(param_shape, device=device, dtype=dtype).uniform_(
+            self.contrastive_scale_min, self.contrastive_scale_max
+        )
+        shift = torch.empty(param_shape, device=device, dtype=dtype).uniform_(
+            -self.contrastive_shift_abs, self.contrastive_shift_abs
+        )
+        noise_std = torch.empty(param_shape, device=device, dtype=dtype).uniform_(
+            0.0, self.contrastive_noise_std_max
+        )
+
+        view = torch.clamp(x, 0.0, 1.0).pow(gamma)
+        view = view * scale + shift
+        if self.contrastive_noise_std_max > 0:
+            view = view + torch.randn_like(view) * noise_std
+        return torch.clamp(view, 0.0, 1.0)
+
     def _infonce_loss(self, feat1: torch.Tensor, feat2: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
-        """Spatial sub-patch InfoNCE contrastive loss supporting any batch size (B >= 1)."""
+        """Symmetric spatial-token InfoNCE supporting batch size one."""
         feat1 = F.normalize(feat1, dim=-1)
         feat2 = F.normalize(feat2, dim=-1)
 
         sim_matrix = torch.matmul(feat1, feat2.T) / temperature
         labels = torch.arange(sim_matrix.size(0), device=feat1.device)
-        return self.ce_loss(sim_matrix, labels)
+        loss_12 = self.ce_loss(sim_matrix, labels)
+        loss_21 = self.ce_loss(sim_matrix.T, labels)
+        return 0.5 * (loss_12 + loss_21)
 
     def train(self, num_epochs: int):
         log_img_freq = getattr(self.config, 'log_image_every_n_epochs', 10)
@@ -159,7 +220,7 @@ class SSLPretrainer:
                 self.optimizer.zero_grad()
 
                 with torch.amp.autocast(self.device_type, enabled=(self.device_type == 'cuda')):
-                    # 1. Masked Volume Inpainting (M-6 fix: compute loss only on masked voxels)
+                    # 1. Masked Volume Inpainting: compute MSE only on masked voxels.
                     x_masked, mask = self._apply_masking(x)
                     out_inp = self.model(x_masked)
                     if isinstance(out_inp, (list, tuple)):
@@ -167,37 +228,51 @@ class SSLPretrainer:
                     elif out_inp.ndim == 6:
                         out_inp = out_inp[:, 0]
 
-                    unmasked_count = (1 - mask).sum()
-                    if unmasked_count > 0:
-                        loss_inp = (self.mse_loss(out_inp * (1 - mask), x * (1 - mask)) * mask.numel()) / unmasked_count
+                    masked_count = (1 - mask).sum()
+                    if masked_count > 0:
+                        loss_inp = (self.mse_loss(out_inp * (1 - mask), x * (1 - mask)) * mask.numel()) / masked_count
                     else:
                         loss_inp = self.mse_loss(out_inp, x)
 
-                    # 2 & 3. Rotation & Contrastive Learning via single batched bottleneck forward pass (GPU Speedup)
+                    # 2 & 3. Rotation + stronger spatial-token contrastive learning.
                     x_rot, rot_labels = self._apply_rotation(x)
-                    x_aug1 = x + torch.randn_like(x) * 0.05
-                    x_aug2 = x + torch.randn_like(x) * 0.05
+                    x_aug1 = self._make_contrastive_view(x)
+                    x_aug2 = self._make_contrastive_view(x)
 
                     B = x.size(0)
                     x_combined = torch.cat([x_rot, x_aug1, x_aug2], dim=0)
                     bottlenecks = self._extract_bottleneck_features(x_combined)
 
                     b_rot = bottlenecks[:B]
-                    b1 = bottlenecks[B:2*B]
-                    b2 = bottlenecks[2*B:]
+                    b1 = bottlenecks[B:2 * B]
+                    b2 = bottlenecks[2 * B:]
 
                     rot_feats = F.adaptive_avg_pool3d(b_rot, 1).view(B, -1)
                     rot_preds = self.rot_head(rot_feats)
                     loss_rot = self.ce_loss(rot_preds, rot_labels)
 
-                    # Extract 2x2x2 spatial sub-patch representations for InfoNCE contrastive pairs (8 patches per volume)
-                    p1 = F.adaptive_avg_pool3d(b1, (2, 2, 2)).permute(0, 2, 3, 4, 1).reshape(-1, b1.size(1))
-                    p2 = F.adaptive_avg_pool3d(b2, (2, 2, 2)).permute(0, 2, 3, 4, 1).reshape(-1, b2.size(1))
+                    # 4x4x4 by default = 64 spatial tokens per volume rather than 8.
+                    g = self.contrastive_grid_size
+                    p1 = (
+                        F.adaptive_avg_pool3d(b1, (g, g, g))
+                        .permute(0, 2, 3, 4, 1)
+                        .reshape(-1, b1.size(1))
+                    )
+                    p2 = (
+                        F.adaptive_avg_pool3d(b2, (g, g, g))
+                        .permute(0, 2, 3, 4, 1)
+                        .reshape(-1, b2.size(1))
+                    )
 
                     feat1 = self.proj_head(p1)
                     feat2 = self.proj_head(p2)
-                    loss_cont = self._infonce_loss(feat1, feat2, temperature=getattr(self.config, 'ssl_contrastive_temp', 0.07))
+                    loss_cont = self._infonce_loss(
+                        feat1,
+                        feat2,
+                        temperature=getattr(self.config, 'ssl_contrastive_temp', 0.07),
+                    )
 
+                    # Equal weights remain frozen for the controlled experiment.
                     loss = loss_inp + loss_rot + loss_cont
 
                 self.scaler.scale(loss).backward()
@@ -222,6 +297,11 @@ class SSLPretrainer:
             avg_rot = epoch_rot / N
             avg_cont = epoch_cont / N
 
+            contribution_total = max(avg_inp + avg_rot + avg_cont, 1e-12)
+            inp_pct = 100.0 * avg_inp / contribution_total
+            rot_pct = 100.0 * avg_rot / contribution_total
+            cont_pct = 100.0 * avg_cont / contribution_total
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -229,14 +309,23 @@ class SSLPretrainer:
             if getattr(self, 'scheduler', None) is not None:
                 self.scheduler.step()
 
-            print(f"  [SSL Pre-train] Epoch {epoch + 1:3d}/{num_epochs} | "
-                  f"Loss: {avg_loss:.4f} (Inp: {avg_inp:.4f}, Rot: {avg_rot:.4f}, Cont: {avg_cont:.4f}) | LR: {current_lr:.6f}")
+            print(
+                f"  [SSL Pre-train] Epoch {epoch + 1:3d}/{num_epochs} | "
+                f"Loss: {avg_loss:.4f} (Inp: {avg_inp:.4f}, Rot: {avg_rot:.4f}, Cont: {avg_cont:.4f}) | "
+                f"Mix: I={inp_pct:.1f}% R={rot_pct:.1f}% C={cont_pct:.1f}% | "
+                f"LR: {current_lr:.6f}"
+            )
 
             self.tracker.log_metrics({
                 'ssl_loss': avg_loss,
                 'ssl_loss_inpainting': avg_inp,
                 'ssl_loss_rotation': avg_rot,
                 'ssl_loss_contrastive': avg_cont,
+                'ssl_contribution_inpainting_pct': inp_pct,
+                'ssl_contribution_rotation_pct': rot_pct,
+                'ssl_contribution_contrastive_pct': cont_pct,
+                'ssl_contrastive_grid_size': float(self.contrastive_grid_size),
+                'ssl_contrastive_tokens_per_volume': float(self.contrastive_grid_size ** 3),
                 'ssl_learning_rate': current_lr,
             }, step=epoch)
 
@@ -244,7 +333,11 @@ class SSLPretrainer:
                 self.log_ssl_inpainting_samples(epoch, *first_batch_sample)
 
             if getattr(self, 'early_stopper', None) is not None and self.early_stopper(avg_loss):
-                print(f"  [SSL Early Stopping] SSL loss did not improve for {self.early_stopper.patience} consecutive epochs. Early stopping at epoch {epoch + 1}.")
+                print(
+                    f"  [SSL Early Stopping] SSL loss did not improve for "
+                    f"{self.early_stopper.patience} consecutive epochs. "
+                    f"Early stopping at epoch {epoch + 1}."
+                )
                 break
 
         ckpt_dir = getattr(self.config, 'checkpoint_dir', './experiments/checkpoints')
