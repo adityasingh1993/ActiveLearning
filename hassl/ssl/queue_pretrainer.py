@@ -106,26 +106,28 @@ class QueueSSLPretrainer(SSLPretrainer):
             return anchors.sum() * 0.0, 0.0, positive_cosine
 
         queue = self.queue_embeddings.to(device=anchors.device, dtype=anchors.dtype)
-        negative_logits = anchors @ queue.T
-        negative_logits = negative_logits / temperature
+        negative_logits = (anchors @ queue.T) / temperature
 
-        usable_counts = []
-        for row_idx, case_id in enumerate(case_ids):
-            valid = torch.tensor(
-                [queued_id != case_id for queued_id in self.queue_ids],
-                dtype=torch.bool,
-                device=anchors.device,
-            )
-            usable_counts.append(float(valid.sum().item()))
-            negative_logits[row_idx, ~valid] = torch.finfo(negative_logits.dtype).min
+        valid_rows = [
+            [queued_id != case_id for queued_id in self.queue_ids]
+            for case_id in case_ids
+        ]
+        valid_mask = torch.tensor(valid_rows, dtype=torch.bool, device=anchors.device)
+        usable_counts = valid_mask.sum(dim=1).float()
 
-        if not any(count > 0 for count in usable_counts):
+        if not bool((usable_counts > 0).any().item()):
             return anchors.sum() * 0.0, 0.0, positive_cosine
+
+        # Avoid in-place edits on autograd-tracked logits. Invalid same-case queue entries are
+        # effectively removed from the softmax denominator.
+        negative_logits = negative_logits.masked_fill(
+            ~valid_mask, torch.finfo(negative_logits.dtype).min
+        )
 
         logits = torch.cat([positive_logits, negative_logits], dim=1)
         targets = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
         loss = F.cross_entropy(logits, targets)
-        return loss, float(sum(usable_counts) / len(usable_counts)), positive_cosine
+        return loss, float(usable_counts.mean().item()), positive_cosine
 
     def _contrastive_loss(
         self,
