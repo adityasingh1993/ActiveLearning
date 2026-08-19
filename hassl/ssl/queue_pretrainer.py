@@ -46,12 +46,28 @@ class QueueSSLPretrainer(SSLPretrainer):
         if self.queue_size < 1:
             raise ValueError("ssl_contrastive_queue_size must be >= 1")
 
+        # Keep the memory bank as a plain torch.Tensor. MONAI MetaTensor metadata must never
+        # enter this queue because slicing a batched MetaTensor attempts to collate metadata
+        # from different source volumes and can fail once the FIFO queue is truncated.
         self.queue_embeddings = torch.empty(
             (0, int(getattr(config, "ssl_embedding_dim", 128))),
             dtype=torch.float32,
             device=self.device,
         )
         self.queue_ids: List[str] = []
+
+    @staticmethod
+    def _plain_tensor(x: torch.Tensor) -> torch.Tensor:
+        """Return a base torch.Tensor while preserving autograd when possible.
+
+        MONAI transforms produce MetaTensor inputs. Neural-network operations can propagate
+        that subclass all the way into the projection head. For the differentiable embedding
+        path, MetaTensor.as_tensor() drops only MONAI metadata and keeps the underlying torch
+        graph. Detached queue copies are subsequently cloned before storage.
+        """
+        if hasattr(x, "as_tensor"):
+            x = x.as_tensor()
+        return x
 
     @staticmethod
     def _normalize_case_ids(case_ids, batch_size: int) -> List[str]:
@@ -77,6 +93,9 @@ class QueueSSLPretrainer(SSLPretrainer):
     def _global_embedding(self, bottleneck: torch.Tensor) -> torch.Tensor:
         pooled = F.adaptive_avg_pool3d(bottleneck, 1).flatten(1)
         projected = self.proj_head(pooled)
+        # Drop MONAI metadata before the embedding is used by the memory-bank code. This is
+        # still differentiable; only the MetaTensor wrapper is removed.
+        projected = self._plain_tensor(projected)
         return F.normalize(projected.float(), dim=1)
 
     def _queue_logits(
@@ -92,6 +111,9 @@ class QueueSSLPretrainer(SSLPretrainer):
         The first queue-less batch returns a differentiable zero contrastive loss; after that
         the queue fills rapidly because the controlled experiment has 103 shuffled volumes.
         """
+        anchors = self._plain_tensor(anchors)
+        positives = self._plain_tensor(positives)
+
         if anchors.shape != positives.shape:
             raise RuntimeError(
                 f"Contrastive embedding shape mismatch: {anchors.shape} vs {positives.shape}"
@@ -105,7 +127,8 @@ class QueueSSLPretrainer(SSLPretrainer):
         if self.queue_embeddings.numel() == 0:
             return anchors.sum() * 0.0, 0.0, positive_cosine
 
-        queue = self.queue_embeddings.to(device=anchors.device, dtype=anchors.dtype)
+        queue = self._plain_tensor(self.queue_embeddings)
+        queue = queue.to(device=anchors.device, dtype=anchors.dtype)
         negative_logits = (anchors @ queue.T) / temperature
 
         valid_rows = [
@@ -153,19 +176,27 @@ class QueueSSLPretrainer(SSLPretrainer):
 
     @torch.no_grad()
     def _enqueue(self, embeddings: torch.Tensor, case_ids: Sequence[str]) -> None:
-        embeddings = F.normalize(embeddings.detach().float(), dim=1)
+        # Explicitly strip MetaTensor metadata before touching the FIFO queue. The previous
+        # implementation allowed torch.cat to promote the queue into a MetaTensor; when the
+        # queue later exceeded 256 entries, slicing invoked MONAI metadata collation and failed.
+        embeddings = self._plain_tensor(embeddings)
+        embeddings = F.normalize(embeddings.detach().float(), dim=1).clone()
         if len(case_ids) != embeddings.size(0):
             raise RuntimeError("Queue enqueue case-ID count mismatch")
 
-        self.queue_embeddings = torch.cat(
-            [self.queue_embeddings, embeddings.to(self.device)], dim=0
-        )
+        queue = self._plain_tensor(self.queue_embeddings)
+        incoming = embeddings.to(self.device)
+        self.queue_embeddings = torch.cat([queue, incoming], dim=0)
         self.queue_ids.extend(str(x) for x in case_ids)
 
         if self.queue_embeddings.size(0) > self.queue_size:
-            excess = self.queue_embeddings.size(0) - self.queue_size
-            self.queue_embeddings = self.queue_embeddings[excess:]
-            self.queue_ids = self.queue_ids[excess:]
+            # Use a fresh clone of the retained tail so the memory bank remains a plain,
+            # contiguous Tensor with no view/subclass baggage.
+            self.queue_embeddings = self.queue_embeddings[-self.queue_size :].clone()
+            self.queue_ids = self.queue_ids[-self.queue_size :]
+
+        if hasattr(self.queue_embeddings, "meta"):
+            raise RuntimeError("Internal error: SSL memory queue became a MONAI MetaTensor")
 
     def train(self, num_epochs: int):
         log_img_freq = getattr(self.config, "log_image_every_n_epochs", 10)
