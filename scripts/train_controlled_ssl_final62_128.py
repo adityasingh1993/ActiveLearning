@@ -98,6 +98,7 @@ def main():
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--resize-size", type=int, default=128)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--audit-only", action="store_true", help="Audit SSL pool/exclusions and exit before training")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 
@@ -113,7 +114,7 @@ def main():
     legacy_checkpoint = checkpoint_dir / "ssl_pretrained.pth"
     controlled_checkpoint = checkpoint_dir / "ssl_pretrained_controlled.pth"
 
-    if output_dir.exists() and any(output_dir.iterdir()):
+    if not args.audit_only and output_dir.exists() and any(output_dir.iterdir()):
         if args.overwrite:
             shutil.rmtree(output_dir)
         elif controlled_checkpoint.exists():
@@ -156,6 +157,7 @@ def main():
         output_cache_dir=Path(config.cache_dir) / "ssl128",
         resize_size=128,
         expected_human_count=62,
+        expected_external_count=31,
     )
     config = ssl_config
 
@@ -174,6 +176,14 @@ def main():
     print(f"SSL epochs:               {config.ssl_epochs} fixed; early stopping OFF")
     print(f"Physical GPU:             {SELECTED_GPU if SELECTED_GPU is not None else '<environment/config>'}")
     print("=" * 116)
+
+    if args.audit_only:
+        audit_output = output_dir / "ssl_pool_audit_preview.json"
+        audit_output.parent.mkdir(parents=True, exist_ok=True)
+        audit_output.write_text(json.dumps(pool_meta, indent=2), encoding="utf-8")
+        print("AUDIT-ONLY: no SSL training was started.")
+        print(f"Audit preview: {audit_output}")
+        return
 
     tracker = ExperimentTracker(
         backend=config.tracker,
