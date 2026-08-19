@@ -96,13 +96,25 @@ if GPU is not None:
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = GPU
 
-# Hard-lock the comparison variables that must stay identical to the trusted Round-2 CV.
+DEFAULT_AUDIT = "experiments/round2_supervised_62_translation12/round2_label_audit.json"
+DEFAULT_SOURCE_CV = "experiments/cv5_supervised_47_translation12"
+DEFAULT_ROUND1_CV = "experiments/round1_cv_55_translation12"
+BASELINE_OUTPUT = "experiments/round2_cv_62_translation12"
+OUTPUTS = {
+    "appearance": "experiments/round2_cv_62_translation12_aug_appearance_v1",
+    "mild_affine": "experiments/round2_cv_62_translation12_aug_mildaffine_v1",
+}
+
+# Hard-lock every comparison variable/provenance source that must stay identical to A0.
 LOCKED = {
     "--epochs": "100",
     "--seed": "42",
     "--resize-size": "128",
     "--eval-source": "ensemble",
     "--eval-threshold": "0.50",
+    "--audit-metadata": DEFAULT_AUDIT,
+    "--source-cv-dir": DEFAULT_SOURCE_CV,
+    "--round1-cv-dir": DEFAULT_ROUND1_CV,
 }
 for name, expected in LOCKED.items():
     explicit = _option_value(CLEAN_ARGV, name)
@@ -124,16 +136,15 @@ for name, expected in LOCKED.items():
     if not _has_option(CLEAN_ARGV, name):
         CLEAN_ARGV.extend([name, expected])
 
-DEFAULT_AUDIT = "experiments/round2_supervised_62_translation12/round2_label_audit.json"
-OUTPUTS = {
-    "appearance": "experiments/round2_cv_62_translation12_aug_appearance_v1",
-    "mild_affine": "experiments/round2_cv_62_translation12_aug_mildaffine_v1",
-}
-
-if not _has_option(CLEAN_ARGV, "--audit-metadata"):
-    CLEAN_ARGV.extend(["--audit-metadata", DEFAULT_AUDIT])
 if not _has_option(CLEAN_ARGV, "--output-dir"):
     CLEAN_ARGV.extend(["--output-dir", OUTPUTS[PROFILE]])
+
+resolved_output = Path(_option_value(CLEAN_ARGV, "--output-dir"))
+if resolved_output.resolve() == Path(BASELINE_OUTPUT).resolve():
+    raise SystemExit(
+        "Refusing to write an augmentation experiment into the frozen A0 baseline directory: "
+        f"{BASELINE_OUTPUT}"
+    )
 
 sys.argv = CLEAN_ARGV
 
@@ -166,7 +177,7 @@ APPEARANCE_PROFILE = {
     "intensity_shift_offset": 0.05,
     "intensity_shift_probability": 0.15,
     "gaussian_noise_mean": 0.0,
-    "gaussian_noise_std": 0.02,
+    "gaussian_noise_std_max": 0.02,
     "gaussian_noise_probability": 0.10,
     "gaussian_smooth_sigma": [0.25, 0.75],
     "gaussian_smooth_probability": 0.10,
@@ -210,6 +221,7 @@ def appearance_transform(
                 sigma_y=(0.25, 0.75),
                 sigma_z=(0.25, 0.75),
             ),
+            # Translation last: preserve clean zero padding outside the shifted FOV.
             RandAffined(
                 keys=["image", "label"],
                 prob=0.8,
@@ -226,15 +238,14 @@ def appearance_transform(
 def mild_affine_transform(
     base_transform,
     translate_voxels=12.0,
-    rotate_degrees=0.0,
-    scale_fraction=0.0,
+    rotate_degrees=3.0,
+    scale_fraction=0.05,
 ):
     """A2: frozen translation plus conservative paired 3-D rotation and scale."""
-    del rotate_degrees, scale_fraction
     base_steps = list(getattr(base_transform, "transforms", [base_transform]))
     t = float(translate_voxels)
-    r = math.radians(3.0)
-    s = 0.05
+    r = math.radians(float(rotate_degrees))
+    s = float(scale_fraction)
     return Compose(
         base_steps
         + [
@@ -263,7 +274,10 @@ def _write_profile_metadata(output_dir: Path, profile: str):
         "version": "final62_round2_augmentation_ablation_v1",
         "profile": profile,
         "profile_parameters": APPEARANCE_PROFILE if profile == "appearance" else MILD_AFFINE_PROFILE,
-        "controlled_reference": "experiments/round2_cv_62_translation12",
+        "controlled_reference": BASELINE_OUTPUT,
+        "source_cv": DEFAULT_SOURCE_CV,
+        "round1_cv": DEFAULT_ROUND1_CV,
+        "round2_audit": DEFAULT_AUDIT,
         "held_out_design": (
             "Exact original-47 fold assignments are held out; all 15 audited post-source "
             "HUMAN_GOLD labels are train-only in every fold."
@@ -295,9 +309,26 @@ def main():
     chosen = appearance_transform if PROFILE == "appearance" else mild_affine_transform
 
     # The established Round-2 runner assigns cv.spatial_aug_transform from this module-global
-    # symbol inside its main(). Replacing the symbol here preserves every other provenance and
-    # evaluation guard in that runner while changing only the transform factory.
+    # symbol inside its main(). Replacing the symbol preserves every other provenance/evaluation
+    # guard while changing only the transform factory.
     round2.translation_only_transform = chosen
+
+    # The base Round-2 runtime stores rotate/scale as 0 because A0 is translation-only. For A2,
+    # set the same runtime object's fields immediately before each fold. install_cv_loader_hook
+    # captures that object by reference, so both the actual transform parameters and fold log are
+    # now truthful (+/-3 degrees, +/-5%).
+    original_run_fold = round2.cv.run_fold
+
+    def run_fold_with_profile_params(args, fold_spec, output_dir):
+        if PROFILE == "mild_affine":
+            args.rotate_degrees = 3.0
+            args.scale_fraction = 0.05
+        else:
+            args.rotate_degrees = 0.0
+            args.scale_fraction = 0.0
+        return original_run_fold(args, fold_spec, output_dir)
+
+    round2.cv.run_fold = run_fold_with_profile_params
 
     output_dir = _selected_output_dir(sys.argv)
     _write_profile_metadata(output_dir, PROFILE)
