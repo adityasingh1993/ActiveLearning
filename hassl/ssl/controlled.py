@@ -11,7 +11,7 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Dict, List, Set
 
 import torch
 from monai.data import DataLoader, PersistentDataset
@@ -133,6 +133,7 @@ def build_controlled_ssl_loader(
     output_cache_dir: Path,
     resize_size: int = 128,
     expected_human_count: int = 62,
+    expected_external_count: int = 31,
 ):
     """Build a fixed-grid SSL loader and return loader + provenance audit metadata.
 
@@ -143,6 +144,12 @@ def build_controlled_ssl_loader(
     """
     human_ids = read_audited_human_ids(audit_path, expected_count=expected_human_count)
     external_ids = read_case_ids(external_case_manifest)
+    if len(external_ids) != int(expected_external_count):
+        raise RuntimeError(
+            f"Expected exactly {expected_external_count} unique external holdout IDs, "
+            f"found {len(external_ids)} in {external_case_manifest}"
+        )
+
     overlap_human_external = sorted(human_ids & external_ids)
     if overlap_human_external:
         raise RuntimeError(
