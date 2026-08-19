@@ -57,6 +57,7 @@ import json
 import random
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -150,11 +151,16 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
     set_determinism(seed=args.seed)
 
+    audit_cache = (
+        Path(tempfile.gettempdir()) / "hassl_controlled_ssl_final62_128_audit"
+        if args.audit_only
+        else Path(config.cache_dir) / "ssl128"
+    )
     ssl_config, loader, pool_meta = build_controlled_ssl_loader(
         config=config,
         audit_path=audit_path,
         external_case_manifest=external_manifest,
-        output_cache_dir=Path(config.cache_dir) / "ssl128",
+        output_cache_dir=audit_cache,
         resize_size=128,
         expected_human_count=62,
         expected_external_count=31,
@@ -178,7 +184,7 @@ def main():
     print("=" * 116)
 
     if args.audit_only:
-        audit_output = output_dir / "ssl_pool_audit_preview.json"
+        audit_output = output_dir.parent / f"{output_dir.name}_pool_audit_preview.json"
         audit_output.parent.mkdir(parents=True, exist_ok=True)
         audit_output.write_text(json.dumps(pool_meta, indent=2), encoding="utf-8")
         print("AUDIT-ONLY: no SSL training was started.")
