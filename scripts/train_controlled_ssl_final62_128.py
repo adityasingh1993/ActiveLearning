@@ -14,7 +14,9 @@ Frozen SSL experiment choices
 - batch size 1
 - 100 epochs by default
 - SSL early stopping disabled
-- existing equal-weight pretext tasks: masked inpainting + rotation + patch InfoNCE
+- masked inpainting + rotation + strengthened spatial-token InfoNCE
+- InfoNCE uses 4x4x4=64 aligned bottleneck tokens per volume
+- contrastive views use independent gamma/scale/shift/noise but no spatial transform
 
 This script does not use external31 images or labels and does not run active learning.
 """
@@ -138,6 +140,17 @@ def main():
     config.ssl_epochs = int(args.epochs)
     config.ssl_use_early_stopping = False
     config.seed = int(args.seed)
+
+    # Frozen strengthened contrastive settings. These are set explicitly rather than relying
+    # on SSLPretrainer defaults so the experiment remains reproducible if defaults later move.
+    config.ssl_contrastive_grid_size = 4
+    config.ssl_contrastive_gamma_min = 0.8
+    config.ssl_contrastive_gamma_max = 1.2
+    config.ssl_contrastive_scale_min = 0.9
+    config.ssl_contrastive_scale_max = 1.1
+    config.ssl_contrastive_shift_abs = 0.05
+    config.ssl_contrastive_noise_std_max = 0.05
+
     config.checkpoint_dir = str(checkpoint_dir)
     config.cache_dir = str(output_dir / "cache")
     config.log_dir = str(output_dir / "logs")
@@ -178,7 +191,10 @@ def main():
     print(f"External overlap:         {len(pool_meta['external_overlap_after_filter'])}")
     print(f"Leakage audit:            {pool_meta['external_overlap_status']}")
     print("Preprocessing:            spacing .1mm -> resize128^3 -> percentile [1,99] to [0,1]")
-    print("SSL tasks:                inpainting + rotation + patch InfoNCE (equal weights)")
+    print("SSL tasks:                inpainting + rotation + strengthened spatial-token InfoNCE")
+    print("Contrastive tokens:       4x4x4 = 64 per volume")
+    print("Contrastive views:        gamma .8-1.2 | scale .9-1.1 | shift +/-0.05 | noise std 0-.05")
+    print("Contrastive geometry:     unchanged/aligned between the two views")
     print(f"SSL epochs:               {config.ssl_epochs} fixed; early stopping OFF")
     print(f"Physical GPU:             {SELECTED_GPU if SELECTED_GPU is not None else '<environment/config>'}")
     print("=" * 116)
@@ -207,7 +223,7 @@ def main():
 
     state = torch.load(legacy_checkpoint, map_location="cpu", weights_only=False)
     metadata = {
-        "version": "controlled_final62_ssl128_v1",
+        "version": "controlled_final62_ssl128_v2_stronger_contrastive",
         "purpose": "Final62 SSL-vs-no-SSL controlled comparison",
         "git_commit": git_commit_or_none(),
         "source_config": str(args.config),
@@ -216,12 +232,22 @@ def main():
         "seed": int(args.seed),
         "ssl_epochs": int(config.ssl_epochs),
         "ssl_early_stopping": False,
-        "ssl_tasks": ["masked_volume_inpainting", "rotation_prediction", "patch_infonce"],
+        "ssl_tasks": ["masked_volume_inpainting", "rotation_prediction", "spatial_token_infonce"],
         "ssl_task_weights": {"inpainting": 1.0, "rotation": 1.0, "contrastive": 1.0},
         "ssl_mask_ratio": float(config.ssl_mask_ratio),
         "ssl_mask_cube_size": int(config.ssl_mask_cube_size),
         "ssl_contrastive_temp": float(config.ssl_contrastive_temp),
         "ssl_embedding_dim": int(config.ssl_embedding_dim),
+        "ssl_contrastive": {
+            "grid_size": int(config.ssl_contrastive_grid_size),
+            "tokens_per_volume": int(config.ssl_contrastive_grid_size ** 3),
+            "symmetric_infonce": True,
+            "spatial_geometry_changed": False,
+            "gamma_range": [float(config.ssl_contrastive_gamma_min), float(config.ssl_contrastive_gamma_max)],
+            "intensity_scale_range": [float(config.ssl_contrastive_scale_min), float(config.ssl_contrastive_scale_max)],
+            "intensity_shift_range": [-float(config.ssl_contrastive_shift_abs), float(config.ssl_contrastive_shift_abs)],
+            "noise_std_range": [0.0, float(config.ssl_contrastive_noise_std_max)],
+        },
         "architecture": "DynUNet",
         "preprocessing": {
             "spacing": [0.1, 0.1, 0.1],
