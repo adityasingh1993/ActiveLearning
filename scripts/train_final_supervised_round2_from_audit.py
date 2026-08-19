@@ -220,7 +220,11 @@ def main():
     print(f"CV best epochs:      {best_epochs.tolist()}")
     print(f"Median best epoch:   {median_best_epoch}")
     print(f"Final epochs:        {final_epochs}")
-    print("Recipe: resize128 | DiceCE | AdamW 1e-4 | dropout=0 | lambda_unsup=0")
+    print(
+        f"Recipe: resize{int(args.resize_size)} | DiceCE | AdamW 1e-4 | "
+        "dropout=0 | lambda_unsup=0"
+    )
+    print(f"Spatial size:        {tuple(int(x) for x in config.spatial_size)}")
     print("Augmentation: paired translation +/-12 vox, p=0.8; other augmentations OFF")
     print("Segmentation operating point remains raw ensemble threshold=0.50")
     print("Deployment rule: fixed-epoch latest checkpoint; same-data best is diagnostic only")
