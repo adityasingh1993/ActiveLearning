@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Evaluate RAW vs largest-connected-component post-processing on hard_dataset/v1.
+"""Evaluate connected-component behavior on hard_dataset/v1 OOF predictions.
 
 This script operates on the Slicer-readable OOF predictions produced by
-`scripts/save_hard_v1_oof_predictions.py` and compares three modes:
+`scripts/save_hard_v1_oof_predictions.py` and compares:
 
   RAW              : original binary prediction
   LCC1             : keep only the single largest 3D connected component
   CONDITIONAL_LCC  : apply LCC1 only when the largest component contains at least
                      --conditional-dominance (default 0.60) of predicted foreground
 
-Both Final62 and Final72 predictions are scored against the exact same hard-v1 GT.
-No threshold tuning is performed here; the input predictions are already the locked
-Student+EMA ensemble at threshold 0.50.
+It also performs a diagnostic per-component analysis. Every connected component is ranked by
+size and scored independently against the hard-v1 GT. This tells us whether a smaller component
+contains the actual target when the largest component is a false positive. The per-component GT
+scores are DIAGNOSTIC/ORACLE information only and must never be used as a deployment selection
+rule.
 
-By default, 26-connected 3D connectivity is used (SimpleITK fully connected).
+Both Final62 and Final72 predictions are scored against the exact same hard-v1 GT. Input masks
+are already the locked Student+EMA ensemble at threshold 0.50. By default, 26-connected 3D
+connectivity is used (SimpleITK fully connected).
 
 Example:
   python scripts/evaluate_hard_v1_lcc.py \
@@ -25,16 +29,16 @@ Outputs:
     hard_v1_lcc_case_metrics.csv
     hard_v1_lcc_summary.csv
     hard_v1_lcc_summary.json
-    filtered_predictions/<case_id>/final62_lcc1.seg.nrrd
-    filtered_predictions/<case_id>/final72_lcc1.seg.nrrd
-    filtered_predictions/<case_id>/final62_conditional_lcc.seg.nrrd
-    filtered_predictions/<case_id>/final72_conditional_lcc.seg.nrrd
+    hard_v1_component_metrics.csv
+    hard_v1_component_case_summary.csv
+    hard_v1_component_analysis.json
+    filtered_predictions/<case_id>/...
+    component_predictions/<case_id>/<model>_component_rankXX.seg.nrrd
 """
 
 import argparse
 import csv
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -104,12 +108,14 @@ def read_binary(path: Path):
     return img, np.ascontiguousarray(arr > 0)
 
 
-def connected_component_stats(mask: np.ndarray):
-    """Return LCC mask, n_components, largest_fraction and component voxel sizes."""
+def connected_components(mask: np.ndarray):
+    """Return size-ranked component label array and voxel sizes.
+
+    Labels are 1..N in descending component-size order, so label 1 is the LCC.
+    """
     mask = np.asarray(mask, dtype=np.uint8)
-    total = int(mask.sum())
-    if total == 0:
-        return mask.astype(bool), 0, 0.0, []
+    if int(mask.sum()) == 0:
+        return np.zeros_like(mask, dtype=np.uint32), []
 
     img = sitk.GetImageFromArray(mask)
     cc_filter = sitk.ConnectedComponentImageFilter()
@@ -120,13 +126,18 @@ def connected_component_stats(mask: np.ndarray):
     relabel.SortByObjectSizeOn()
     relabeled = relabel.Execute(labeled)
     sizes = [int(x) for x in relabel.GetSizeOfObjectsInPixels()]
+    labels = np.asarray(sitk.GetArrayFromImage(relabeled), dtype=np.uint32)
+    return np.ascontiguousarray(labels), sizes
 
-    lab = np.asarray(sitk.GetArrayFromImage(relabeled))
+
+def connected_component_stats(mask: np.ndarray):
+    labels, sizes = connected_components(mask)
+    total = int(np.asarray(mask, dtype=bool).sum())
     n_components = len(sizes)
-    lcc = lab == 1 if n_components > 0 else np.zeros_like(mask, dtype=bool)
+    lcc = labels == 1 if n_components else np.zeros_like(mask, dtype=bool)
     largest = int(sizes[0]) if sizes else 0
     largest_fraction = float(largest / total) if total > 0 else 0.0
-    return np.ascontiguousarray(lcc), n_components, largest_fraction, sizes
+    return np.ascontiguousarray(lcc), n_components, largest_fraction, sizes, labels
 
 
 def binary_metrics(pred: np.ndarray, gt: np.ndarray):
@@ -159,6 +170,82 @@ def binary_metrics(pred: np.ndarray, gt: np.ndarray):
         "pred_vox": pred_vox,
         "gt_vox": gt_vox,
     }
+
+
+def component_geometry(mask: np.ndarray, source_img):
+    """Return centroid and bounding box in numpy/index and physical coordinates."""
+    pts_zyx = np.argwhere(mask)
+    if pts_zyx.size == 0:
+        return {
+            "centroid_x": float("nan"),
+            "centroid_y": float("nan"),
+            "centroid_z": float("nan"),
+            "centroid_physical_x": float("nan"),
+            "centroid_physical_y": float("nan"),
+            "centroid_physical_z": float("nan"),
+            "bbox_x0": -1, "bbox_x1": -1,
+            "bbox_y0": -1, "bbox_y1": -1,
+            "bbox_z0": -1, "bbox_z1": -1,
+            "bbox_size_x": 0, "bbox_size_y": 0, "bbox_size_z": 0,
+        }
+
+    mins = pts_zyx.min(axis=0)
+    maxs = pts_zyx.max(axis=0)
+    centroid_zyx = pts_zyx.mean(axis=0)
+    z, y, x = [float(v) for v in centroid_zyx]
+    physical = source_img.TransformContinuousIndexToPhysicalPoint((x, y, z))
+
+    z0, y0, x0 = [int(v) for v in mins]
+    z1, y1, x1 = [int(v) for v in maxs]
+    return {
+        "centroid_x": x,
+        "centroid_y": y,
+        "centroid_z": z,
+        "centroid_physical_x": float(physical[0]),
+        "centroid_physical_y": float(physical[1]),
+        "centroid_physical_z": float(physical[2]),
+        "bbox_x0": x0,
+        "bbox_x1": x1,
+        "bbox_y0": y0,
+        "bbox_y1": y1,
+        "bbox_z0": z0,
+        "bbox_z1": z1,
+        "bbox_size_x": int(x1 - x0 + 1),
+        "bbox_size_y": int(y1 - y0 + 1),
+        "bbox_size_z": int(z1 - z0 + 1),
+    }
+
+
+def analyze_components(case_id, model, labels, sizes, raw, gt, source_img):
+    """Score every size-ranked component independently against GT.
+
+    GT-derived fields are oracle diagnostics only. They quantify whether a smaller component
+    already contains the target; they are not valid inputs to an inference-time selector.
+    """
+    total_pred = int(raw.sum())
+    rows = []
+    for rank, size in enumerate(sizes, start=1):
+        component = labels == rank
+        metrics = binary_metrics(component, gt)
+        geom = component_geometry(component, source_img)
+        rows.append({
+            "case_id": case_id,
+            "model": model,
+            "component_rank_by_size": int(rank),
+            "is_largest_component": int(rank == 1),
+            "component_vox": int(size),
+            "component_fraction_of_pred": float(size / total_pred) if total_pred else 0.0,
+            "gt_overlap_vox": int(metrics["tp_vox"]),
+            "gt_overlap_fraction_of_component": (
+                float(metrics["tp_vox"] / size) if size > 0 else 0.0
+            ),
+            "gt_recall_from_component": float(metrics["recall"]),
+            "component_dice_oracle": float(metrics["dice"]),
+            "component_precision_oracle": float(metrics["precision"]),
+            "component_signed_rve_pct": float(metrics["signed_rve_pct"]),
+            **geom,
+        })
+    return rows
 
 
 def write_csv(path: Path, rows):
@@ -210,8 +297,55 @@ def summarize(rows):
     return out
 
 
+def component_case_summary(component_rows, raw_rows):
+    raw_by_key = {
+        (r["case_id"], r["model"]): r
+        for r in raw_rows
+        if r["mode"] == "RAW"
+    }
+    out = []
+    keys = sorted({(r["case_id"], r["model"]) for r in component_rows})
+    for case_id, model in keys:
+        subset = [
+            r for r in component_rows
+            if r["case_id"] == case_id and r["model"] == model
+        ]
+        subset.sort(key=lambda r: int(r["component_rank_by_size"]))
+        best = max(subset, key=lambda r: float(r["component_dice_oracle"]))
+        largest = subset[0]
+        raw = raw_by_key[(case_id, model)]
+        out.append({
+            "case_id": case_id,
+            "model": model,
+            "n_components": len(subset),
+            "raw_dice": float(raw["dice"]),
+            "largest_rank": 1,
+            "largest_fraction": float(largest["component_fraction_of_pred"]),
+            "largest_dice": float(largest["component_dice_oracle"]),
+            "best_component_rank": int(best["component_rank_by_size"]),
+            "best_component_fraction": float(best["component_fraction_of_pred"]),
+            "best_component_dice_oracle": float(best["component_dice_oracle"]),
+            "best_component_precision_oracle": float(best["component_precision_oracle"]),
+            "best_component_recall_oracle": float(best["gt_recall_from_component"]),
+            "best_minus_raw_dice": float(best["component_dice_oracle"] - float(raw["dice"])),
+            "best_minus_largest_dice": float(
+                best["component_dice_oracle"] - largest["component_dice_oracle"]
+            ),
+            "largest_is_best_component": int(
+                int(best["component_rank_by_size"]) == 1
+            ),
+            "best_centroid_x": float(best["centroid_x"]),
+            "best_centroid_y": float(best["centroid_y"]),
+            "best_centroid_z": float(best["centroid_z"]),
+            "largest_centroid_x": float(largest["centroid_x"]),
+            "largest_centroid_y": float(largest["centroid_y"]),
+            "largest_centroid_z": float(largest["centroid_z"]),
+        })
+    return out
+
+
 def main():
-    p = argparse.ArgumentParser(description="RAW vs LCC1 benchmark on hard-v1 OOF predictions")
+    p = argparse.ArgumentParser(description="RAW/LCC and per-component analysis on hard-v1 OOF predictions")
     p.add_argument("--pred-root", default=str(DEFAULT_PRED_ROOT))
     p.add_argument("--gt-dir", required=True)
     p.add_argument("--image-dir", required=True)
@@ -222,6 +356,11 @@ def main():
         "--no-save-filtered",
         action="store_true",
         help="Do not write LCC/conditional Slicer .seg.nrrd masks.",
+    )
+    p.add_argument(
+        "--save-components",
+        action="store_true",
+        help="Also save every connected component as its own Slicer .seg.nrrd for visual review.",
     )
     args = p.parse_args()
 
@@ -254,14 +393,16 @@ def main():
         )
 
     rows = []
-    print("=" * 128)
-    print("HARD-V1 CONNECTED-COMPONENT ANALYSIS")
+    component_rows = []
+    print("=" * 132)
+    print("HARD-V1 CONNECTED-COMPONENT + PER-COMPONENT ANALYSIS")
     print(f"Cases:                    {len(pred_case_ids)}")
     print("Connectivity:             26-connected / fully connected")
     print("LCC mode:                 keep n_components=1")
     print(f"Conditional dominance:    >= {args.conditional_dominance:.2f}")
     print("Input predictions:        locked OOF ensemble @ 0.50")
-    print("=" * 128)
+    print("Component Dice vs GT:     DIAGNOSTIC/ORACLE ONLY — not a deployment selector")
+    print("=" * 132)
 
     for case_id in sorted(pred_case_ids):
         gt_img, gt = read_binary(gt_by_id[case_id])
@@ -278,7 +419,7 @@ def main():
             if not geometry_equal(pred_img, source_img):
                 raise RuntimeError(f"Prediction/image geometry mismatch for {case_id} {model}")
 
-            lcc, n_components, largest_fraction, component_sizes = connected_component_stats(raw)
+            lcc, n_components, largest_fraction, component_sizes, labels = connected_component_stats(raw)
             apply_conditional = bool(
                 n_components > 1 and largest_fraction >= args.conditional_dominance
             )
@@ -308,6 +449,11 @@ def main():
                 rows.append(row)
                 mode_metrics[mode] = metrics
 
+            per_component = analyze_components(
+                case_id, model, labels, component_sizes, raw, gt, source_img
+            )
+            component_rows.extend(per_component)
+
             raw_dice = mode_metrics["RAW"]["dice"]
             lcc_dice = mode_metrics["LCC1"]["dice"]
             cond_dice = mode_metrics["CONDITIONAL_LCC"]["dice"]
@@ -317,6 +463,30 @@ def main():
                 f"COND={cond_dice:.4f} ({cond_dice-raw_dice:+.4f}) | "
                 f"conditional_applied={apply_conditional}"
             )
+
+            if per_component:
+                best = max(per_component, key=lambda r: float(r["component_dice_oracle"]))
+                print("    PER-COMPONENT (ranked by size; Dice is oracle diagnostic):")
+                for comp in per_component:
+                    marker = " <-- BEST_GT_OVERLAP" if comp is best else ""
+                    print(
+                        f"      C{int(comp['component_rank_by_size']):02d}: "
+                        f"size={int(comp['component_vox']):>7d} "
+                        f"({float(comp['component_fraction_of_pred']):6.1%}) | "
+                        f"Dice={float(comp['component_dice_oracle']):.4f} | "
+                        f"Prec={float(comp['component_precision_oracle']):.4f} | "
+                        f"Rec={float(comp['gt_recall_from_component']):.4f} | "
+                        f"overlap={int(comp['gt_overlap_vox']):>7d} | "
+                        f"centroidXYZ=({float(comp['centroid_x']):.1f},"
+                        f"{float(comp['centroid_y']):.1f},"
+                        f"{float(comp['centroid_z']):.1f}){marker}"
+                    )
+                if int(best["component_rank_by_size"]) != 1:
+                    print(
+                        f"    >>> Largest component is NOT the best GT-overlap component. "
+                        f"Oracle best is C{int(best['component_rank_by_size']):02d}: "
+                        f"Dice={float(best['component_dice_oracle']):.4f}"
+                    )
 
             if not args.no_save_filtered:
                 case_out = output_dir / "filtered_predictions" / case_id
@@ -337,13 +507,31 @@ def main():
                     segment_id=f"{model}_ConditionalLCC",
                 )
 
+            if args.save_components:
+                component_out = output_dir / "component_predictions" / case_id
+                component_out.mkdir(parents=True, exist_ok=True)
+                lower = model.lower()
+                for comp in per_component:
+                    rank = int(comp["component_rank_by_size"])
+                    component_mask = labels == rank
+                    write_mask_with_spatial_geometry(
+                        str(component_out / f"{lower}_component_rank{rank:02d}.seg.nrrd"),
+                        component_mask.astype(np.uint8),
+                        reference_image_path=str(image_by_id[case_id]),
+                        segment_name=f"{model}_Component_{rank:02d}",
+                        segment_id=f"{model}_Component_{rank:02d}",
+                    )
+
     summary_rows = summarize(rows)
+    component_summary_rows = component_case_summary(component_rows, rows)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_csv(output_dir / "hard_v1_lcc_case_metrics.csv", rows)
     write_csv(output_dir / "hard_v1_lcc_summary.csv", summary_rows)
+    write_csv(output_dir / "hard_v1_component_metrics.csv", component_rows)
+    write_csv(output_dir / "hard_v1_component_case_summary.csv", component_summary_rows)
 
     summary_json = {
-        "version": "hard_v1_lcc_analysis_v1",
+        "version": "hard_v1_lcc_analysis_v2_per_component",
         "n_cases": len(pred_case_ids),
         "connectivity": "26-connected / fully connected",
         "lcc_rule": "keep exactly the largest connected component (n_component=1)",
@@ -357,7 +545,21 @@ def main():
         json.dumps(summary_json, indent=2), encoding="utf-8"
     )
 
-    print("\n" + "=" * 128)
+    component_json = {
+        "version": "hard_v1_per_component_analysis_v1",
+        "n_cases": len(pred_case_ids),
+        "warning": (
+            "Per-component Dice/precision/recall use GT and are oracle diagnostics only. "
+            "Do not use them to choose components at inference time."
+        ),
+        "case_summary": component_summary_rows,
+        "components": component_rows,
+    }
+    (output_dir / "hard_v1_component_analysis.json").write_text(
+        json.dumps(component_json, indent=2), encoding="utf-8"
+    )
+
+    print("\n" + "=" * 132)
     print("SUMMARY")
     print(f"{'model':<10} {'mode':<17} {'n':>3} {'meanDice':>10} {'median':>10} {'precision':>10} {'recall':>10} {'med|RVE|':>10}")
     print("-" * 86)
@@ -369,12 +571,33 @@ def main():
             f"{float(r['median_abs_rve_pct']):>9.2f}%"
         )
 
-    print(f"\nCase metrics: {output_dir / 'hard_v1_lcc_case_metrics.csv'}")
-    print(f"Summary CSV:  {output_dir / 'hard_v1_lcc_summary.csv'}")
-    print(f"Summary JSON: {output_dir / 'hard_v1_lcc_summary.json'}")
+    print("\nPER-COMPONENT CASE SUMMARY (GT oracle diagnostic)")
+    print(
+        f"{'model':<9} {'case':<12} {'n':>3} {'raw':>7} {'LCC':>7} "
+        f"{'bestRank':>8} {'bestDice':>9} {'best-raw':>9} {'largestBest':>11}"
+    )
+    print("-" * 94)
+    for r in component_summary_rows:
+        print(
+            f"{r['model']:<9} {r['case_id'][:12]:<12} {int(r['n_components']):>3d} "
+            f"{float(r['raw_dice']):>7.4f} {float(r['largest_dice']):>7.4f} "
+            f"{int(r['best_component_rank']):>8d} "
+            f"{float(r['best_component_dice_oracle']):>9.4f} "
+            f"{float(r['best_minus_raw_dice']):>+9.4f} "
+            f"{bool(r['largest_is_best_component'])!s:>11}"
+        )
+
+    print(f"\nCase metrics:       {output_dir / 'hard_v1_lcc_case_metrics.csv'}")
+    print(f"Summary CSV:        {output_dir / 'hard_v1_lcc_summary.csv'}")
+    print(f"Summary JSON:       {output_dir / 'hard_v1_lcc_summary.json'}")
+    print(f"Component metrics:  {output_dir / 'hard_v1_component_metrics.csv'}")
+    print(f"Component summary:  {output_dir / 'hard_v1_component_case_summary.csv'}")
+    print(f"Component JSON:     {output_dir / 'hard_v1_component_analysis.json'}")
     if not args.no_save_filtered:
-        print(f"Slicer masks: {output_dir / 'filtered_predictions'}")
-    print("=" * 128)
+        print(f"Slicer LCC masks:   {output_dir / 'filtered_predictions'}")
+    if args.save_components:
+        print(f"Slicer components:  {output_dir / 'component_predictions'}")
+    print("=" * 132)
 
 
 if __name__ == "__main__":
