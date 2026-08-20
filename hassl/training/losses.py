@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import scipy.ndimage as ndimage
-from monai.losses import DiceCELoss, GeneralizedDiceFocalLoss
+from monai.losses import DiceCELoss, GeneralizedDiceFocalLoss, TverskyLoss
 
 
 class FlexMatchThreshold(nn.Module):
@@ -146,10 +146,16 @@ class BoundaryLoss(nn.Module):
 class CombinedSegLoss(nn.Module):
     """Configurable segmentation loss for supervised training.
 
-    ``GeneralizedDiceFocalLoss`` is the default for the highly imbalanced 3D
-    foreground task. For a single sigmoid output there is no explicit background
-    channel; false-positive background voxels are penalized by the focal/CE term,
-    while multi-class targets are converted to one-hot for MONAI losses.
+    Supported ``loss_type`` values used by controlled experiments:
+
+    - ``dice_ce``: MONAI DiceCELoss (the frozen Final72 baseline).
+    - ``generalized_dice_focal``: MONAI GeneralizedDiceFocalLoss.
+    - ``tversky_60_40``: Tversky with alpha=0.60 (FP) / beta=0.40 (FN).
+    - ``tversky_70_30``: Tversky with alpha=0.70 (FP) / beta=0.30 (FN).
+
+    The fixed Tversky variants are intentionally explicit so experiment provenance
+    cannot silently change through an unrelated YAML value. In MONAI's Tversky
+    formulation alpha weights false positives and beta weights false negatives.
     """
 
     def __init__(
@@ -189,13 +195,32 @@ class CombinedSegLoss(nn.Module):
                 lambda_focal=lambda_focal,
                 gamma=gamma,
             )
-        else:
+        elif loss_type in {"tversky_60_40", "tversky_70_30"}:
+            alpha, beta = {
+                "tversky_60_40": (0.60, 0.40),
+                "tversky_70_30": (0.70, 0.30),
+            }[loss_type]
+            self.dice_ce = TverskyLoss(
+                include_background=include_background,
+                to_onehot_y=to_onehot_y,
+                sigmoid=sigmoid,
+                softmax=softmax,
+                alpha=alpha,
+                beta=beta,
+                reduction=monai_reduction,
+            )
+        elif loss_type == "dice_ce":
             self.dice_ce = DiceCELoss(
                 include_background=include_background,
                 to_onehot_y=to_onehot_y,
                 sigmoid=sigmoid,
                 softmax=softmax,
                 reduction=monai_reduction,
+            )
+        else:
+            raise ValueError(
+                f"Unknown loss_type={loss_type!r}. Expected one of: dice_ce, "
+                "generalized_dice_focal, tversky_60_40, tversky_70_30"
             )
 
         if include_boundary:
