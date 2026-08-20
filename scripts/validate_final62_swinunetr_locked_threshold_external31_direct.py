@@ -18,6 +18,13 @@ locked_threshold.json created before this external evaluation.
 import sys
 from pathlib import Path
 
+# When this file is executed as `python scripts/<name>.py`, Python puts the scripts directory
+# (not the repository root) on sys.path. Add the repo root before importing another scripts.*
+# module so the wrapper works from a normal repository checkout/container invocation.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 def consume_required(argv, name):
     args = list(argv)
