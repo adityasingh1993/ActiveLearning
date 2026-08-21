@@ -24,11 +24,13 @@ only and do not affect training.
 
 import argparse
 import copy
+import csv
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from monai.data import CacheDataset, DataLoader, Dataset, MetaTensor
 from monai.inferers import SlidingWindowInferer
@@ -45,10 +47,6 @@ import hassl.pipeline as pipeline_module
 import hassl.training.trainer as trainer_module
 import scripts.train_supervised_cv as cv
 import scripts.train_final72_screen_spatial_folds12 as spatial_screen
-from scripts.train_final72_screen_small_bladder_oversampling import (
-    compare_to_a3,
-    read_csv,
-)
 
 SOURCE_CV = Path("experiments/cv5_supervised_47_translation12")
 AUDIT = Path("experiments/round3_supervised_72_translation12/round3_label_audit.json")
@@ -56,6 +54,30 @@ A3_CV = Path("experiments/final72_screen_a3_translation4_p05_lrflip_p05")
 SIZE_PROFILE = Path("experiments/final72_bladder_size_diagnostic/all72_bladder_size_profile.csv")
 DEFAULT_OUTPUT = Path("experiments/final72_screen_c1_coord_channels_a3")
 INPUT_CHANNELS = 4
+
+
+def read_csv(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def write_csv(path: Path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    fields = []
+    for row in rows:
+        for key in row:
+            if key not in fields:
+                fields.append(key)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fields})
 
 
 class AddCoordinateChannelsd:
@@ -193,6 +215,28 @@ def build_coord_network(backbone: str, num_classes: int, dropout: float):
     )
 
 
+def preflight_coordinate_input(config, fold_spec):
+    """Fail before training if the coordinate input contract is not exactly as intended."""
+    by_id = {c["id"]: c for c in cv.collect_cases(config)}
+    case_id = sorted(fold_spec["val_ids"])[0]
+    base = cv.ORIGINAL_GET_TRANSFORMS(
+        config, keys=["image", "label"], is_training=False, apply_strong_aug=False
+    )
+    sample = c1_val_transform(base)(by_id[case_id])
+    image = sample["image"]
+    if tuple(image.shape) != (4, 128, 128, 128):
+        raise RuntimeError(f"C1 preflight expected [4,128,128,128], got {tuple(image.shape)}")
+    coord = image[1:4].as_tensor() if isinstance(image, MetaTensor) else image[1:4]
+    mins = [float(coord[i].min().item()) for i in range(3)]
+    maxs = [float(coord[i].max().item()) for i in range(3)]
+    if not all(abs(x + 1.0) < 1e-5 for x in mins) or not all(abs(x - 1.0) < 1e-5 for x in maxs):
+        raise RuntimeError(f"C1 coordinate range failed: mins={mins}, maxs={maxs}")
+    print(
+        f"C1 preflight PASS | case={case_id} | shape={tuple(image.shape)} | "
+        f"coord mins={mins} | maxs={maxs}"
+    )
+
+
 @torch.no_grad()
 def evaluate_fold_c1(config, val_ids, checkpoint, source, threshold):
     """Final held-out evaluation with the same 4-channel deterministic input."""
@@ -253,6 +297,117 @@ def evaluate_fold_c1(config, val_ids, checkpoint, source, threshold):
     return rows
 
 
+def metric_mean(rows, key):
+    vals = np.asarray([float(r[key]) for r in rows], dtype=float)
+    return float(np.nanmean(vals)) if np.isfinite(vals).any() else float("nan")
+
+
+def compare_to_a3_c1(candidate_rows, a3_rows, selected_folds, size_profile, output_dir):
+    selected = set(int(x) for x in selected_folds)
+    cand = {str(r["case_id"]): r for r in candidate_rows if int(r["fold"]) in selected}
+    base = {str(r["case_id"]): r for r in a3_rows if int(r["fold"]) in selected}
+    if set(cand) != set(base):
+        raise RuntimeError("C1 and A3 must contain exact same held-out IDs for selected folds")
+
+    size_by_id = {str(r["case_id"]): str(r["size_group"]) for r in size_profile}
+    paired = []
+    for case_id in sorted(cand):
+        a = base[case_id]
+        b = cand[case_id]
+        if case_id not in size_by_id:
+            raise RuntimeError(f"Missing fixed size group for {case_id}")
+        paired.append({
+            "case_id": case_id,
+            "fold": int(b["fold"]),
+            "size_group": size_by_id[case_id],
+            "a3_dice": float(a["dice"]),
+            "c1_dice": float(b["dice"]),
+            "delta_dice": float(b["dice"]) - float(a["dice"]),
+            "a3_precision": float(a["precision"]),
+            "c1_precision": float(b["precision"]),
+            "delta_precision": float(b["precision"]) - float(a["precision"]),
+            "a3_recall": float(a["recall"]),
+            "c1_recall": float(b["recall"]),
+            "delta_recall": float(b["recall"]) - float(a["recall"]),
+            "a3_hd95": float(a["hd95"]),
+            "c1_hd95": float(b["hd95"]),
+            "delta_hd95": float(b["hd95"]) - float(a["hd95"]),
+            "a3_rve": float(a["rve"]),
+            "c1_rve": float(b["rve"]),
+            "delta_rve": float(b["rve"]) - float(a["rve"]),
+        })
+    write_csv(output_dir / "screening_vs_a3_case_comparison.csv", paired)
+
+    def block(rows):
+        if not rows:
+            return {"n": 0}
+        return {
+            "n": len(rows),
+            "a3_mean_dice": metric_mean(rows, "a3_dice"),
+            "c1_mean_dice": metric_mean(rows, "c1_dice"),
+            "delta_mean_dice": metric_mean(rows, "delta_dice"),
+            "a3_mean_precision": metric_mean(rows, "a3_precision"),
+            "c1_mean_precision": metric_mean(rows, "c1_precision"),
+            "delta_mean_precision": metric_mean(rows, "delta_precision"),
+            "a3_mean_recall": metric_mean(rows, "a3_recall"),
+            "c1_mean_recall": metric_mean(rows, "c1_recall"),
+            "delta_mean_recall": metric_mean(rows, "delta_recall"),
+            "a3_mean_hd95": metric_mean(rows, "a3_hd95"),
+            "c1_mean_hd95": metric_mean(rows, "c1_hd95"),
+            "improved": int(sum(r["delta_dice"] > 1e-6 for r in rows)),
+            "worsened": int(sum(r["delta_dice"] < -1e-6 for r in rows)),
+            "improved_ge_0p05": int(sum(r["delta_dice"] >= 0.05 for r in rows)),
+            "worsened_le_minus_0p05": int(sum(r["delta_dice"] <= -0.05 for r in rows)),
+        }
+
+    folds = {str(f): block([r for r in paired if int(r["fold"]) == f]) for f in selected_folds}
+    groups = {g: block([r for r in paired if r["size_group"] == g]) for g in ("SMALL", "MEDIUM", "LARGE")}
+    overall = block(paired)
+    summary = {
+        "version": "final72_c1_coord_channels_screen_v1",
+        "reference": "A3 = +/-4 vox p=.5 + LR flip p=.5 + DiceCE + 128^3",
+        "candidate": "C1 = A3 + normalized LR/AP/SI coordinate channels",
+        "screening_folds": list(selected_folds),
+        "overall": overall,
+        "folds": folds,
+        "fixed_validation_size_groups": groups,
+        "screening_only": True,
+    }
+    (output_dir / "screening_vs_a3_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    print("\n" + "=" * 122)
+    print("C1_COORD vs A3 — COORDINATE-CHANNEL SCREEN")
+    for f in selected_folds:
+        s = folds[str(f)]
+        print(
+            f"Fold {f}: A3={s['a3_mean_dice']:.4f} -> C1={s['c1_mean_dice']:.4f} "
+            f"({s['delta_mean_dice']:+.4f}) | PrecDelta={s['delta_mean_precision']:+.4f} | "
+            f"RecDelta={s['delta_mean_recall']:+.4f}"
+        )
+    print(
+        f"Combined: A3={overall['a3_mean_dice']:.4f} -> C1={overall['c1_mean_dice']:.4f} "
+        f"({overall['delta_mean_dice']:+.4f}) | PrecDelta={overall['delta_mean_precision']:+.4f} | "
+        f"RecDelta={overall['delta_mean_recall']:+.4f}"
+    )
+    print("\nFIXED VALIDATION SIZE GROUPS (diagnostic only)")
+    for g in ("SMALL", "MEDIUM", "LARGE"):
+        s = groups[g]
+        if not s["n"]:
+            continue
+        print(
+            f"  {g}: n={s['n']} | Dice {s['a3_mean_dice']:.4f}->{s['c1_mean_dice']:.4f} "
+            f"({s['delta_mean_dice']:+.4f}) | Prec {s['a3_mean_precision']:.4f}->{s['c1_mean_precision']:.4f} "
+            f"({s['delta_mean_precision']:+.4f}) | Rec {s['a3_mean_recall']:.4f}->{s['c1_mean_recall']:.4f} "
+            f"({s['delta_mean_recall']:+.4f}) | HD95 {s['a3_mean_hd95']:.2f}->{s['c1_mean_hd95']:.2f}mm"
+        )
+    print(
+        f"Case effects: improved={overall['improved']} | worsened={overall['worsened']} | "
+        f"+>=.05={overall['improved_ge_0p05']} | <=-.05={overall['worsened_le_minus_0p05']}"
+    )
+    print("SCREENING ONLY: full frozen CV is required before promotion.")
+    print("=" * 122)
+
+
 def main():
     p = argparse.ArgumentParser(description="C1 coordinate-channel DynUNet screening on Final72 A3")
     p.add_argument("--config", required=True)
@@ -286,6 +441,10 @@ def main():
         config, source_manifest_path, Path(args.audit_metadata)
     )
     fold_map = {int(x["fold"]): x for x in fold_specs}
+
+    # Match the actual run's deterministic settings before validating the 4-channel contract.
+    cv.apply_baseline(config, resize_size=128, epochs=100)
+    preflight_coordinate_input(config, fold_map[selected_folds[0]])
 
     # Runner-local patches only. Existing trainer/checkpoints remain untouched.
     trainer_module.build_network = build_coord_network
@@ -378,14 +537,7 @@ def main():
     combined.sort(key=lambda r: (int(r["fold"]), str(r["case_id"])))
     cv.write_results(results_path, combined)
 
-    compare_to_a3(
-        combined,
-        a3_rows,
-        selected_folds,
-        size_profile,
-        output_dir,
-        "C1_COORD",
-    )
+    compare_to_a3_c1(combined, a3_rows, selected_folds, size_profile, output_dir)
 
     print(f"\nResults: {results_path}")
     print(f"Plan:    {plan_path}")
