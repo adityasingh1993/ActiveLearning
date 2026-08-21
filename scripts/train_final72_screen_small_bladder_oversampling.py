@@ -29,20 +29,11 @@ oversampling intervention.
 Default screening folds are 1 and 2. The candidate is compared directly against the completed
 A3 results on the same held-out IDs. Fixed Final72 global SMALL/MEDIUM/LARGE groups are used only
 for post-hoc reporting, never for training.
-
-Examples
---------
-python scripts/train_final72_screen_small_bladder_oversampling.py \
-  --config config_resize128.yaml --variant S1 --fold screen
-
-python scripts/train_final72_screen_small_bladder_oversampling.py \
-  --config config_resize128.yaml --variant S2 --fold screen
 """
 
 import argparse
 import csv
 import json
-import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,7 +142,8 @@ def build_fold_sampling(train_ids, cases_by_id, small_weight):
     values = np.asarray([volumes[x] for x in train_ids], dtype=float)
     q1 = float(np.quantile(values, 1.0 / 3.0))
     small_ids = sorted([x for x in train_ids if volumes[x] <= q1])
-    weights = [float(small_weight if x in set(small_ids) else 1.0) for x in train_ids]
+    small_set = set(small_ids)
+    weights = [float(small_weight if x in small_set else 1.0) for x in train_ids]
     return q1, small_ids, volumes, weights
 
 
@@ -161,7 +153,7 @@ def make_dataset(items, transform, use_cache):
     return Dataset(items, transform=transform)
 
 
-def install_oversampling_loader_hook(runtime_args, small_weight, sampling_records):
+def install_oversampling_loader_hook(small_weight, sampling_records, fold_lookup):
     """Install A3 dataloaders with fold-local weighted sampling and fixed epoch length."""
     def build_cv_dataloaders(config):
         cases = {c["id"]: c for c in cv.collect_cases(config)}
@@ -171,10 +163,14 @@ def install_oversampling_loader_hook(runtime_args, small_weight, sampling_record
         if missing:
             raise RuntimeError(f"Missing labeled cases for fold: {missing}")
 
+        key = frozenset(train_ids)
+        if key not in fold_lookup:
+            raise RuntimeError("Current training-ID set does not match any frozen Final72 fold")
+        fold_idx = int(fold_lookup[key])
+
         q1, small_ids, volumes, weights = build_fold_sampling(
             train_ids, cases, float(small_weight)
         )
-        fold_idx = int(getattr(config, "_cv_fold_idx"))
         sampling_records[fold_idx] = {
             "fold": fold_idx,
             "n_train": len(train_ids),
@@ -186,6 +182,7 @@ def install_oversampling_loader_hook(runtime_args, small_weight, sampling_record
             "sampler": "WeightedRandomSampler(replacement=True)",
             "samples_per_epoch": len(train_ids),
             "steps_per_epoch_matched_to_a3": True,
+            "validation_labels_used_for_sampling": False,
         }
 
         train_t = cv.ORIGINAL_GET_TRANSFORMS(
@@ -202,7 +199,6 @@ def install_oversampling_loader_hook(runtime_args, small_weight, sampling_record
         train_ds = make_dataset(train_items, train_t, use_cache)
         val_ds = make_dataset(val_items, val_t, use_cache)
 
-        # Generator is fold-specific for reproducible weighted sampling.
         generator = torch.Generator()
         generator.manual_seed(int(config.seed) + 10000)
         sampler = WeightedRandomSampler(
@@ -380,6 +376,10 @@ def main():
         config, source_manifest_path, Path(args.audit_metadata)
     )
     fold_map = {int(x["fold"]): x for x in fold_specs}
+    fold_lookup = {
+        frozenset(str(x) for x in spec["train_ids"]): int(spec["fold"])
+        for spec in fold_specs
+    }
 
     runtime_args = SimpleNamespace(
         config=args.config,
@@ -401,28 +401,8 @@ def main():
         baseline_results=str(a3_results_path),
     )
 
-    # cv.run_fold reconstructs config per fold. Add fold index so the loader hook can persist
-    # fold-local training-only sampling provenance.
     sampling_records = {}
-    original_run_fold = cv.run_fold
-
-    def run_fold_with_idx(run_args, fold_spec, out_dir):
-        idx = int(fold_spec["fold"])
-        original_from_yaml = HASSLConfig.from_yaml
-
-        def from_yaml_with_fold(path):
-            cfg = original_from_yaml(path)
-            cfg._cv_fold_idx = idx
-            return cfg
-
-        HASSLConfig.from_yaml = staticmethod(from_yaml_with_fold)
-        try:
-            return original_run_fold(run_args, fold_spec, out_dir)
-        finally:
-            HASSLConfig.from_yaml = original_from_yaml
-
-    cv.run_fold = run_fold_with_idx
-    install_oversampling_loader_hook(runtime_args, variant["small_weight"], sampling_records)
+    install_oversampling_loader_hook(variant["small_weight"], sampling_records, fold_lookup)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     print("=" * 122)
