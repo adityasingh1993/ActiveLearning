@@ -23,12 +23,12 @@ only and do not affect training.
 """
 
 import argparse
+import copy
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import torch
 from monai.data import CacheDataset, DataLoader, Dataset, MetaTensor
 from monai.inferers import SlidingWindowInferer
@@ -64,6 +64,11 @@ class AddCoordinateChannelsd:
     The transform must be placed after all random spatial augmentation. The first spatial axis
     is treated as LR because the upstream deterministic transform has already oriented the
     volume to RAS, matching the A3 LR-flip convention used in this experiment series.
+
+    MONAI transform history is copied from the one-channel MetaTensor. This is important because
+    HASSL validation uses Invertd to restore predictions to native geometry for volume metrics.
+    Adding coordinates is intentionally not part of that inverse trace; only the underlying
+    spatial preprocessing/augmentation history is preserved.
     """
 
     def __init__(self, key="image"):
@@ -97,7 +102,8 @@ class AddCoordinateChannelsd:
             out[self.key] = MetaTensor(
                 stacked,
                 affine=image.affine.clone(),
-                meta=dict(image.meta),
+                meta=copy.deepcopy(image.meta),
+                applied_operations=copy.deepcopy(image.applied_operations),
             )
         else:
             out[self.key] = stacked
