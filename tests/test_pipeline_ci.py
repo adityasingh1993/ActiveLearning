@@ -135,12 +135,31 @@ def test_written_mask_preserves_geometry(tmp_path):
     sitk.WriteImage(ref_img, src_path)
 
     mask_arr = np.ones((16, 16, 16), dtype=np.uint8)  # Resized 16^3 prediction mask
-    write_mask_with_spatial_geometry(out_path, mask_arr, reference_image_path=src_path)
+    write_mask_with_spatial_geometry(
+        out_path,
+        mask_arr,
+        reference_image_path=src_path,
+        segment_name="Lumen_AKS",
+        segment_id="Lumen_AKS",
+        label_value=1,
+        segment_color="0.2 0.7 0.9",
+        segment_layer=0,
+        segment_tags="|TerminologyEntry:test|",
+    )
 
     got_img = sitk.ReadImage(out_path)
     assert got_img.GetSize() == ref_img.GetSize(), "Output mask size must match reference image size"
     assert got_img.GetSpacing() == pytest.approx(ref_img.GetSpacing()), "Output mask spacing must match reference image spacing"
     assert got_img.GetOrigin() == pytest.approx(ref_img.GetOrigin()), "Output mask origin must match reference image origin"
+    assert got_img.GetMetaData("Segmentation_MasterRepresentation") == "Binary labelmap"
+    assert got_img.GetMetaData("Segmentation_ReferenceImageExtentOffset") == "0 0 0"
+    assert got_img.GetMetaData("Segment0_ID") == "Lumen_AKS"
+    assert got_img.GetMetaData("Segment0_Name") == "Lumen_AKS"
+    assert got_img.GetMetaData("Segment0_LabelValue") == "1"
+    assert got_img.GetMetaData("Segment0_Layer") == "0"
+    assert got_img.GetMetaData("Segment0_Color") == "0.2 0.7 0.9"
+    assert got_img.GetMetaData("Segment0_Tags") == "|TerminologyEntry:test|"
+    assert got_img.GetMetaData("Segment0_Extent") == "0 31 0 31 0 31"
 
 
 def test_teacher_student_views_are_spatially_aligned():

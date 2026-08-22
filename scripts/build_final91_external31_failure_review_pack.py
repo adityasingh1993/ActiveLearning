@@ -50,6 +50,7 @@ if GPU is not None:
 sys.argv = CLEAN_ARGV
 
 import numpy as np  # noqa: E402
+import nrrd  # noqa: E402
 import torch  # noqa: E402
 from monai.data import DataLoader, Dataset  # noqa: E402
 from monai.inferers import SlidingWindowInferer  # noqa: E402
@@ -111,6 +112,62 @@ def copy_exact(source: Path, destination: Path):
         raise RuntimeError(f"Copy verification failed: {source} -> {destination}")
 
 
+def read_ground_truth_segment_metadata(path: Path):
+    """Read the single foreground segment identity that should be preserved in predictions."""
+    header = nrrd.read_header(str(path))
+    prefixes = sorted(
+        key.rsplit("_", 1)[0]
+        for key in header
+        if key.startswith("Segment") and key.endswith("_Name")
+    )
+    if len(prefixes) > 1:
+        raise RuntimeError(f"Expected one foreground segment in {path}, found {prefixes}")
+    prefix = prefixes[0] if prefixes else "Segment0"
+    name = str(header.get(f"{prefix}_Name", "Bladder"))
+    segment_id = str(header.get(f"{prefix}_ID", name))
+    try:
+        label_value = int(header.get(f"{prefix}_LabelValue", 1))
+        layer = int(header.get(f"{prefix}_Layer", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid Slicer label/layer metadata in {path}") from exc
+    if label_value <= 0:
+        raise RuntimeError(f"Foreground Segment0_LabelValue must be positive in {path}")
+    return {
+        "segment_id": segment_id,
+        "segment_name": name,
+        "label_value": label_value,
+        "layer": layer,
+        "color": str(header.get(f"{prefix}_Color", "0.0 1.0 0.0")),
+        "tags": str(header.get(f"{prefix}_Tags", "|")),
+    }
+
+
+def verify_saved_segment_metadata(path: Path, expected):
+    """Fail if the saved prediction lost its embedded 3D Slicer segmentation metadata."""
+    header = nrrd.read_header(str(path))
+    checks = {
+        "Segmentation_ContainedRepresentationNames": "Binary labelmap|",
+        "Segmentation_MasterRepresentation": "Binary labelmap",
+        "Segmentation_ReferenceImageExtentOffset": "0 0 0",
+        "Segment0_ID": expected["segment_id"],
+        "Segment0_Name": expected["segment_name"],
+        "Segment0_LabelValue": str(expected["label_value"]),
+        "Segment0_Layer": str(expected["layer"]),
+        "Segment0_Color": expected["color"],
+        "Segment0_Tags": expected["tags"],
+    }
+    mismatches = {
+        key: {"expected": value, "actual": header.get(key)}
+        for key, value in checks.items()
+        if str(header.get(key)) != str(value)
+    }
+    if mismatches:
+        raise RuntimeError(f"Embedded .seg.nrrd metadata mismatch for {path}: {mismatches}")
+    if "Segment0_Extent" not in header:
+        raise RuntimeError(f"Saved .seg.nrrd has no Segment0_Extent: {path}")
+    return checks
+
+
 def diagnostic_hint(row):
     dice = float(row["final91_dice"])
     precision = float(row["final91_precision"])
@@ -129,7 +186,16 @@ def diagnostic_hint(row):
     return "BOUNDARY_OR_SMALL_TARGET_REVIEW"
 
 
-def infer_checkpoint(config, checkpoint, selected_ids, images, labels, destinations, expected_dice):
+def infer_checkpoint(
+    config,
+    checkpoint,
+    selected_ids,
+    images,
+    labels,
+    destinations,
+    expected_dice,
+    segment_metadata,
+):
     transform = get_base_transforms(config, keys=["image"], is_training=False, apply_strong_aug=False)
     inverse_transform = build_invertd(
         keys=["pred"], transform=transform, orig_keys=["image"], nearest_interp=False, to_tensor=True
@@ -163,14 +229,20 @@ def infer_checkpoint(config, checkpoint, selected_ids, images, labels, destinati
                     f"{case_id}: rerun Dice {metrics['dice']:.6f} differs from recorded "
                     f"{float(expected_dice[case_id]):.6f} for {checkpoint}"
                 )
+            embedded = segment_metadata[case_id]
+            prediction_with_label_value = pred.astype(np.uint8) * int(embedded["label_value"])
             write_mask_with_spatial_geometry(
                 str(destinations[case_id]),
-                pred,
+                prediction_with_label_value,
                 reference_image_path=str(images[case_id]),
-                segment_name=destinations[case_id].stem,
-                segment_id=destinations[case_id].stem,
-                label_value=1,
+                segment_name=embedded["segment_name"],
+                segment_id=embedded["segment_id"],
+                label_value=embedded["label_value"],
+                segment_color=embedded["color"],
+                segment_layer=embedded["layer"],
+                segment_tags=embedded["tags"],
             )
+            verify_saved_segment_metadata(destinations[case_id], embedded)
             computed[case_id] = metrics
             print(f"  {case_id}: Dice={metrics['dice']:.4f} -> {destinations[case_id]}")
     del student, teacher
@@ -235,10 +307,12 @@ def main():
     manifest = []
     final91_destinations = {}
     final62_destinations = {}
+    segment_metadata = {}
     for case_id in selected_ids:
         case_dir = output_dir / case_id
         copy_exact(images[case_id], case_dir / "image.mha")
         copy_exact(labels[case_id], case_dir / "ground_truth" / "ground_truth.seg.nrrd")
+        segment_metadata[case_id] = read_ground_truth_segment_metadata(labels[case_id])
         final91_destinations[case_id] = case_dir / "final91_pred" / "final91_pred.seg.nrrd"
         final62_destinations[case_id] = case_dir / "final62_pred" / "final62_pred.seg.nrrd"
 
@@ -246,12 +320,14 @@ def main():
     final91_computed = infer_checkpoint(
         config, Path(args.final91_checkpoint), selected_ids, images, labels,
         final91_destinations, {case_id: current[case_id]["dice"] for case_id in selected_ids},
+        segment_metadata,
     )
     print("Final62 selected-case inference")
     final62_computed = infer_checkpoint(
         config, Path(args.final62_checkpoint), selected_ids, images, labels,
         final62_destinations,
         {case_id: paired[case_id]["final62_ensemble_dice"] for case_id in selected_ids},
+        segment_metadata,
     )
 
     for index, case_id in enumerate(selected_ids, start=1):
@@ -278,6 +354,12 @@ def main():
             "gt_vox": int(float(now["gt_vox"])),
             "final62_pred_vox": int(final62_computed[case_id]["pred_vox"]),
             "final91_pred_vox": int(final91_computed[case_id]["pred_vox"]),
+            "embedded_segment_id": segment_metadata[case_id]["segment_id"],
+            "embedded_segment_name": segment_metadata[case_id]["segment_name"],
+            "embedded_label_value": segment_metadata[case_id]["label_value"],
+            "embedded_layer": segment_metadata[case_id]["layer"],
+            "embedded_color": segment_metadata[case_id]["color"],
+            "embedded_tags": segment_metadata[case_id]["tags"],
             "review_notes": "",
         }
         row["diagnostic_hint_not_ground_truth"] = diagnostic_hint(row)
@@ -297,6 +379,11 @@ def main():
         "n_selected": len(selected_ids),
         "selected_case_ids": selected_ids,
         "prediction_definition": "Student+EMA 50/50 raw probability ensemble @ 0.50; no LCC",
+        "seg_nrrd_metadata": (
+            "Final91 and Final62 predictions preserve Segment0 ID, Name, LabelValue, Layer, "
+            "Color and Tags from each ground truth; Slicer representation, reference offset "
+            "and full native Segment0_Extent are written and verified"
+        ),
         "source_external_role": "frozen_failure_diagnosis_only; no tuning or selection",
         "source_data_modified": False,
     }

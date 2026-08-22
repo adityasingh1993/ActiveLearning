@@ -51,6 +51,8 @@ def _slicer_segmentation_metadata(
     segment_id: Optional[str] = None,
     label_value: int = 1,
     segment_color: str = "0.0 1.0 0.0",
+    segment_layer: int = 0,
+    segment_tags: str = "|",
 ) -> Dict[str, str]:
     """Return the 3D Slicer .seg.nrrd key/value metadata required by downstream apps."""
     segment_id = segment_id or segment_name
@@ -66,11 +68,11 @@ def _slicer_segmentation_metadata(
         "Segmentation_ReferenceImageExtentOffset": "0 0 0",
         "Segment0_ID": str(segment_id),
         "Segment0_LabelValue": str(int(label_value)),
-        "Segment0_Layer": "0",
+        "Segment0_Layer": str(int(segment_layer)),
         "Segment0_Color": str(segment_color),
         "Segment0_Name": str(segment_name),
         "Segment0_Extent": extent,
-        "Segment0_Tags": "|",
+        "Segment0_Tags": str(segment_tags),
     }
 
 
@@ -80,6 +82,8 @@ def _set_slicer_metadata(
     segment_id: Optional[str] = None,
     label_value: int = 1,
     segment_color: str = "0.0 1.0 0.0",
+    segment_layer: int = 0,
+    segment_tags: str = "|",
 ):
     """Attach Slicer segmentation metadata to a SimpleITK image before NRRD writing."""
     metadata = _slicer_segmentation_metadata(
@@ -88,6 +92,8 @@ def _set_slicer_metadata(
         segment_id=segment_id,
         label_value=label_value,
         segment_color=segment_color,
+        segment_layer=segment_layer,
+        segment_tags=segment_tags,
     )
     for key, value in metadata.items():
         image.SetMetaData(key, value)
@@ -101,6 +107,8 @@ def write_mask_with_spatial_geometry(
     segment_id: Optional[str] = None,
     label_value: int = 1,
     segment_color: str = "0.0 1.0 0.0",
+    segment_layer: int = 0,
+    segment_tags: str = "|",
 ):
     """Write a native-grid Slicer-compatible .seg.nrrd with spatial and segment metadata.
 
@@ -156,6 +164,8 @@ def write_mask_with_spatial_geometry(
                 segment_id=segment_id,
                 label_value=label_value,
                 segment_color=segment_color,
+                segment_layer=segment_layer,
+                segment_tags=segment_tags,
             )
 
             writer = sitk.ImageFileWriter()
@@ -186,6 +196,8 @@ def write_mask_with_spatial_geometry(
             segment_id=segment_id,
             label_value=label_value,
             segment_color=segment_color,
+            segment_layer=segment_layer,
+            segment_tags=segment_tags,
         )
     )
     nrrd.write(output_path, clean_arr, header=header)
