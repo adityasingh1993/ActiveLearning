@@ -20,11 +20,14 @@ def main():
     parser.add_argument("--source-manifest", default=str(SOURCE_MANIFEST))
     parser.add_argument("--output-dir", default=str(OUTPUT))
     parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--validation-every-n-epochs", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.epochs < 101 or args.epochs > 300:
         parser.error("--epochs must be between 101 and 300")
+    if args.validation_every_n_epochs < 1:
+        parser.error("--validation-every-n-epochs must be >=1")
 
     from train_final91_a3_all91 import main as train_final91
 
@@ -35,6 +38,7 @@ def main():
         "--source-manifest", args.source_manifest,
         "--output-dir", args.output_dir,
         "--epochs", str(args.epochs),
+        "--validation-every-n-epochs", str(args.validation_every_n_epochs),
         "--seed", str(args.seed),
     ]
     if args.overwrite:

@@ -216,6 +216,7 @@ def main():
     parser.add_argument("--gpu-e200", type=int, default=0)
     parser.add_argument("--gpu-appearance", type=int, default=1)
     parser.add_argument("--long-epochs", type=int, default=200)
+    parser.add_argument("--validation-every-n-epochs", type=int, default=10)
     parser.add_argument("--image-dir", default=str(DEFAULT_IMAGE_DIR))
     parser.add_argument("--gt-dir", default=str(DEFAULT_GT_DIR))
     parser.add_argument("--run-dir", default=str(RUN_DIR))
@@ -232,6 +233,8 @@ def main():
         parser.error("Parallel experiments require two different GPU indices")
     if args.long_epochs <= 100 or args.long_epochs > 300:
         parser.error("--long-epochs must be between 101 and 300")
+    if args.validation_every_n_epochs < 1:
+        parser.error("--validation-every-n-epochs must be >=1")
 
     run_dir = Path(args.run_dir)
     log_dir = run_dir / "logs"
@@ -246,12 +249,14 @@ def main():
         "--config", args.config,
         "--output-dir", str(e200_train_dir),
         "--epochs", str(args.long_epochs),
+        "--validation-every-n-epochs", str(args.validation_every_n_epochs),
     ]
     a4_train = [
         sys.executable,
         str(A4_TRAIN_SCRIPT),
         "--config", args.config,
         "--output-dir", str(a4_train_dir),
+        "--validation-every-n-epochs", str(args.validation_every_n_epochs),
     ]
     if args.overwrite:
         e200_train.append("--overwrite")

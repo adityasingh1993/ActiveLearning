@@ -122,6 +122,7 @@ class HASSLConfig:
     pseudo_label_weight: float = 0.5  # Weight multiplier for pseudo-labeled approved samples
     save_every_n_epochs: int = 20  # Checkpoint frequency
     log_image_every_n_epochs: int = 10  # Log sample predictions
+    validation_every_n_epochs: int = 1  # Full validation cadence; Final91 all-data runs override to 10
 
     # ─── Active Learning (Phase 4) ───────────────────────────────────────
     al_query_size: int = 10  # Volumes to query per round
@@ -153,6 +154,8 @@ class HASSLConfig:
 
     def __post_init__(self):
         """Validate and adjust config based on compute mode."""
+        if self.validation_every_n_epochs < 1:
+            raise ValueError("validation_every_n_epochs must be >=1")
         if self.compute_mode == "prototype":
             # Enforce 8GB-friendly settings
             if self.batch_size > 1:

@@ -145,14 +145,29 @@ def install_all_labeled_a3_loader(cases, use_cache: bool, appearance_augmentatio
         )
         train_ds = cv.make_dataset(ordered, train_t, use_cache)
         val_ds = cv.make_dataset(ordered, val_t, use_cache)
+        train_workers = int(getattr(config, "num_workers", 0))
+        pin_memory = bool(torch.cuda.is_available())
         train_loader = DataLoader(
             train_ds,
             batch_size=int(getattr(config, "batch_size", 1)),
             shuffle=True,
-            num_workers=int(getattr(config, "num_workers", 0)),
+            num_workers=train_workers,
+            pin_memory=pin_memory,
+            persistent_workers=train_workers > 0,
         )
-        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=pin_memory,
+        )
         unlabeled_loader = DataLoader(Dataset([]), batch_size=1, shuffle=False, num_workers=0)
+        print(
+            f"Final91 data loaders: train={len(train_ds)} | val={len(val_ds)} | "
+            f"RAM cache={'ON (100%)' if use_cache else 'OFF'} | "
+            f"train_workers={train_workers} | val_batch=1"
+        )
         return train_loader, unlabeled_loader, val_loader, val_t
 
     data_engine.build_dataloaders = build_final_dataloaders
@@ -167,6 +182,12 @@ def main(argv=None):
     p.add_argument("--source-manifest", default=str(SOURCE_MANIFEST))
     p.add_argument("--output-dir", default=str(OUTPUT))
     p.add_argument("--epochs", type=int, default=None)
+    p.add_argument(
+        "--validation-every-n-epochs",
+        type=int,
+        default=10,
+        help="Run full cached all-91 validation at this interval, plus epoch 1 and final epoch",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--appearance-augmentation",
@@ -175,6 +196,8 @@ def main(argv=None):
     )
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args(argv)
+    if args.validation_every_n_epochs < 1:
+        p.error("--validation-every-n-epochs must be >=1")
 
     cv_dir = Path(args.cv_dir)
     audit_path = Path(args.audit_metadata)
@@ -218,6 +241,8 @@ def main(argv=None):
 
     cv.apply_baseline(config, resize_size=128, epochs=final_epochs)
     config.seed = int(args.seed)
+    config.use_cache_dataset = True
+    config.validation_every_n_epochs = int(args.validation_every_n_epochs)
     config.use_early_stopping = False
     config.checkpoint_dir = str(checkpoint_dir)
     config.cache_dir = str(output_dir / "cache")
@@ -235,7 +260,7 @@ def main(argv=None):
     cases = [by_id[x] for x in audited_ids]
     install_all_labeled_a3_loader(
         cases,
-        bool(getattr(config, "use_cache_dataset", True)),
+        True,
         appearance_augmentation=bool(args.appearance_augmentation),
     )
 
@@ -249,6 +274,8 @@ def main(argv=None):
     print(f"CV best epochs:        {best_epochs.tolist()}")
     print(f"Median best epoch:     {median_best_epoch}")
     print(f"Final training epochs: {final_epochs}")
+    print("Dataset cache:         train + validation cached 100% in host RAM")
+    print(f"Full validation:       epoch 1, every {args.validation_every_n_epochs} epochs, and final epoch")
     print("Recipe:                DynUNet | 128^3 | DiceCE | AdamW 1e-4")
     print("A3 augmentation:       translation +/-4 p=.5 + LR flip p=.5")
     print(
@@ -285,6 +312,8 @@ def main(argv=None):
         "cv_best_dice": [float(x["best_dice"]) for x in epoch_rows],
         "median_cv_best_epoch": median_best_epoch,
         "final_training_epochs": final_epochs,
+        "validation_every_n_epochs": int(args.validation_every_n_epochs),
+        "validation_cache": "CacheDataset cache_rate=1.0 in host RAM",
         "epoch_selection": "user_override" if args.epochs is not None else "median_final91_cv_best_epoch",
         "deployment_checkpoint": str(final_checkpoint),
         "checkpoint_saved_epoch": int(state.get("epoch", final_epochs)),

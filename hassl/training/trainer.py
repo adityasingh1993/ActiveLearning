@@ -312,6 +312,8 @@ class HASSLTrainer:
         total_pseudo_conf = 0.0   # Mean teacher sigmoid probability on unlabeled voxels
         total_pseudo_fg   = 0.0   # Fraction of voxels the teacher labels as foreground
         n_unlabeled_steps = 0
+        train_metric_sums = torch.zeros(3, device=self.device, dtype=torch.float64)
+        train_metric_count = 0
 
         if self.unlabeled_loader is None or len(self.unlabeled_loader.dataset) == 0:
             iter_unlabeled = None
@@ -350,6 +352,41 @@ class HASSLTrainer:
                     loss_sup_list.append(l_b)
                 loss_sup_tensor = torch.stack(loss_sup_list)
                 loss_sup = (loss_sup_tensor * sample_weights).sum() / (sample_weights.sum() + 1e-8)
+
+                # Training-set segmentation metrics reuse the existing supervised forward pass.
+                # They add only thresholding/reductions, not another model inference.
+                if self.num_classes == 1:
+                    metric_logits = preds_l
+                    if isinstance(metric_logits, (list, tuple)):
+                        metric_logits = metric_logits[0]
+                    elif metric_logits.ndim == 6:
+                        metric_logits = metric_logits[:, 0]
+                    with torch.no_grad():
+                        pred_metric = (torch.sigmoid(metric_logits.detach()) > 0.5).float()
+                        target_metric = (targets_l.detach() > 0.5).float()
+                        reduce_dims = tuple(range(1, pred_metric.ndim))
+                        tp = (pred_metric * target_metric).sum(dim=reduce_dims).double()
+                        pred_sum = pred_metric.sum(dim=reduce_dims).double()
+                        target_sum = target_metric.sum(dim=reduce_dims).double()
+                        dice = torch.where(
+                            pred_sum + target_sum > 0,
+                            (2.0 * tp) / (pred_sum + target_sum + 1e-8),
+                            torch.ones_like(tp),
+                        )
+                        precision = torch.where(
+                            pred_sum > 0,
+                            tp / (pred_sum + 1e-8),
+                            (target_sum == 0).double(),
+                        )
+                        recall = torch.where(
+                            target_sum > 0,
+                            tp / (target_sum + 1e-8),
+                            torch.ones_like(tp),
+                        )
+                        train_metric_sums += torch.stack([
+                            dice.sum(), precision.sum(), recall.sum()
+                        ])
+                        train_metric_count += int(pred_metric.shape[0])
 
                 # 2. Unsupervised Loss via MC Dropout Teacher with input perturbation asymmetry (N-5 & V7-1 fix)
                 loss_unsup = torch.tensor(0.0, device=self.device)
@@ -417,6 +454,19 @@ class HASSLTrainer:
 
         N = max(1, len(self.labeled_loader))
         M = max(1, n_unlabeled_steps)
+        if train_metric_count > 0:
+            metric_values = (train_metric_sums / train_metric_count).detach().cpu().tolist()
+            self._last_train_metrics = {
+                'train_dice': float(metric_values[0]),
+                'train_precision': float(metric_values[1]),
+                'train_recall': float(metric_values[2]),
+            }
+        else:
+            self._last_train_metrics = {
+                'train_dice': float('nan'),
+                'train_precision': float('nan'),
+                'train_recall': float('nan'),
+            }
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return (
@@ -1177,13 +1227,26 @@ class HASSLTrainer:
     def train(self, num_epochs: int):
         end_epoch = self.start_epoch + num_epochs
         log_img_freq = getattr(self.config, 'log_image_every_n_epochs', 10)
+        validation_frequency = max(
+            1, int(getattr(self.config, 'validation_every_n_epochs', 1))
+        )
 
         for epoch in range(self.start_epoch, end_epoch):
+            should_validate = (
+                epoch == self.start_epoch
+                or (epoch + 1) % validation_frequency == 0
+                or epoch == end_epoch - 1
+            )
             if self.mode == 'prototype':
                 train_loss, sup_loss, unsup_loss, uncert, pseudo_conf, pseudo_fg = self.train_one_epoch_uamt(epoch)
             else:
                 train_loss, sup_loss, unsup_loss, uncert = self.train_one_epoch_cps(epoch)
                 pseudo_conf, pseudo_fg = float('nan'), float('nan')
+            train_seg_metrics = getattr(self, '_last_train_metrics', {
+                'train_dice': float('nan'),
+                'train_precision': float('nan'),
+                'train_recall': float('nan'),
+            })
 
             # --- Per-epoch diagnostics: foreground fraction & zero-prediction alert ---
             try:
@@ -1195,7 +1258,7 @@ class HASSLTrainer:
                     fg_voxels.append(float(lbl.sum().item()))
                     total_voxels.append(float(lbl.numel()))
                     break  # only first batch for speed
-                if self.val_loader is not None:
+                if self.val_loader is not None and should_validate:
                     for bd in self.val_loader:
                         self.net_A.eval()
                         with torch.no_grad():
@@ -1235,32 +1298,56 @@ class HASSLTrainer:
             except Exception:
                 pass
 
-            should_log_image = ((epoch + 1) % log_img_freq == 0) or (epoch == end_epoch - 1)
+            should_log_image = should_validate and (
+                ((epoch + 1) % log_img_freq == 0) or (epoch == end_epoch - 1)
+            )
 
             # Log post-resize data preview at epoch 0 and on image-log epochs
             if epoch == self.start_epoch or should_log_image:
                 self.log_data_preview(epoch)
 
-            val_metrics = self.validate(epoch=epoch, should_log_image=should_log_image)
+            if should_validate:
+                val_metrics = self.validate(epoch=epoch, should_log_image=should_log_image)
+            else:
+                val_metrics = {
+                    'val_dice': float('nan'),
+                    'val_dice_teacher': float('nan'),
+                    'val_dice_lcc': float('nan'),
+                    'val_precision': float('nan'),
+                    'val_precision_lcc': float('nan'),
+                    'val_recall': float('nan'),
+                    'val_recall_lcc': float('nan'),
+                    'val_rve_pct': float('nan'),
+                    'val_rve_pct_lcc': float('nan'),
+                    'val_volume_r2': float('nan'),
+                    'val_volume_r2_lcc': float('nan'),
+                    'val_hd95': float('nan'),
+                    'val_pred_vol_mm3_mean': float('nan'),
+                    'val_pred_vol_mm3_mean_lcc': float('nan'),
+                    'val_gt_vol_mm3_mean': float('nan'),
+                }
             val_dice = val_metrics['val_dice']
 
             # Step LR scheduler and get current learning rate
             current_lr = self.config.train_lr
             if self.mode == 'prototype' and getattr(self, 'scheduler', None) is not None:
                 if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    self.scheduler.step(val_dice)
+                    if should_validate:
+                        self.scheduler.step(val_dice)
                 else:
                     self.scheduler.step()
                 current_lr = self.optimizer.param_groups[0]['lr']
             elif self.mode == 'full':
                 if getattr(self, 'scheduler_A', None) is not None:
                     if isinstance(self.scheduler_A, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                        self.scheduler_A.step(val_dice)
+                        if should_validate:
+                            self.scheduler_A.step(val_dice)
                     else:
                         self.scheduler_A.step()
                 if getattr(self, 'scheduler_B', None) is not None:
                     if isinstance(self.scheduler_B, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                        self.scheduler_B.step(val_dice)
+                        if should_validate:
+                            self.scheduler_B.step(val_dice)
                     else:
                         self.scheduler_B.step()
                 current_lr = self.optimizer_A.param_groups[0]['lr']
@@ -1276,24 +1363,39 @@ class HASSLTrainer:
                 'teacher_pseudo_fg_frac': pseudo_fg,      # Fraction of unlabeled voxels labelled as FG by teacher
                 'consistency_rampup_weight': self.get_rampup_weight(epoch),  # Unsupervised loss rampup progress
                 'epoch': epoch,
+                **train_seg_metrics,
                 **val_metrics
             }
             self.tracker.log_metrics(metrics, step=epoch)
 
-            hd95_str    = f"{val_metrics['val_hd95']:.2f}mm" if not np.isnan(val_metrics['val_hd95']) else "N/A"
-            dice_str    = f"{val_dice:.4f}"                    if not np.isnan(val_dice)                    else "N/A"
-            t_dice_str  = f"{val_metrics['val_dice_teacher']:.4f}" if not np.isnan(val_metrics['val_dice_teacher']) else "N/A"
-            prec_str    = f"{val_metrics['val_precision']:.4f}" if not np.isnan(val_metrics['val_precision']) else "N/A"
-            rec_str     = f"{val_metrics['val_recall']:.4f}"    if not np.isnan(val_metrics['val_recall'])    else "N/A"
+            if should_validate:
+                hd95_str = f"{val_metrics['val_hd95']:.2f}mm" if not np.isnan(val_metrics['val_hd95']) else "N/A"
+                dice_str = f"{val_dice:.4f}" if not np.isnan(val_dice) else "N/A"
+                t_dice_str = f"{val_metrics['val_dice_teacher']:.4f}" if not np.isnan(val_metrics['val_dice_teacher']) else "N/A"
+                prec_str = f"{val_metrics['val_precision']:.4f}" if not np.isnan(val_metrics['val_precision']) else "N/A"
+                rec_str = f"{val_metrics['val_recall']:.4f}" if not np.isnan(val_metrics['val_recall']) else "N/A"
+                print(
+                    f"  Epoch {epoch + 1:3d}/{end_epoch} | "
+                    f"TRAIN Loss={train_loss:.4f} Dice={train_seg_metrics['train_dice']:.4f} "
+                    f"Prec={train_seg_metrics['train_precision']:.4f} "
+                    f"Rec={train_seg_metrics['train_recall']:.4f} | "
+                    f"VALID EnsDice={dice_str} EMA_Dice={t_dice_str} "
+                    f"Prec={prec_str} Rec={rec_str} "
+                    f"RVE={val_metrics['val_rve_pct']:.1f}% "
+                    f"R²={val_metrics['val_volume_r2']:.3f} HD95={hd95_str} | "
+                    f"LR={current_lr:.6f}"
+                )
+            else:
+                print(
+                    f"  Epoch {epoch + 1:3d}/{end_epoch} | "
+                    f"TRAIN Loss={train_loss:.4f} Dice={train_seg_metrics['train_dice']:.4f} "
+                    f"Prec={train_seg_metrics['train_precision']:.4f} "
+                    f"Rec={train_seg_metrics['train_recall']:.4f} | "
+                    f"VALID SKIPPED (every {validation_frequency} epochs) | "
+                    f"LR={current_lr:.6f}"
+                )
 
-            print(f"  Epoch {epoch:3d}/{end_epoch} | "
-                  f"Loss: {train_loss:.4f} | "
-                  f"Dice(S): {dice_str} | Dice(T): {t_dice_str} | "
-                  f"Prec: {prec_str} | Rec: {rec_str} | "
-                  f"RVE: {val_metrics['val_rve_pct']:.1f}% | R²: {val_metrics['val_volume_r2']:.3f} | "
-                  f"HD95: {hd95_str} | LR: {current_lr:.6f}")
-
-            if val_dice > self.best_dice:
+            if should_validate and val_dice > self.best_dice:
                 self.best_dice = val_dice
                 self.save_checkpoint(
                     os.path.join(self.config.checkpoint_dir, 'best_checkpoint.pth'),
@@ -1307,7 +1409,7 @@ class HASSLTrainer:
                 )
 
             # Early Stopping Check
-            if self.early_stopper and self.early_stopper(val_dice):
+            if should_validate and self.early_stopper and self.early_stopper(val_dice):
                 print(f"  [HASSL Early Stopping] Validation Dice did not improve for {self.early_stopper.patience} consecutive epochs. Early stopping at epoch {epoch + 1}.")
                 self.save_checkpoint(
                     os.path.join(self.config.checkpoint_dir, f'checkpoint_epoch{epoch}.pth'),
