@@ -24,7 +24,8 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TRAIN_SCRIPT = REPO_ROOT / "scripts" / "train_final91_a3_all91.py"
+E200_TRAIN_SCRIPT = REPO_ROOT / "scripts" / "train_final91_a3_e200_all91.py"
+A4_TRAIN_SCRIPT = REPO_ROOT / "scripts" / "train_final91_a4_appearance_all91.py"
 EVAL_SCRIPT = REPO_ROOT / "scripts" / "benchmark_final91_a3_external31.py"
 
 E200_TRAIN_DIR = Path("experiments/final91_a3_all91_e200")
@@ -188,12 +189,18 @@ def main():
     e200_eval_dir = E200_EVAL_DIR
     a4_eval_dir = A4_EVAL_DIR
 
-    common_train = [sys.executable, str(TRAIN_SCRIPT), "--config", args.config]
-    e200_train = common_train + [
-        "--epochs", str(args.long_epochs), "--output-dir", str(e200_train_dir)
+    e200_train = [
+        sys.executable,
+        str(E200_TRAIN_SCRIPT),
+        "--config", args.config,
+        "--output-dir", str(e200_train_dir),
+        "--epochs", str(args.long_epochs),
     ]
-    a4_train = common_train + [
-        "--appearance-augmentation", "--output-dir", str(a4_train_dir)
+    a4_train = [
+        sys.executable,
+        str(A4_TRAIN_SCRIPT),
+        "--config", args.config,
+        "--output-dir", str(a4_train_dir),
     ]
     if args.overwrite:
         e200_train.append("--overwrite")

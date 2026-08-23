@@ -159,7 +159,7 @@ def install_all_labeled_a3_loader(cases, use_cache: bool, appearance_augmentatio
     pipeline_module.build_dataloaders = build_final_dataloaders
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description="Train final A3 model on all 91 HUMAN_GOLD cases")
     p.add_argument("--config", required=True)
     p.add_argument("--cv-dir", default=str(CV_DIR))
@@ -174,7 +174,7 @@ def main():
         help="Add the locked mild ultrasound contrast/intensity/noise/smoothing bundle",
     )
     p.add_argument("--overwrite", action="store_true")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     cv_dir = Path(args.cv_dir)
     audit_path = Path(args.audit_metadata)
