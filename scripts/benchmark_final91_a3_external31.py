@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Evaluate the fully trained Final91 A3 model once on the frozen external31 benchmark.
 
-Primary predeclared operating point: raw Student+EMA 50/50 probability ensemble @ threshold 0.50,
-no LCC and no threshold/post-processing tuning. Student and EMA are reported diagnostically only.
-External labels are evaluation-only and are never used to select training epochs or weights.
+Primary predeclared operating point: raw Student+EMA 50/50 probability ensemble @ threshold 0.50.
+The same predictions are additionally reported with a fixed 26-connected largest-component filter.
+Raw remains primary; LCC, Student, and EMA are diagnostic only. External labels are evaluation-only.
 """
 
 import argparse
@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from monai.data import DataLoader, Dataset
 from monai.inferers import SlidingWindowInferer
-from scipy.ndimage import binary_erosion, distance_transform_edt
+from scipy.ndimage import binary_erosion, distance_transform_edt, label as connected_components
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -45,6 +45,7 @@ DEFAULT_GT_DIR = Path("/data/v1/compressed/label")
 EXPECTED_CASES = 31
 THRESHOLD = 0.50
 MODE_ORDER = {"STUDENT": 0, "EMA": 1, "ENSEMBLE": 2}
+LCC_STRUCTURE = np.ones((3, 3, 3), dtype=np.uint8)
 
 
 def read_json(path: Path):
@@ -103,6 +104,17 @@ def hd95_mm(pred, gt, spacing_xyz):
     d_to_p = distance_transform_edt(~p_surface, sampling=spacing_zyx)[g_surface]
     distances = np.concatenate([d_to_g, d_to_p])
     return float(np.percentile(distances, 95)) if distances.size else 0.0
+
+
+def largest_connected_component(mask):
+    mask = np.asarray(mask, dtype=bool)
+    labeled, count = connected_components(mask, structure=LCC_STRUCTURE)
+    if count <= 1:
+        return mask.copy(), int(count)
+    sizes = np.bincount(labeled.ravel())
+    sizes[0] = 0
+    largest_label = int(np.argmax(sizes))
+    return labeled == largest_label, int(count)
 
 
 def summarize(rows):
@@ -177,6 +189,54 @@ def maybe_compare_final62(current_rows, baseline_path: Path, output_dir: Path, m
     print(f"\nFINAL62 ENSEMBLE -> {model_label} ENSEMBLE — EXTERNAL31")
     print(f"Mean Dice: {summary['final62_mean_dice']:.4f} -> {summary['final91_mean_dice']:.4f} ({summary['delta_mean_dice']:+.4f})")
     print(f"Cases: improved={summary['improved']} | worsened={summary['worsened']} | +>=.05={summary['improved_ge_0p05']} | <=-.05={summary['worsened_le_minus_0p05']}")
+    return summary
+
+
+def compare_raw_and_lcc(raw_rows, lcc_rows, output_dir: Path, model_label: str):
+    raw = {str(r["case_id"]): r for r in raw_rows if r["mode"] == "ENSEMBLE"}
+    lcc = {str(r["case_id"]): r for r in lcc_rows if r["mode"] == "ENSEMBLE"}
+    if set(raw) != set(lcc) or len(raw) != EXPECTED_CASES:
+        raise RuntimeError("Raw and LCC ensemble results do not contain identical 31 IDs")
+    paired = []
+    for case_id in sorted(raw):
+        first, second = raw[case_id], lcc[case_id]
+        paired.append({
+            "case_id": case_id,
+            "raw_dice": float(first["dice"]),
+            "lcc_dice": float(second["dice"]),
+            "lcc_minus_raw_dice": float(second["dice"]) - float(first["dice"]),
+            "raw_precision": float(first["precision"]),
+            "lcc_precision": float(second["precision"]),
+            "raw_recall": float(first["recall"]),
+            "lcc_recall": float(second["recall"]),
+            "raw_signed_rve_pct": float(first["signed_rve_pct"]),
+            "lcc_signed_rve_pct": float(second["signed_rve_pct"]),
+            "raw_hd95_mm": float(first["hd95_mm"]),
+            "lcc_hd95_mm": float(second["hd95_mm"]),
+            "raw_component_count": int(first["component_count"]),
+        })
+    delta = np.asarray([r["lcc_minus_raw_dice"] for r in paired])
+    summary = {
+        "version": "final91_external31_raw_vs_lcc_v1",
+        "model_label": model_label,
+        "n": len(paired),
+        "raw_mean_dice": float(np.mean([r["raw_dice"] for r in paired])),
+        "lcc_mean_dice": float(np.mean([r["lcc_dice"] for r in paired])),
+        "lcc_minus_raw_mean_dice": float(np.mean(delta)),
+        "lcc_improved_cases": int(np.sum(delta > 1e-6)),
+        "lcc_worsened_cases": int(np.sum(delta < -1e-6)),
+        "lcc_improved_ge_0p05": int(np.sum(delta >= 0.05)),
+        "lcc_worsened_le_minus_0p05": int(np.sum(delta <= -0.05)),
+        "raw_multicomponent_cases": int(np.sum([
+            r["raw_component_count"] > 1 for r in paired
+        ])),
+        "lcc_connectivity": 26,
+        "selection_role": "diagnostic_only_not_selected_on_external31",
+    }
+    write_csv(output_dir / "external31_raw_vs_lcc_case_comparison.csv", paired)
+    (output_dir / "external31_raw_vs_lcc_summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
     return summary
 
 
@@ -261,12 +321,14 @@ def main():
     print(f"Training overlap:   {len(overlap)}")
     print(f"Checkpoint:         {checkpoint}")
     print("Primary result:     ENSEMBLE = Student+EMA 50/50 @ 0.50")
-    print("Postprocessing:     raw, no LCC")
+    print("Primary processing: raw, no LCC")
+    print("Diagnostic:         26-connected largest component at the same threshold")
     print("Student/EMA:        diagnostic only; not used to choose deployment mode here")
     print("External31 labels:  evaluation only")
     print("=" * 120)
 
     rows = []
+    lcc_rows = []
     with torch.no_grad():
         for idx, batch in enumerate(loader, start=1):
             raw_id = batch["id"]
@@ -282,25 +344,56 @@ def main():
                 ref, prob_zyx = normalize_native_probability(native_prob, images[case_id])
                 gt = read_gt_binary(labels[case_id], ref)
                 pred = prob_zyx > THRESHOLD
-                metrics = binary_metrics(pred, gt)
-                metrics["hd95_mm"] = hd95_mm(pred, gt, ref.GetSpacing())
-                row = {"case_id": case_id, "mode": mode, "threshold": THRESHOLD, **metrics}
-                rows.append(row)
-                case_metrics[mode] = row
+                lcc_pred, component_count = largest_connected_component(pred)
+                raw_metrics = binary_metrics(pred, gt)
+                raw_metrics["hd95_mm"] = hd95_mm(pred, gt, ref.GetSpacing())
+                lcc_metrics = binary_metrics(lcc_pred, gt)
+                lcc_metrics["hd95_mm"] = hd95_mm(lcc_pred, gt, ref.GetSpacing())
+                raw_row = {
+                    "case_id": case_id,
+                    "mode": mode,
+                    "postprocessing": "RAW",
+                    "threshold": THRESHOLD,
+                    "component_count": component_count,
+                    **raw_metrics,
+                }
+                lcc_row = {
+                    "case_id": case_id,
+                    "mode": mode,
+                    "postprocessing": "LCC_26",
+                    "threshold": THRESHOLD,
+                    "component_count": int(lcc_pred.any()),
+                    **lcc_metrics,
+                }
+                rows.append(raw_row)
+                lcc_rows.append(lcc_row)
+                case_metrics[mode] = {"raw": raw_row, "lcc": lcc_row}
             print(
-                f"[{idx:02d}/31] {case_id} | Student={case_metrics['STUDENT']['dice']:.4f} | "
-                f"EMA={case_metrics['EMA']['dice']:.4f} | Ensemble={case_metrics['ENSEMBLE']['dice']:.4f}"
+                f"[{idx:02d}/31] {case_id} | "
+                f"Student R/L={case_metrics['STUDENT']['raw']['dice']:.4f}/"
+                f"{case_metrics['STUDENT']['lcc']['dice']:.4f} | "
+                f"EMA R/L={case_metrics['EMA']['raw']['dice']:.4f}/"
+                f"{case_metrics['EMA']['lcc']['dice']:.4f} | "
+                f"Ensemble R/L={case_metrics['ENSEMBLE']['raw']['dice']:.4f}/"
+                f"{case_metrics['ENSEMBLE']['lcc']['dice']:.4f} | "
+                f"components={case_metrics['ENSEMBLE']['raw']['component_count']}"
             )
 
     rows.sort(key=lambda r: (str(r["case_id"]), MODE_ORDER[r["mode"]]))
+    lcc_rows.sort(key=lambda r: (str(r["case_id"]), MODE_ORDER[r["mode"]]))
     summary_rows = summarize(rows)
+    lcc_summary_rows = summarize(lcc_rows)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_csv(output_dir / "external31_case_metrics.csv", rows)
     write_csv(output_dir / "external31_summary.csv", summary_rows)
+    write_csv(output_dir / "external31_case_metrics_lcc.csv", lcc_rows)
+    write_csv(output_dir / "external31_summary_lcc.csv", lcc_summary_rows)
 
     primary = next(x for x in summary_rows if x["mode"] == "ENSEMBLE")
+    primary_lcc = next(x for x in lcc_summary_rows if x["mode"] == "ENSEMBLE")
+    raw_vs_lcc = compare_raw_and_lcc(rows, lcc_rows, output_dir, str(args.model_label))
     metadata = {
-        "version": "final91_a3_external31_locked_v1",
+        "version": "final91_a3_external31_raw_and_lcc_v2",
         "model_label": str(args.model_label),
         "checkpoint": str(checkpoint),
         "training_metadata": str(train_meta_path),
@@ -311,9 +404,12 @@ def main():
         "primary_mode": "ENSEMBLE",
         "prediction_definition": "Student+EMA 50/50 raw probability ensemble @ 0.50",
         "threshold": THRESHOLD,
-        "postprocessing": "raw_no_lcc",
+        "primary_postprocessing": "raw_no_lcc",
+        "diagnostic_postprocessing": "largest_26_connected_component_after_threshold",
         "external_gt_usage": "evaluation_only",
         "primary_summary": primary,
+        "lcc_diagnostic_summary": primary_lcc,
+        "raw_vs_lcc_comparison": raw_vs_lcc,
         "warning": "External31 has been used in prior historical evaluations, so it is a frozen comparison benchmark, not a pristine prospective test set.",
     }
     historical = maybe_compare_final62(
@@ -328,17 +424,27 @@ def main():
     (output_dir / "external31_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     print("\n" + "=" * 120)
-    print(f"{args.model_label} — EXTERNAL31 PRIMARY ENSEMBLE RESULT")
-    print(f"Mean Dice:          {primary['mean_dice']:.4f}")
-    print(f"Median Dice:        {primary['median_dice']:.4f}")
-    print(f"Precision:          {primary['mean_precision']:.4f}")
-    print(f"Recall:             {primary['mean_recall']:.4f}")
-    print(f"Median signed RVE:  {primary['median_signed_rve_pct']:+.2f}%")
-    print(f"Median |RVE|:       {primary['median_abs_rve_pct']:.2f}%")
-    print(f"Mean HD95:          {primary['mean_hd95_mm']:.3f} mm")
-    print(f"Dice <0.70:         {primary['dice_lt_0p70']}")
-    print(f"Dice <0.50:         {primary['dice_lt_0p50']}")
-    print(f"Dice >=0.80:        {primary['dice_ge_0p80']}")
+    print(f"{args.model_label} — EXTERNAL31 ENSEMBLE RAW vs LCC")
+    print(f"Mean Dice:          {primary['mean_dice']:.4f} -> {primary_lcc['mean_dice']:.4f} "
+          f"({raw_vs_lcc['lcc_minus_raw_mean_dice']:+.4f})")
+    print(f"Median Dice:        {primary['median_dice']:.4f} -> {primary_lcc['median_dice']:.4f}")
+    print(f"Precision:          {primary['mean_precision']:.4f} -> {primary_lcc['mean_precision']:.4f}")
+    print(f"Recall:             {primary['mean_recall']:.4f} -> {primary_lcc['mean_recall']:.4f}")
+    print(f"Median signed RVE:  {primary['median_signed_rve_pct']:+.2f}% -> "
+          f"{primary_lcc['median_signed_rve_pct']:+.2f}%")
+    print(f"Median |RVE|:       {primary['median_abs_rve_pct']:.2f}% -> "
+          f"{primary_lcc['median_abs_rve_pct']:.2f}%")
+    print(f"Mean HD95:          {primary['mean_hd95_mm']:.3f} -> "
+          f"{primary_lcc['mean_hd95_mm']:.3f} mm")
+    print(f"Dice <0.70:         {primary['dice_lt_0p70']} -> {primary_lcc['dice_lt_0p70']}")
+    print(f"Dice <0.50:         {primary['dice_lt_0p50']} -> {primary_lcc['dice_lt_0p50']}")
+    print(f"Dice >=0.80:        {primary['dice_ge_0p80']} -> {primary_lcc['dice_ge_0p80']}")
+    print(f"Raw multicomponent: {raw_vs_lcc['raw_multicomponent_cases']}/{EXPECTED_CASES}")
+    print(f"LCC case effects:   improved={raw_vs_lcc['lcc_improved_cases']} | "
+          f"worsened={raw_vs_lcc['lcc_worsened_cases']} | "
+          f"+>=.05={raw_vs_lcc['lcc_improved_ge_0p05']} | "
+          f"<=-.05={raw_vs_lcc['lcc_worsened_le_minus_0p05']}")
+    print("Raw remains the predeclared primary result; LCC is diagnostic.")
     print("=" * 120)
 
 

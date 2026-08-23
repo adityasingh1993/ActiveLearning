@@ -8,8 +8,8 @@ Experiment A4_APPEARANCE (default GPU 1)
     Final91 A3 plus the locked mild ultrasound appearance augmentation bundle. The
     epoch count defaults to the same CV-derived full-training duration as Final91 A3.
 
-Each worker trains first and then runs the locked raw Student+EMA 50/50 ensemble at
-threshold 0.50 over the same 31 external cases one-by-one. External31 is diagnostic;
+Each worker trains first and then runs the locked Student+EMA 50/50 ensemble at
+threshold 0.50 over the same 31 external cases one-by-one, reporting raw and LCC. External31 is diagnostic;
 the script performs no threshold, checkpoint, loss, augmentation, or post-processing search.
 """
 
@@ -97,11 +97,14 @@ def read_ensemble(path: Path):
 def write_comparison(e200_eval_dir: Path, a4_eval_dir: Path, run_dir: Path):
     e200 = read_ensemble(e200_eval_dir / "external31_case_metrics.csv")
     a4 = read_ensemble(a4_eval_dir / "external31_case_metrics.csv")
-    if set(e200) != set(a4):
-        raise RuntimeError("E200 and A4 External31 IDs differ")
+    e200_lcc = read_ensemble(e200_eval_dir / "external31_case_metrics_lcc.csv")
+    a4_lcc = read_ensemble(a4_eval_dir / "external31_case_metrics_lcc.csv")
+    if not (set(e200) == set(a4) == set(e200_lcc) == set(a4_lcc)):
+        raise RuntimeError("E200/A4 raw/LCC External31 IDs differ")
     rows = []
     for case_id in sorted(e200):
         first, second = e200[case_id], a4[case_id]
+        first_lcc, second_lcc = e200_lcc[case_id], a4_lcc[case_id]
         rows.append({
             "case_id": case_id,
             "e200_dice": float(first["dice"]),
@@ -115,6 +118,21 @@ def write_comparison(e200_eval_dir: Path, a4_eval_dir: Path, run_dir: Path):
             "a4_appearance_signed_rve_pct": float(second["signed_rve_pct"]),
             "e200_hd95_mm": float(first["hd95_mm"]),
             "a4_appearance_hd95_mm": float(second["hd95_mm"]),
+            "e200_lcc_dice": float(first_lcc["dice"]),
+            "a4_appearance_lcc_dice": float(second_lcc["dice"]),
+            "a4_minus_e200_lcc_dice": (
+                float(second_lcc["dice"]) - float(first_lcc["dice"])
+            ),
+            "e200_lcc_precision": float(first_lcc["precision"]),
+            "a4_appearance_lcc_precision": float(second_lcc["precision"]),
+            "e200_lcc_recall": float(first_lcc["recall"]),
+            "a4_appearance_lcc_recall": float(second_lcc["recall"]),
+            "e200_lcc_signed_rve_pct": float(first_lcc["signed_rve_pct"]),
+            "a4_appearance_lcc_signed_rve_pct": float(second_lcc["signed_rve_pct"]),
+            "e200_lcc_hd95_mm": float(first_lcc["hd95_mm"]),
+            "a4_appearance_lcc_hd95_mm": float(second_lcc["hd95_mm"]),
+            "e200_lcc_minus_raw_dice": float(first_lcc["dice"]) - float(first["dice"]),
+            "a4_lcc_minus_raw_dice": float(second_lcc["dice"]) - float(second["dice"]),
         })
     run_dir.mkdir(parents=True, exist_ok=True)
     comparison_path = run_dir / "external31_e200_vs_a4_appearance_case_comparison.csv"
@@ -126,9 +144,14 @@ def write_comparison(e200_eval_dir: Path, a4_eval_dir: Path, run_dir: Path):
     e200_dice = [row["e200_dice"] for row in rows]
     a4_dice = [row["a4_appearance_dice"] for row in rows]
     delta = [row["a4_minus_e200_dice"] for row in rows]
+    e200_lcc_dice = [row["e200_lcc_dice"] for row in rows]
+    a4_lcc_dice = [row["a4_appearance_lcc_dice"] for row in rows]
+    lcc_delta = [row["a4_minus_e200_lcc_dice"] for row in rows]
     summary = {
-        "version": "final91_e200_vs_a4_appearance_external31_diagnostic_v1",
+        "version": "final91_e200_vs_a4_appearance_external31_raw_and_lcc_v2",
         "n": len(rows),
+        "primary_postprocessing": "raw_no_lcc",
+        "diagnostic_postprocessing": "largest_26_connected_component_after_threshold",
         "e200_mean_dice": sum(e200_dice) / len(e200_dice),
         "a4_appearance_mean_dice": sum(a4_dice) / len(a4_dice),
         "a4_minus_e200_mean_dice": sum(delta) / len(delta),
@@ -136,6 +159,19 @@ def write_comparison(e200_eval_dir: Path, a4_eval_dir: Path, run_dir: Path):
         "a4_worsened_cases": sum(value < -1e-6 for value in delta),
         "a4_improved_ge_0p05": sum(value >= 0.05 for value in delta),
         "a4_worsened_le_minus_0p05": sum(value <= -0.05 for value in delta),
+        "e200_lcc_mean_dice": sum(e200_lcc_dice) / len(e200_lcc_dice),
+        "a4_appearance_lcc_mean_dice": sum(a4_lcc_dice) / len(a4_lcc_dice),
+        "a4_minus_e200_lcc_mean_dice": sum(lcc_delta) / len(lcc_delta),
+        "a4_lcc_improved_cases": sum(value > 1e-6 for value in lcc_delta),
+        "a4_lcc_worsened_cases": sum(value < -1e-6 for value in lcc_delta),
+        "a4_lcc_improved_ge_0p05": sum(value >= 0.05 for value in lcc_delta),
+        "a4_lcc_worsened_le_minus_0p05": sum(value <= -0.05 for value in lcc_delta),
+        "e200_lcc_minus_raw_mean_dice": sum(
+            row["e200_lcc_minus_raw_dice"] for row in rows
+        ) / len(rows),
+        "a4_lcc_minus_raw_mean_dice": sum(
+            row["a4_lcc_minus_raw_dice"] for row in rows
+        ) / len(rows),
         "external31_role": "repeated_frozen_diagnostic_not_model_selection",
     }
     summary_path = run_dir / "external31_e200_vs_a4_appearance_summary.json"
@@ -143,7 +179,7 @@ def write_comparison(e200_eval_dir: Path, a4_eval_dir: Path, run_dir: Path):
     print("\n" + "=" * 112)
     print("FINAL91 TWO-EXPERIMENT EXTERNAL31 DIAGNOSTIC")
     print(
-        f"Mean Dice E200 -> A4 appearance: {summary['e200_mean_dice']:.4f} -> "
+        f"RAW mean Dice E200 -> A4: {summary['e200_mean_dice']:.4f} -> "
         f"{summary['a4_appearance_mean_dice']:.4f} "
         f"({summary['a4_minus_e200_mean_dice']:+.4f})"
     )
@@ -152,6 +188,21 @@ def write_comparison(e200_eval_dir: Path, a4_eval_dir: Path, run_dir: Path):
         f"worsened={summary['a4_worsened_cases']} | "
         f"+>=.05={summary['a4_improved_ge_0p05']} | "
         f"<=-.05={summary['a4_worsened_le_minus_0p05']}"
+    )
+    print(
+        f"LCC mean Dice E200 -> A4: {summary['e200_lcc_mean_dice']:.4f} -> "
+        f"{summary['a4_appearance_lcc_mean_dice']:.4f} "
+        f"({summary['a4_minus_e200_lcc_mean_dice']:+.4f})"
+    )
+    print(
+        f"A4 LCC cases improved={summary['a4_lcc_improved_cases']} | "
+        f"worsened={summary['a4_lcc_worsened_cases']} | "
+        f"+>=.05={summary['a4_lcc_improved_ge_0p05']} | "
+        f"<=-.05={summary['a4_lcc_worsened_le_minus_0p05']}"
+    )
+    print(
+        f"Within-model LCC gain: E200={summary['e200_lcc_minus_raw_mean_dice']:+.4f} | "
+        f"A4={summary['a4_lcc_minus_raw_mean_dice']:+.4f}"
     )
     print(f"Case comparison: {comparison_path}")
     print(f"Summary:         {summary_path}")
@@ -251,7 +302,7 @@ def main():
     print("FINAL91 PARALLEL EXPERIMENTS")
     print(f"GPU {args.gpu_e200}: A3 with {args.long_epochs}-epoch cap")
     print(f"GPU {args.gpu_appearance}: A4 mild ultrasound appearance augmentation")
-    print("After training: locked Student+EMA 50/50 @ .50 External31, case-by-case")
+    print("After training: Student+EMA 50/50 @ .50 External31, RAW + LCC case-by-case")
     print(f"Logs: {log_dir}")
     print("=" * 112)
 

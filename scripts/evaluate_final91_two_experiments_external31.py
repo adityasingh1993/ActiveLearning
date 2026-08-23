@@ -156,7 +156,7 @@ def main():
     plan = {
         "version": "final91_two_experiment_external31_evaluation_v1",
         "external31_role": "repeated_frozen_diagnostic_not_model_selection",
-        "prediction": "Student+EMA 50/50 raw probability ensemble @ 0.50; no LCC",
+        "prediction": "Student+EMA 50/50 @ 0.50; report raw primary and fixed LCC diagnostic",
         "jobs": {
             "E200": {"gpu": args.gpu_e200, "command": e200_command},
             "A4_APPEARANCE": {
@@ -175,7 +175,7 @@ def main():
     print(f"GPU {args.gpu_e200}: A3 E{e200_epochs}")
     print(f"GPU {args.gpu_appearance}: A4 appearance E{a4_epochs}")
     print("Each evaluator processes the same 31 cases one-by-one.")
-    print("Locked prediction: Student+EMA 50/50 @ .50 | no LCC")
+    print("Locked prediction: Student+EMA 50/50 @ .50 | RAW primary + LCC diagnostic")
     print(f"Comparison output: {comparison_dir}")
     print("=" * 112)
 
