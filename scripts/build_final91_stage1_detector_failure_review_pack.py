@@ -22,7 +22,6 @@ Output layout
 """
 
 import argparse
-import copy
 import csv
 import json
 import math
@@ -341,10 +340,6 @@ def infer_stage1(
             keys=["pred"], transform=transform, orig_keys=["image"],
             nearest_interp=False, to_tensor=True,
         )
-        inverse_nearest = build_invertd(
-            keys=["pred"], transform=transform, orig_keys=["image"],
-            nearest_interp=True, to_tensor=True,
-        )
         loader = DataLoader(
             Dataset(
                 [{"id": case_id, "image": cases[case_id]["image"]} for case_id in fold_ids],
@@ -368,36 +363,28 @@ def infer_stage1(
                 prediction_96 = probability_96 >= DETECTOR_THRESHOLD
                 crop_96, lo, hi, components, fallback = detector_crop(probability_96)
 
-                # MONAI Invertd consumes/pops transform history while inverting. Each derived
-                # artifact therefore needs an independent deep copy of the original batch;
-                # otherwise only the first inversion returns to native geometry and subsequent
-                # artifacts silently remain on the 96^3 detector grid.
+                # Invert exactly once. MONAI ties inverse state to both the MetaTensor trace and
+                # the transform pipeline, so replaying sibling inversions from one preprocessing
+                # pass is not reliable across supported MONAI versions. The native detector mask
+                # and crop are deterministically regenerated from this native probability below.
                 native_probability = invert_probability_exact(
-                    probability_t, copy.deepcopy(batch), inverse_linear, index=0
+                    probability_t, batch, inverse_linear, index=0
                 )
                 reference, probability_zyx = normalize_native_probability(
                     native_probability, cases[case_id]["image"]
                 )
-                prediction_t = torch.from_numpy(prediction_96[None, None].astype(np.float32))
-                crop_t = torch.from_numpy(crop_96[None, None].astype(np.float32))
-                native_prediction = invert_probability_exact(
-                    prediction_t, copy.deepcopy(batch), inverse_nearest, index=0
+                prediction_zyx = probability_zyx >= DETECTOR_THRESHOLD
+                crop_zyx, native_lo, native_hi, native_components, native_fallback = (
+                    detector_crop(probability_zyx)
                 )
-                _, prediction_zyx = normalize_native_probability(
-                    native_prediction, cases[case_id]["image"]
-                )
-                native_crop = invert_probability_exact(
-                    crop_t, copy.deepcopy(batch), inverse_nearest, index=0
-                )
-                _, crop_zyx = normalize_native_probability(native_crop, cases[case_id]["image"])
                 outputs[case_id] = {
                     "checkpoint": str(checkpoint_path),
                     "checkpoint_epoch": int(state.get("epoch", -1)),
                     "checkpoint_best_val_box_dice": float(state.get("best_val_box_dice", float("nan"))),
                     "reference": reference,
                     "probability_zyx": probability_zyx,
-                    "prediction_zyx": prediction_zyx > 0.5,
-                    "crop_zyx": crop_zyx > 0.5,
+                    "prediction_zyx": prediction_zyx,
+                    "crop_zyx": crop_zyx,
                     "model_probability_max": float(probability_96.max()),
                     "model_probability_mean": float(probability_96.mean()),
                     "model_prediction_fraction": float(prediction_96.mean()),
@@ -408,6 +395,13 @@ def infer_stage1(
                         "z0": int(lo[0]), "z1": int(hi[0]),
                         "y0": int(lo[1]), "y1": int(hi[1]),
                         "x0": int(lo[2]), "x1": int(hi[2]),
+                    },
+                    "native_detector_components": native_components,
+                    "native_full_volume_fallback": native_fallback,
+                    "native_crop_bounds_zyx": {
+                        "z0": int(native_lo[0]), "z1": int(native_hi[0]),
+                        "y0": int(native_lo[1]), "y1": int(native_hi[1]),
+                        "x0": int(native_lo[2]), "x1": int(native_hi[2]),
                     },
                 }
         del model
@@ -669,6 +663,14 @@ def main():
                 "component_count_96": s1["model_detector_components"],
                 "full_volume_fallback": s1["model_full_volume_fallback"],
                 "crop_bounds_96_zyx": s1["model_crop_bounds_zyx"],
+                "native_artifact_derivation": (
+                    "Stage1 probability inverted exactly once with MONAI; native prediction and "
+                    "native crop regenerated from that probability using threshold 0.30, substantial "
+                    "components and 0.40 margin. Exact original 96^3 crop remains recorded separately."
+                ),
+                "native_component_count": s1["native_detector_components"],
+                "native_full_volume_fallback": s1["native_full_volume_fallback"],
+                "native_crop_bounds_zyx": s1["native_crop_bounds_zyx"],
                 "native_prediction_vs_gt": stage1_native_metrics,
                 "native_crop_gt_coverage": crop_coverage_native,
                 "native_crop_fraction": crop_fraction_native,
@@ -742,6 +744,12 @@ def main():
         "seg_nrrd_metadata": (
             "Every generated .seg.nrrd contains verified Slicer Binary labelmap representation, "
             "Segment0 ID/Name/LabelValue/Layer/Color/Tags, reference offset and full native extent."
+        ),
+        "stage1_native_artifact_derivation": (
+            "The detector probability is inverted exactly once to native geometry. The native "
+            "Stage1 prediction and proposed crop are regenerated from that native probability "
+            "using the locked threshold/component/margin rule; exact 96^3 crop metrics remain "
+            "in each metrics.json."
         ),
         "ground_truth": "Copied byte-for-byte; never modified",
         "source_data_modified": False,
