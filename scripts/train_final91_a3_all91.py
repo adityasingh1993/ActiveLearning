@@ -16,6 +16,15 @@ from pathlib import Path
 import numpy as np
 import torch
 from monai.data import DataLoader, Dataset
+from monai.transforms import (
+    Compose,
+    MapTransform,
+    RandAdjustContrastd,
+    RandGaussianNoised,
+    RandGaussianSmoothd,
+    RandScaleIntensityd,
+    RandShiftIntensityd,
+)
 from monai.utils import set_determinism
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +54,50 @@ A3_VARIANT = {
     "lr_flip_prob": 0.5,
 }
 
+APPEARANCE_AUGMENTATION = {
+    "gamma_contrast": {"probability": 0.30, "gamma": [0.7, 1.5]},
+    "intensity_scale": {"probability": 0.20, "factor": 0.10},
+    "intensity_shift": {"probability": 0.20, "offset": 0.05},
+    "gaussian_noise": {"probability": 0.15, "mean": 0.0, "std": 0.02},
+    "gaussian_smoothing": {"probability": 0.15, "sigma": [0.5, 1.0]},
+    "clip_after_augmentation": [0.0, 1.0],
+}
+
+
+class ClipIntensityd(MapTransform):
+    """Clip normalized image intensities after random appearance perturbations."""
+
+    def __init__(self, keys, low=0.0, high=1.0):
+        super().__init__(keys)
+        self.low = float(low)
+        self.high = float(high)
+
+    def __call__(self, data):
+        result = dict(data)
+        for key in self.keys:
+            result[key] = torch.clamp(result[key], self.low, self.high)
+        return result
+
+
+def add_mild_ultrasound_appearance_augmentation(transform):
+    """Append the predeclared mild image-only ultrasound appearance augmentation bundle."""
+    steps = list(getattr(transform, "transforms", [transform]))
+    steps.extend([
+        RandAdjustContrastd(keys=["image"], prob=0.30, gamma=(0.7, 1.5)),
+        RandScaleIntensityd(keys=["image"], prob=0.20, factors=0.10),
+        RandShiftIntensityd(keys=["image"], prob=0.20, offsets=0.05),
+        RandGaussianNoised(keys=["image"], prob=0.15, mean=0.0, std=0.02),
+        RandGaussianSmoothd(
+            keys=["image"],
+            prob=0.15,
+            sigma_x=(0.5, 1.0),
+            sigma_y=(0.5, 1.0),
+            sigma_z=(0.5, 1.0),
+        ),
+        ClipIntensityd(keys=["image"], low=0.0, high=1.0),
+    ])
+    return Compose(steps)
+
 
 def read_json(path: Path):
     if not path.exists():
@@ -71,7 +124,7 @@ def read_cv_best_epochs(cv_dir: Path):
     return rows
 
 
-def install_all_labeled_a3_loader(cases, use_cache: bool):
+def install_all_labeled_a3_loader(cases, use_cache: bool, appearance_augmentation=False):
     ordered = sorted(cases, key=lambda x: str(x["id"]))
 
     def build_final_dataloaders(config):
@@ -85,6 +138,8 @@ def install_all_labeled_a3_loader(cases, use_cache: bool):
             rotate_degrees=0.0,
             scale_fraction=0.0,
         )
+        if appearance_augmentation:
+            train_t = add_mild_ultrasound_appearance_augmentation(train_t)
         val_t = cv.ORIGINAL_GET_TRANSFORMS(
             config, keys=["image", "label"], is_training=False, apply_strong_aug=False
         )
@@ -113,6 +168,11 @@ def main():
     p.add_argument("--output-dir", default=str(OUTPUT))
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--appearance-augmentation",
+        action="store_true",
+        help="Add the locked mild ultrasound contrast/intensity/noise/smoothing bundle",
+    )
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 
@@ -120,6 +180,8 @@ def main():
     audit_path = Path(args.audit_metadata)
     source_manifest = Path(args.source_manifest)
     output_dir = Path(args.output_dir)
+    if args.appearance_augmentation and output_dir.resolve() == OUTPUT.resolve():
+        p.error("--appearance-augmentation requires a separate --output-dir from locked Final91 A3")
 
     audit = read_json(audit_path)
     if not audit.get("all_visible_labels_passed_audit", False) or not audit.get("selection_provenance_enforced", False):
@@ -160,7 +222,8 @@ def main():
     config.checkpoint_dir = str(checkpoint_dir)
     config.cache_dir = str(output_dir / "cache")
     config.log_dir = str(output_dir / "logs")
-    config.experiment_name = f"{config.experiment_name}-final91-a3-all91"
+    variant_name = "a4-appearance" if args.appearance_augmentation else "a3"
+    config.experiment_name = f"{config.experiment_name}-final91-{variant_name}-all91"
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -170,10 +233,14 @@ def main():
     set_determinism(seed=args.seed)
 
     cases = [by_id[x] for x in audited_ids]
-    install_all_labeled_a3_loader(cases, bool(getattr(config, "use_cache_dataset", True)))
+    install_all_labeled_a3_loader(
+        cases,
+        bool(getattr(config, "use_cache_dataset", True)),
+        appearance_augmentation=bool(args.appearance_augmentation),
+    )
 
     print("=" * 112)
-    print("FINAL91 A3 — FULL TRAINING ON ALL 91 HUMAN_GOLD")
+    print(f"FINAL91 {variant_name.upper()} — FULL TRAINING ON ALL 91 HUMAN_GOLD")
     print(f"CV source:             {cv_dir}")
     print(f"Audit:                 {audit_path}")
     print(f"Total HUMAN_GOLD:      {len(audited_ids)}")
@@ -184,6 +251,11 @@ def main():
     print(f"Final training epochs: {final_epochs}")
     print("Recipe:                DynUNet | 128^3 | DiceCE | AdamW 1e-4")
     print("A3 augmentation:       translation +/-4 p=.5 + LR flip p=.5")
+    print(
+        "Appearance augmentation: mild gamma/intensity/noise/smoothing bundle"
+        if args.appearance_augmentation else
+        "Appearance augmentation: OFF"
+    )
     print("Deployment prediction: Student+EMA 50/50 @ .50 | no LCC")
     print("External31:            NOT ACCESSED")
     print("=" * 112)
@@ -198,7 +270,11 @@ def main():
 
     state = torch.load(final_checkpoint, map_location="cpu", weights_only=False)
     metadata = {
-        "version": "final91_a3_all91_training_v1",
+        "version": (
+            "final91_a4_appearance_all91_training_v1"
+            if args.appearance_augmentation else "final91_a3_all91_training_v1"
+        ),
+        "variant": "A4_APPEARANCE" if args.appearance_augmentation else "A3",
         "source_cv_dir": str(cv_dir),
         "source_audit": str(audit_path),
         "source_manifest": str(source_manifest),
@@ -219,6 +295,9 @@ def main():
             "learning_rate": 1e-4, "dropout": 0.0, "lambda_unsup": 0.0,
             "translation_voxels": 4.0, "translation_probability": 0.5,
             "lr_flip": True, "lr_flip_probability": 0.5, "postprocessing": "raw_no_lcc",
+            "appearance_augmentation": (
+                APPEARANCE_AUGMENTATION if args.appearance_augmentation else None
+            ),
         },
         "external31_access": False,
         "warning": "Same-data validation is diagnostic only. Deployment weight is fixed-epoch latest checkpoint.",

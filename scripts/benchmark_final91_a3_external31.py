@@ -134,7 +134,7 @@ def summarize(rows):
     return out
 
 
-def maybe_compare_final62(current_rows, baseline_path: Path, output_dir: Path):
+def maybe_compare_final62(current_rows, baseline_path: Path, output_dir: Path, model_label="FINAL91 A3"):
     if not baseline_path.exists():
         print(f"Final62 baseline case metrics not found; skipping paired historical comparison: {baseline_path}")
         return None
@@ -174,7 +174,7 @@ def maybe_compare_final62(current_rows, baseline_path: Path, output_dir: Path):
     }
     write_csv(output_dir / "final91_vs_final62_external31_case_comparison.csv", paired)
     (output_dir / "final91_vs_final62_external31_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print("\nFINAL62 ENSEMBLE -> FINAL91 ENSEMBLE — EXTERNAL31")
+    print(f"\nFINAL62 ENSEMBLE -> {model_label} ENSEMBLE — EXTERNAL31")
     print(f"Mean Dice: {summary['final62_mean_dice']:.4f} -> {summary['final91_mean_dice']:.4f} ({summary['delta_mean_dice']:+.4f})")
     print(f"Cases: improved={summary['improved']} | worsened={summary['worsened']} | +>=.05={summary['improved_ge_0p05']} | <=-.05={summary['worsened_le_minus_0p05']}")
     return summary
@@ -192,6 +192,7 @@ def main():
     p.add_argument("--output-dir", default=str(OUTPUT))
     p.add_argument("--expected-count", type=int, default=EXPECTED_CASES)
     p.add_argument("--threshold", type=float, default=THRESHOLD)
+    p.add_argument("--model-label", default="FINAL91 A3")
     args = p.parse_args()
 
     if args.expected_count != EXPECTED_CASES:
@@ -255,7 +256,7 @@ def main():
     inferer = SlidingWindowInferer(tuple(config.spatial_size), sw_batch_size=1, overlap=0.25)
 
     print("=" * 120)
-    print("FINAL91 A3 — LOCKED EXTERNAL31 EVALUATION")
+    print(f"{args.model_label} — LOCKED EXTERNAL31 EVALUATION")
     print(f"Cases:              {len(common)}")
     print(f"Training overlap:   {len(overlap)}")
     print(f"Checkpoint:         {checkpoint}")
@@ -300,6 +301,7 @@ def main():
     primary = next(x for x in summary_rows if x["mode"] == "ENSEMBLE")
     metadata = {
         "version": "final91_a3_external31_locked_v1",
+        "model_label": str(args.model_label),
         "checkpoint": str(checkpoint),
         "training_metadata": str(train_meta_path),
         "audit_metadata": str(audit_path),
@@ -314,14 +316,19 @@ def main():
         "primary_summary": primary,
         "warning": "External31 has been used in prior historical evaluations, so it is a frozen comparison benchmark, not a pristine prospective test set.",
     }
-    historical = maybe_compare_final62(rows, Path(args.baseline_final62_case_metrics), output_dir)
+    historical = maybe_compare_final62(
+        rows,
+        Path(args.baseline_final62_case_metrics),
+        output_dir,
+        model_label=str(args.model_label),
+    )
     metadata["historical_final62_comparison_available"] = historical is not None
     if historical is not None:
         metadata["historical_final62_comparison"] = historical
     (output_dir / "external31_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     print("\n" + "=" * 120)
-    print("FINAL91 A3 — EXTERNAL31 PRIMARY ENSEMBLE RESULT")
+    print(f"{args.model_label} — EXTERNAL31 PRIMARY ENSEMBLE RESULT")
     print(f"Mean Dice:          {primary['mean_dice']:.4f}")
     print(f"Median Dice:        {primary['median_dice']:.4f}")
     print(f"Precision:          {primary['mean_precision']:.4f}")
