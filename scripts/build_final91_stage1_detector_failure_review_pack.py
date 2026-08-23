@@ -22,6 +22,7 @@ Output layout
 """
 
 import argparse
+import copy
 import csv
 import json
 import math
@@ -367,8 +368,12 @@ def infer_stage1(
                 prediction_96 = probability_96 >= DETECTOR_THRESHOLD
                 crop_96, lo, hi, components, fallback = detector_crop(probability_96)
 
+                # MONAI Invertd consumes/pops transform history while inverting. Each derived
+                # artifact therefore needs an independent deep copy of the original batch;
+                # otherwise only the first inversion returns to native geometry and subsequent
+                # artifacts silently remain on the 96^3 detector grid.
                 native_probability = invert_probability_exact(
-                    probability_t, batch, inverse_linear, index=0
+                    probability_t, copy.deepcopy(batch), inverse_linear, index=0
                 )
                 reference, probability_zyx = normalize_native_probability(
                     native_probability, cases[case_id]["image"]
@@ -376,12 +381,14 @@ def infer_stage1(
                 prediction_t = torch.from_numpy(prediction_96[None, None].astype(np.float32))
                 crop_t = torch.from_numpy(crop_96[None, None].astype(np.float32))
                 native_prediction = invert_probability_exact(
-                    prediction_t, batch, inverse_nearest, index=0
+                    prediction_t, copy.deepcopy(batch), inverse_nearest, index=0
                 )
                 _, prediction_zyx = normalize_native_probability(
                     native_prediction, cases[case_id]["image"]
                 )
-                native_crop = invert_probability_exact(crop_t, batch, inverse_nearest, index=0)
+                native_crop = invert_probability_exact(
+                    crop_t, copy.deepcopy(batch), inverse_nearest, index=0
+                )
                 _, crop_zyx = normalize_native_probability(native_crop, cases[case_id]["image"])
                 outputs[case_id] = {
                     "checkpoint": str(checkpoint_path),
