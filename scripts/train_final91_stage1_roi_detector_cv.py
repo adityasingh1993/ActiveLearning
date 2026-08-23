@@ -90,10 +90,14 @@ def parse_fold(value):
     value = str(value).strip().lower()
     if value == "all":
         return list(range(5))
-    fold = int(value)
-    if fold not in range(5):
-        raise ValueError("--fold must be all or 0..4")
-    return [fold]
+    pieces = value.replace("+", ",").split(",")
+    try:
+        folds = sorted({int(x.strip()) for x in pieces if x.strip()})
+    except ValueError as exc:
+        raise ValueError("--fold must be all, 0..4, or a comma-separated subset") from exc
+    if not folds or any(fold not in range(5) for fold in folds):
+        raise ValueError("--fold must be all, 0..4, or a comma-separated subset")
+    return folds
 
 
 def median(values):
@@ -321,6 +325,8 @@ def run(args):
             kept_labels = ranked[:1]
         elif policy == "top2":
             kept_labels = ranked[:2]
+        elif policy == "all":
+            kept_labels = np.arange(1, count + 1)
         elif policy == "substantial":
             minimum = max(
                 args.min_component_voxels,
@@ -394,9 +400,9 @@ def run(args):
     @torch.no_grad()
     def sweep_crop_postprocessing(model, loader, device, fold):
         """Reuse one checkpoint to test compact crop rules without retraining or selection on External31."""
-        thresholds = (0.30, 0.40, 0.50, 0.60, 0.70, 0.80)
-        margins = (0.10, 0.20, 0.30, 0.40)
-        policies = ("substantial", "top2", "largest")
+        thresholds = (0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80)
+        margins = (0.10, 0.20, 0.30, 0.40, 0.60)
+        policies = ("all", "substantial", "top2", "largest")
         model.eval()
         rows = []
         for batch in loader:
@@ -665,6 +671,13 @@ def run(args):
                 "mean_gt_crop_coverage": float(np.mean(coverage)),
                 "minimum_gt_crop_coverage": float(np.min(coverage)),
                 "crop_misses_below_0p99": misses,
+                "crop_miss_case_ids": ";".join(
+                    sorted(
+                        str(x["case_id"])
+                        for x in rows
+                        if float(x["gt_crop_coverage"]) < 0.99
+                    )
+                ),
                 "median_crop_fraction": median(crop_fraction),
                 "mean_crop_fraction": float(np.mean(crop_fraction)),
                 "full_volume_fallbacks": fallbacks,
@@ -685,7 +698,7 @@ def run(args):
             "best_setting": sweep_summary[0],
             "passing_settings": [x for x in sweep_summary if x["fold_gate_candidate"]],
             "interpretation": (
-                "A passing Fold-2 setting justifies completing Stage-1 OOF CV; "
+                "A setting passing the selected frozen folds justifies completing Stage-1 OOF CV; "
                 "it does not authorize Stage 2 until all five folds pass."
             ),
         })
@@ -698,7 +711,8 @@ def run(args):
                 f"coverage mean/min={row['mean_gt_crop_coverage']:.4f}/{row['minimum_gt_crop_coverage']:.4f} | "
                 f"misses={row['crop_misses_below_0p99']} | "
                 f"median crop={row['median_crop_fraction']:.4f} | "
-                f"candidate={row['fold_gate_candidate']}"
+                f"candidate={row['fold_gate_candidate']} | "
+                f"missed={row['crop_miss_case_ids'] or 'none'}"
             )
         print(f"Summary: {sweep_summary_path}")
         print("=" * 112)
@@ -721,6 +735,9 @@ def run(args):
             "minimum_gt_crop_coverage": float(np.min([float(x["gt_crop_coverage"]) for x in rows])),
             "median_crop_fraction": median(float(x["crop_fraction"]) for x in rows),
             "crop_misses_below_0p99": sum(float(x["gt_crop_coverage"]) < 0.99 for x in rows),
+            "crop_miss_case_ids": ";".join(
+                sorted(str(x["case_id"]) for x in rows if float(x["gt_crop_coverage"]) < 0.99)
+            ),
             "full_volume_fallbacks": sum(int(float(x["full_volume_fallback"])) for x in rows),
         })
     write_csv(output_dir / "detector_fold_summary.csv", fold_summaries)
@@ -731,6 +748,9 @@ def run(args):
     coverage_values = [float(x["gt_crop_coverage"]) for x in combined]
     crop_values = [float(x["crop_fraction"]) for x in combined]
     misses = sum(x < 0.99 for x in coverage_values)
+    miss_case_ids = sorted(
+        str(x["case_id"]) for x in combined if float(x["gt_crop_coverage"]) < 0.99
+    )
     fallbacks = sum(int(float(x["full_volume_fallback"])) for x in combined)
     summary = {
         "version": "final91_stage1_roi_detector_gate_v1",
@@ -743,6 +763,7 @@ def run(args):
         "median_crop_fraction": median(crop_values),
         "mean_crop_fraction": float(np.mean(crop_values)),
         "crop_misses_below_0p99": misses,
+        "crop_miss_case_ids": miss_case_ids,
         "full_volume_fallbacks": fallbacks,
         "mean_center_error_normalized": float(np.mean([float(x["center_error_normalized"]) for x in combined])),
         "criteria": detector_recipe(args)["gate"],
@@ -766,6 +787,7 @@ def run(args):
     print(f"Mean detector box Dice:    {summary['mean_detector_box_dice']:.4f}")
     print(f"Mean/min GT coverage:      {summary['mean_gt_crop_coverage']:.4f} / {summary['minimum_gt_crop_coverage']:.4f}")
     print(f"Crop misses (<0.99):       {summary['crop_misses_below_0p99']}")
+    print(f"Missed case IDs:           {', '.join(summary['crop_miss_case_ids']) or 'none'}")
     print(f"Median/mean crop fraction: {summary['median_crop_fraction']:.4f} / {summary['mean_crop_fraction']:.4f}")
     print(f"Full-volume fallbacks:     {summary['full_volume_fallbacks']}")
     print(f"GATE PASS:                 {summary['gate_pass']}")
@@ -783,7 +805,7 @@ def build_parser():
     parser.add_argument("--audit-metadata", default=str(AUDIT))
     parser.add_argument("--source-cv-dir", default=str(SOURCE_CV))
     parser.add_argument("--output-dir", default=str(OUTPUT))
-    parser.add_argument("--fold", default="all", help="all or 0..4")
+    parser.add_argument("--fold", default="all", help="all, one fold 0..4, or comma-separated folds such as 1,2")
     parser.add_argument("--gpu", default="0", help="CUDA_VISIBLE_DEVICES value; default 0")
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--resize-size", type=int, default=96)

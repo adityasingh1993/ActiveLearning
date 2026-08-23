@@ -24,7 +24,11 @@ DEFAULT_OUTPUT = "experiments/final91_stage1_roi_detector_e500_cv"
 def main():
     parser = argparse.ArgumentParser(description="Final91 Stage-1 ROI detector — 500 epochs")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--fold", default="2", help="all or 0..4; default 2")
+    parser.add_argument(
+        "--fold",
+        default="2",
+        help="all, one fold 0..4, or comma-separated folds such as 1,2; default 2",
+    )
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     parser.add_argument("--audit-metadata", default=None)
