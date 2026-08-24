@@ -170,11 +170,32 @@ def resolve_validation_cases(pool_rows, gt_by_id, expected_count):
 def invert_probability_exact(prob_tensor, batch_data, inverse_transform, index=0):
     """Invert a probability map without thresholding, using the original transform trace."""
     try:
+        import copy
+
         samples = decollate_batch(batch_data)
         if index >= len(samples):
             raise IndexError(f"decollated batch has {len(samples)} samples, requested {index}")
         sample = samples[index]
-        sample["pred"] = prob_tensor[index].detach().cpu()
+        prediction = prob_tensor[index].detach().cpu()
+        reference = sample.get("image")
+        # Network arithmetic, crop/paste, torch.zeros, and torch.from_numpy can all turn a
+        # MetaTensor into a plain Tensor. MONAI >=1.5 then has no Resize/Spacing/Orientation
+        # history to replay and silently returns the 128^3 model grid. The prediction lives on
+        # the processed image grid, so explicitly give it a deep copy of that image's exact
+        # metadata and applied-operations trace before calling Invertd.
+        if reference is not None and hasattr(reference, "applied_operations"):
+            from monai.data import MetaTensor
+
+            operations = copy.deepcopy(reference.applied_operations)
+            if not operations:
+                raise RuntimeError("Processed image has no MONAI applied_operations trace")
+            values = prediction.as_tensor() if hasattr(prediction, "as_tensor") else prediction
+            prediction = MetaTensor(
+                values.clone(),
+                meta=copy.deepcopy(reference.meta),
+                applied_operations=operations,
+            )
+        sample["pred"] = prediction
         inv_out = inverse_transform(sample)
         inv_prob = inv_out["pred"]
         if inv_prob.ndim == 4:
