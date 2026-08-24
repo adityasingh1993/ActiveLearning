@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Train a single-object 3D CenterNet bladder localizer on Final91.
+"""Train a single-object 3D CenterNet bladder localizer from Final91-QC.
 
 The detector preserves spatial supervision instead of globally regressing six values. It predicts
 one center heatmap, a sub-voxel center offset, and one normalized 3D box size. The highest heatmap
 peak produces exactly one bladder ROI; no connected-component or NMS policy is involved.
 
-Evaluation uses the exact frozen original47 OOF folds. The 44 post-original HUMAN_GOLD cases are
-train-only, External31 is never accessed, and Stage 2 remains blocked until the complete OOF safety
-gate passes.
+The live 91-label dataset is preserved. Case 9435... is explicitly quarantined because the bladder
+and its ground truth could not be confidently verified. It is neither trained nor scored. Evaluation
+therefore uses the remaining 46 scorable cases from the exact frozen original47 folds, while the 44
+post-original HUMAN_GOLD cases remain train-only. External31 is never accessed, and Stage 2 remains
+blocked until the complete QC-clean OOF safety gate passes.
 """
 
 import argparse
@@ -26,10 +28,15 @@ if str(REPO_ROOT) not in sys.path:
 
 SOURCE_CV = Path("experiments/cv5_supervised_47_translation12")
 AUDIT = Path("experiments/round5_supervised_91_a3/final91_live_label_audit.json")
-OUTPUT = Path("experiments/final91_stage1_centernet3d_cv")
+OUTPUT = Path("experiments/final91_qc_stage1_centernet3d_cv")
 EXPECTED_SOURCE = 47
 EXPECTED_TOTAL = 91
 EXPECTED_EXTRA = 44
+EXPECTED_SCORABLE_SOURCE = 46
+EXPECTED_SCORABLE_TOTAL = 90
+QUARANTINED_CASE_IDS = (
+    "9435b1b67a41b88f6084a3e750fc54d913213ea55f33d165a1f42b9b50dd237c",
+)
 
 
 def read_json(path):
@@ -94,7 +101,7 @@ def median(values):
 
 def recipe(args):
     return {
-        "version": "final91_stage1_centernet3d_cv_v1",
+        "version": "final91_qc_stage1_centernet3d_cv_v2",
         "task": "single_object_3d_bladder_detection",
         "architecture": "centernet3d_fpn",
         "input_channels": ["ultrasound", "z_coordinate", "y_coordinate", "x_coordinate"],
@@ -135,7 +142,14 @@ def recipe(args):
             "minimum_mean_bbox_iou": 0.20,
             "maximum_median_crop_fraction": 0.60,
         },
-        "heldout_evaluation": "exact_frozen_original47",
+        "dataset_qc": {
+            "live_human_gold_cases": EXPECTED_TOTAL,
+            "quarantined_case_ids": list(QUARANTINED_CASE_IDS),
+            "trainable_cases": EXPECTED_SCORABLE_TOTAL,
+            "scorable_frozen_source_cases": EXPECTED_SCORABLE_SOURCE,
+            "quarantine_reason": "bladder_and_ground_truth_not_confidently_verifiable",
+        },
+        "heldout_evaluation": "frozen_original47_minus_documented_qc_quarantine",
         "external31_access": False,
     }
 
@@ -143,7 +157,7 @@ def recipe(args):
 def dry_run(args):
     output_size = args.resize_size // 4
     print("=" * 116)
-    print("FINAL91 STAGE-1 3D CENTERNET BLADDER LOCALIZER — DRY RUN")
+    print("FINAL91-QC STAGE-1 3D CENTERNET BLADDER LOCALIZER — DRY RUN")
     print(f"Folds:                    {parse_fold(args.fold)}")
     print(f"Input:                    full padded image at {args.resize_size}^3")
     print(f"Heatmap:                  1 x {output_size}^3 (stride 4)")
@@ -152,7 +166,10 @@ def dry_run(args):
     print(f"Epochs:                   {args.epochs}")
     print(f"Validate every:           {args.validation_every_n_epochs} epochs")
     print(f"Safety margin per side:   {args.safety_margin:.0%}")
-    print("Held out:                 exact frozen original47")
+    print("Live HUMAN_GOLD:          91 (files unchanged)")
+    print("QC-trainable cases:       90")
+    print("Held out:                 frozen original47 minus 1 QC quarantine = 46")
+    print(f"Quarantined:              {QUARANTINED_CASE_IDS[0]}")
     print("Newer 44 HUMAN_GOLD:      train-only")
     print("External31:               NOT ACCESSED")
     print("Stage 2:                  BLOCKED until complete OOF gate passes")
@@ -522,21 +539,37 @@ def run(args):
         current_ids = sorted(str(x) for x in by_id)
         if current_ids != audited_ids or sorted(str(x) for x in discovered_source) != source_ids:
             raise RuntimeError("Live labels or frozen source changed after Final91 audit")
+        quarantine_ids = sorted(set(QUARANTINED_CASE_IDS))
+        if len(quarantine_ids) != EXPECTED_SOURCE - EXPECTED_SCORABLE_SOURCE:
+            raise RuntimeError("Unexpected number of configured QC quarantines")
+        if set(quarantine_ids) - set(source_ids) or set(quarantine_ids) - set(current_ids):
+            raise RuntimeError("A configured QC quarantine is absent from the frozen source or live labels")
         extra_ids = sorted(set(current_ids) - set(source_ids))
         if len(extra_ids) != EXPECTED_EXTRA:
             raise RuntimeError("Expected exactly 44 train-only Final91 extras")
+        scorable_source_ids = sorted(set(source_ids) - set(quarantine_ids))
+        scorable_current_ids = sorted(set(current_ids) - set(quarantine_ids))
+        if len(scorable_source_ids) != EXPECTED_SCORABLE_SOURCE:
+            raise RuntimeError("QC-clean frozen source must contain exactly 46 scorable cases")
+        if len(scorable_current_ids) != EXPECTED_SCORABLE_TOTAL:
+            raise RuntimeError("QC-clean training population must contain exactly 90 cases")
         specs, held_out = [], []
         for original in manifest.get("folds", []):
             fold = int(original["fold"])
-            val_ids = sorted(str(x) for x in original["val_ids"])
-            train_ids = sorted(set(str(x) for x in original["train_ids"]) | set(extra_ids))
+            val_ids = sorted(set(str(x) for x in original["val_ids"]) - set(quarantine_ids))
+            train_ids = sorted(
+                (set(str(x) for x in original["train_ids"]) | set(extra_ids))
+                - set(quarantine_ids)
+            )
             if set(train_ids) & set(val_ids) or set(extra_ids) & set(val_ids):
                 raise RuntimeError(f"Fold {fold}: leakage detected")
+            if set(quarantine_ids) & (set(train_ids) | set(val_ids)):
+                raise RuntimeError(f"Fold {fold}: quarantined case entered training or validation")
             specs.append({"fold": fold, "train_ids": train_ids, "val_ids": val_ids})
             held_out.extend(val_ids)
-        if sorted(held_out) != source_ids or len(specs) != 5:
-            raise RuntimeError("Frozen folds do not cover original47 exactly once")
-        return config, by_id, extra_ids, specs, source_path
+        if sorted(held_out) != scorable_source_ids or len(specs) != 5:
+            raise RuntimeError("QC-clean folds do not cover the 46 scorable source cases exactly once")
+        return config, by_id, extra_ids, quarantine_ids, specs, source_path
 
     def train_fold(config, by_id, spec, output_dir, device):
         fold = int(spec["fold"])
@@ -653,13 +686,17 @@ def run(args):
         torch.cuda.empty_cache()
         return rows
 
-    config, by_id, extra_ids, specs, source_path = preflight()
+    config, by_id, extra_ids, quarantine_ids, specs, source_path = preflight()
     selected_folds = parse_fold(args.fold)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     plan = {
         **recipe(args), "config": args.config, "audit_metadata": args.audit_metadata,
-        "source_manifest": str(source_path), "n_total_human_gold": EXPECTED_TOTAL,
+        "source_manifest": str(source_path), "n_live_human_gold": EXPECTED_TOTAL,
+        "n_qc_trainable": EXPECTED_SCORABLE_TOTAL,
+        "n_frozen_source": EXPECTED_SOURCE,
+        "n_scorable_frozen_source": EXPECTED_SCORABLE_SOURCE,
+        "quarantined_case_ids": quarantine_ids,
         "n_train_only_extra": len(extra_ids), "train_only_extra_ids": extra_ids,
         "folds": specs,
     }
@@ -672,12 +709,17 @@ def run(args):
     if device.type != "cuda":
         raise RuntimeError("3D CenterNet training requires CUDA")
     print("=" * 116)
-    print("FINAL91 STAGE-1 3D CENTERNET BLADDER LOCALIZER")
+    print("FINAL91-QC STAGE-1 3D CENTERNET BLADDER LOCALIZER")
     print(
         f"Folds: {selected_folds} | input={args.resize_size}^3 | "
         f"heatmap={args.resize_size // 4}^3 | epochs={args.epochs} | "
         f"margin={args.safety_margin:.0%}"
     )
+    print(
+        f"Data: {EXPECTED_TOTAL} live labels | {EXPECTED_SCORABLE_TOTAL} trainable | "
+        f"{EXPECTED_SCORABLE_SOURCE} scorable held-out | {len(quarantine_ids)} quarantined"
+    )
+    print(f"Quarantined case: {quarantine_ids[0]}")
     print("Output: one center heatmap + one offset + one 3D size | External31: NOT ACCESSED")
     print("=" * 116)
     spec_map = {int(x["fold"]): x for x in specs}
@@ -698,9 +740,10 @@ def run(args):
     write_csv(output_dir / "centernet3d_fold_summary.csv", fold_rows)
     overall = summarize(combined)
     complete = (
-        len(combined) == EXPECTED_SOURCE
-        and len({str(x["case_id"]) for x in combined}) == EXPECTED_SOURCE
+        len(combined) == EXPECTED_SCORABLE_SOURCE
+        and len({str(x["case_id"]) for x in combined}) == EXPECTED_SCORABLE_SOURCE
         and {int(x["fold"]) for x in combined} == set(range(5))
+        and not ({str(x["case_id"]) for x in combined} & set(quarantine_ids))
     )
     gate = recipe(args)["gate"]
     passed = bool(
@@ -711,17 +754,24 @@ def run(args):
         and overall["median_crop_fraction"] <= gate["maximum_median_crop_fraction"]
     )
     summary = {
-        "version": "final91_stage1_centernet3d_gate_v1",
-        "complete_original47_oof": complete,
+        "version": "final91_qc_stage1_centernet3d_gate_v2",
+        "complete_original46_qc_oof": complete,
+        "n_live_human_gold": EXPECTED_TOTAL,
+        "n_qc_trainable": EXPECTED_SCORABLE_TOTAL,
+        "n_original_source": EXPECTED_SOURCE,
+        "n_scorable_source": EXPECTED_SCORABLE_SOURCE,
+        "quarantined_case_ids": quarantine_ids,
+        "quarantine_reason": "bladder_and_ground_truth_not_confidently_verifiable",
         "completed_folds": sorted({int(x["fold"]) for x in combined}),
         **overall, "criteria": gate, "gate_pass": passed,
         "stage2_authorized": passed, "external31_access": False,
     }
     write_json(output_dir / "centernet3d_gate_summary.json", summary)
     print("\n" + "=" * 116)
-    print("3D CENTERNET LOCALIZER GATE")
+    print("3D CENTERNET LOCALIZER GATE — QC-CLEAN")
     print(f"OOF complete:              {complete}")
     print(f"Cases / folds:             {len(combined)} / {summary['completed_folds']}")
+    print(f"QC quarantined:            {len(quarantine_ids)} / {quarantine_ids[0]}")
     print(f"Mean box IoU:              {overall['mean_bbox_iou']:.4f}")
     print(
         f"Mean/min GT coverage:      {overall['mean_gt_crop_coverage']:.4f} / "
