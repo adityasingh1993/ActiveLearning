@@ -298,7 +298,12 @@ def run(args):
                 student_probability = torch.sigmoid(main_prediction(student(crop)))
                 teacher_probability = torch.sigmoid(main_prediction(teacher(crop)))
                 probability = 0.5 * (student_probability + teacher_probability)
-            full_probability = paste_probability(probability, bounds)
+            model_grid_probability = paste_probability(probability, bounds)
+            # Preserve the exact MONAI MetaTensor history carried by the processed image.
+            # A newly allocated torch.zeros tensor has no inverse Resize/Orientation trace.
+            full_probability = image.clone()
+            full_probability.zero_()
+            full_probability.copy_(model_grid_probability.to(dtype=full_probability.dtype))
             native_probability = invert_probability_exact(
                 full_probability, batch, inverse_transform, index=0
             )
@@ -375,12 +380,16 @@ def run(args):
         "all90_two_stage_vs_five_crop_committee",
     )
     metadata = {
-        "version": "final91_qc_two_stage_all90_external31_v1",
+        "version": "final91_qc_two_stage_all90_external31_v2",
         "n_external": EXPECTED_EXTERNAL,
         "pipeline": "single final all90 CenterNet -> single final all90 Stage-2 Student+EMA",
         "threshold": THRESHOLD, "stage1_safety_margin_per_side": SAFETY_MARGIN,
         "primary_postprocessing": "raw_no_lcc",
         "diagnostic_postprocessing": "largest_26_connected_component",
+        "native_inversion": (
+            "full-grid probability carried by a clone of the processed image MetaTensor; "
+            "prediction receives a deep copy of the exact image applied_operations trace"
+        ),
         "external_gt_usage": "evaluation_only",
         "raw_summary": raw_summary, "lcc_summary": lcc_summary,
         "raw_vs_lcc": lcc_comparison,
