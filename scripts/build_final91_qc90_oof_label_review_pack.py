@@ -8,12 +8,14 @@ Low OOF agreement is a review signal, not proof that the HUMAN_GOLD annotation i
 
 import argparse
 import csv
+import hashlib
 import json
 import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
+import nrrd
 import torch
 from monai.data import DataLoader, Dataset
 from scipy import ndimage
@@ -69,13 +71,47 @@ def read_csv(path):
         return list(csv.DictReader(handle))
 
 
-def prediction_metadata(gt_metadata, name, segment_id, color):
+def derived_segment_metadata(gt_metadata, name, segment_id, color):
     result = dict(gt_metadata)
     result.update({"segment_name": name, "segment_id": segment_id, "color": color})
     return result
 
 
-def write_segmentation(destination, mask, image_path, metadata):
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def app_metadata(case_id, fold, content, postprocessing, source_sha256=""):
+    result = {
+        "HASSL_Content": content,
+        "HASSL_CaseID": str(case_id),
+        "HASSL_FrozenOOFFold": str(int(fold)),
+        "HASSL_PredictionRole": "heldout_label_qc_only",
+        "HASSL_Threshold": "0.50",
+        "HASSL_Postprocessing": postprocessing,
+        "HASSL_External31Access": "false",
+    }
+    if source_sha256:
+        result["HASSL_SourceSegmentationSHA256"] = str(source_sha256)
+    return result
+
+
+def verify_app_metadata(destination, expected):
+    header = nrrd.read_header(str(destination))
+    mismatches = {
+        key: {"expected": str(value), "actual": header.get(key)}
+        for key, value in expected.items()
+        if str(header.get(key)) != str(value)
+    }
+    if mismatches:
+        raise RuntimeError(f"Application metadata mismatch for {destination}: {mismatches}")
+
+
+def write_segmentation(destination, mask, image_path, metadata, extra_metadata):
     write_mask_with_spatial_geometry(
         str(destination),
         np.asarray(mask, dtype=np.uint8) * int(metadata["label_value"]),
@@ -86,8 +122,10 @@ def write_segmentation(destination, mask, image_path, metadata):
         segment_color=metadata["color"],
         segment_layer=metadata["layer"],
         segment_tags=metadata["tags"],
+        extra_metadata=extra_metadata,
     )
     verify_saved_segment_metadata(destination, metadata)
+    verify_app_metadata(destination, extra_metadata)
 
 
 def label_features(gt, reference):
@@ -250,31 +288,47 @@ def main():
 
         case_dir = output_dir / case_id
         copy_exact(Path(by_id[case_id]["image"]), case_dir / "image.mha")
-        copy_exact(
-            Path(by_id[case_id]["label"]),
-            case_dir / "ground_truth" / "ground_truth.seg.nrrd",
-        )
-        gt_metadata = read_ground_truth_segment_metadata(Path(by_id[case_id]["label"]))
-        raw_metadata = prediction_metadata(
-            gt_metadata, "QC90 OOF Two-Stage RAW", "QC90OOFRaw", "0.20 0.90 0.25"
-        )
-        lcc_metadata = prediction_metadata(
-            gt_metadata, "QC90 OOF Two-Stage LCC", "QC90OOFLCC", "0.10 0.55 1.00"
-        )
-        roi_metadata = prediction_metadata(
+        source_gt = Path(by_id[case_id]["label"])
+        source_gt_sha256 = file_sha256(source_gt)
+        row_fold = int(float(stage2_by_id[case_id]["fold"]))
+        gt_metadata = read_ground_truth_segment_metadata(source_gt)
+        # Match the proven application-compatible prediction schema: RAW and LCC preserve the
+        # exact Segment0 ID, Name, LabelValue, Layer, Color and Tags from HUMAN_GOLD.
+        raw_metadata = dict(gt_metadata)
+        lcc_metadata = dict(gt_metadata)
+        roi_metadata = derived_segment_metadata(
             gt_metadata, "QC90 OOF CenterNet ROI", "QC90OOFROI", "1.00 0.55 0.05"
+        )
+        write_segmentation(
+            case_dir / "ground_truth" / "ground_truth.seg.nrrd",
+            gt, by_id[case_id]["image"], gt_metadata,
+            app_metadata(
+                case_id, row_fold,
+                "Final91 QC90 HUMAN_GOLD reference", "human_gold_reference",
+                source_gt_sha256,
+            ),
         )
         write_segmentation(
             case_dir / "oof_two_stage_raw_pred" / "oof_two_stage_raw_pred.seg.nrrd",
             raw, by_id[case_id]["image"], raw_metadata,
+            app_metadata(
+                case_id, row_fold, "Final91 QC90 OOF two-stage RAW prediction", "raw"
+            ),
         )
         write_segmentation(
             case_dir / "oof_two_stage_lcc_pred" / "oof_two_stage_lcc_pred.seg.nrrd",
             lcc, by_id[case_id]["image"], lcc_metadata,
+            app_metadata(
+                case_id, row_fold, "Final91 QC90 OOF two-stage LCC prediction",
+                "largest_connected_component",
+            ),
         )
         write_segmentation(
             case_dir / "oof_centernet_roi" / "oof_centernet_roi.seg.nrrd",
             roi, by_id[case_id]["image"], roi_metadata,
+            app_metadata(
+                case_id, row_fold, "Final91 QC90 OOF CenterNet ROI", "centernet_roi"
+            ),
         )
 
         row = dict(stage2_by_id[case_id])
@@ -290,6 +344,13 @@ def main():
             "stage1_predicted_crop_fraction": float(stage1["crop_fraction"]),
             "stage1_center_confidence": float(stage1["center_confidence"]),
             "stage1_center_peak_margin": float(stage1["center_peak_margin"]),
+            "source_ground_truth_sha256": source_gt_sha256,
+            "embedded_segment_id": gt_metadata["segment_id"],
+            "embedded_segment_name": gt_metadata["segment_name"],
+            "embedded_label_value": gt_metadata["label_value"],
+            "embedded_layer": gt_metadata["layer"],
+            "embedded_color": gt_metadata["color"],
+            "embedded_tags": gt_metadata["tags"],
             **label_features(gt, reference),
             "diagnostic_hint_not_ground_truth": "",
             "review_notes": "",
@@ -305,7 +366,7 @@ def main():
 
     write_csv(output_dir / "label_qc90_oof_review_manifest.csv", manifest)
     summary = {
-        "version": "final91_label_qc90_oof_review_pack_v1",
+        "version": "final91_label_qc90_oof_review_pack_v2",
         "role": "heldout annotation diagnosis only; low OOF Dice is not proof of label error",
         "n_qc_clean_oof": EXPECTED_QC90,
         "quarantined_not_scored": QUARANTINED_CASE_ID,
@@ -314,6 +375,22 @@ def main():
         "n_below_threshold": len(threshold_ids),
         "n_selected_union": len(selected_ids),
         "selected_case_ids_in_review_order": [row["case_id"] for row in manifest],
+        "seg_nrrd_metadata": {
+            "ground_truth_raw_lcc": (
+                "preserve exact Segment0 ID, Name, LabelValue, Layer, Color and Tags from "
+                "source HUMAN_GOLD"
+            ),
+            "roi": "derived ROI ID/Name/Color while preserving HUMAN_GOLD Tags",
+            "required_slicer_fields": [
+                "Segmentation_ContainedRepresentationNames",
+                "Segmentation_MasterRepresentation",
+                "Segmentation_ReferenceImageExtentOffset",
+                "Segment0_ID", "Segment0_Name", "Segment0_LabelValue", "Segment0_Layer",
+                "Segment0_Color", "Segment0_Extent", "Segment0_Tags",
+            ],
+            "application_provenance_prefix": "HASSL_",
+            "verified_after_write": True,
+        },
         "external31_access": False,
     }
     (output_dir / "label_qc90_oof_review_summary.json").write_text(
@@ -324,6 +401,8 @@ def main():
         "Every prediction was produced by models that did not train on that case.\n"
         "Low OOF Dice is a review signal, not proof that HUMAN_GOLD is wrong.\n"
         "Inspect the image and ground truth independently before viewing predictions.\n"
+        "All .seg.nrrd files contain verified Slicer segment tags, full native extent and HASSL provenance.\n"
+        "Ground truth, RAW and LCC preserve the same application-compatible Segment0 identity.\n"
         "A QC full-grid fallback means CenterNet missed/truncated GT; it is recorded in metrics.\n"
         f"The uncertain case {QUARANTINED_CASE_ID} remains quarantined and is not OOF-scored here.\n",
         encoding="utf-8",

@@ -109,6 +109,7 @@ def write_mask_with_spatial_geometry(
     segment_color: str = "0.0 1.0 0.0",
     segment_layer: int = 0,
     segment_tags: str = "|",
+    extra_metadata: Optional[Dict[str, Any]] = None,
 ):
     """Write a native-grid Slicer-compatible .seg.nrrd with spatial and segment metadata.
 
@@ -167,6 +168,13 @@ def write_mask_with_spatial_geometry(
                 segment_layer=segment_layer,
                 segment_tags=segment_tags,
             )
+            for key, value in (extra_metadata or {}).items():
+                key = str(key)
+                if key.startswith("Segment0_") or key.startswith("Segmentation_"):
+                    raise ValueError(
+                        f"extra_metadata cannot override reserved Slicer key {key!r}"
+                    )
+                mask_img.SetMetaData(key, str(value))
 
             writer = sitk.ImageFileWriter()
             writer.SetFileName(output_path)
@@ -200,4 +208,9 @@ def write_mask_with_spatial_geometry(
             segment_tags=segment_tags,
         )
     )
+    for key, value in (extra_metadata or {}).items():
+        key = str(key)
+        if key.startswith("Segment0_") or key.startswith("Segmentation_"):
+            raise ValueError(f"extra_metadata cannot override reserved Slicer key {key!r}")
+        header[key] = str(value)
     nrrd.write(output_path, clean_arr, header=header)
