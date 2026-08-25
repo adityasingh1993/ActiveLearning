@@ -31,8 +31,10 @@ if str(REPO_ROOT) not in sys.path:
 SOURCE_CV = Path("experiments/cv5_supervised_47_translation12")
 AUDIT = Path("experiments/round5_supervised_91_a3/final91_live_label_audit.json")
 STAGE1_DIR = Path("experiments/final91_qc_stage1_centernet3d_cv")
+QC90_STAGE1_DIR = Path("experiments/final91_label_qc90_centernet3d_oof")
 FULL_VOLUME_BASELINE = Path("experiments/round5_cv_91_a3/cv_results.csv")
 OUTPUT = Path("experiments/final91_qc_stage2_centernet_dynunet_cv")
+QC90_OUTPUT = Path("experiments/final91_label_qc90_two_stage_oof")
 
 EXPECTED_LIVE = 91
 EXPECTED_SOURCE = 47
@@ -42,6 +44,20 @@ EXPECTED_SCORABLE = 46
 QUARANTINED_CASE_IDS = (
     "9435b1b67a41b88f6084a3e750fc54d913213ea55f33d165a1f42b9b50dd237c",
 )
+
+
+def qc90_mode(args):
+    return str(getattr(args, "split_scope", "original46")) == "qc90"
+
+
+def resolved_stage1_dir(args):
+    value = Path(args.stage1_dir)
+    return QC90_STAGE1_DIR if qc90_mode(args) and value == STAGE1_DIR else value
+
+
+def resolved_output_dir(args):
+    value = Path(args.output_dir)
+    return QC90_OUTPUT if qc90_mode(args) and value == OUTPUT else value
 
 
 def read_json(path):
@@ -119,7 +135,7 @@ def median(values):
 
 
 def recipe(args):
-    return {
+    result = {
         "version": "final91_qc_stage2_centernet_dynunet_cv_v1",
         "architecture": "DynUNet",
         "input": "CenterNet-localized crop resized to 128^3",
@@ -156,16 +172,39 @@ def recipe(args):
         "quarantined_case_ids": list(QUARANTINED_CASE_IDS),
         "external31_access": False,
     }
+    if qc90_mode(args):
+        result.update({
+            "version": "final91_label_qc90_stage2_dynunet_oof_v1",
+            "label_qc_only": True,
+            "heldout_evaluation": "all_90_qc_clean_cases_exactly_once",
+            "validation_crop": {
+                "source": "matching-fold OOF CenterNet coordinates",
+                "stage1_margin_per_side": 0.50,
+                "stage1_complete_qc90_oof_required": True,
+                "gt_aware_diagnostic_fallback": (
+                    "full 128^3 grid only when OOF detector crop covers <99% of GT; "
+                    "fallback is recorded per case and is not a deployable inference rule"
+                ),
+            },
+        })
+    return result
 
 
 def dry_run(args):
     print("=" * 120)
-    print("FINAL91-QC STAGE-2 CENTERNET -> DYNUNET — DRY RUN")
+    print(
+        "FINAL91 LABEL-QC90 STAGE-2 OOF — DRY RUN"
+        if qc90_mode(args) else "FINAL91-QC STAGE-2 CENTERNET -> DYNUNET — DRY RUN"
+    )
     print(f"Folds:                    {parse_fold(args.fold)}")
     print("Live / QC trainable:      91 / 90")
-    print("OOF scorable:             46")
+    print(f"OOF scorable:             {90 if qc90_mode(args) else 46}")
+    if qc90_mode(args):
+        print("Per fold:                 train=72 / validation=18")
+        print("Crop miss policy:         record detector miss + use full grid for QC segmentation")
+        print("Role:                     annotation diagnosis; not final model validation")
     print(f"Quarantined:              {QUARANTINED_CASE_IDS[0]}")
-    print(f"Frozen Stage-1:           {args.stage1_dir}")
+    print(f"Frozen Stage-1:           {resolved_stage1_dir(args)}")
     print(
         f"Training crop:            GT box + random {args.train_margin_min:.0%}-"
         f"{args.train_margin_max:.0%} margin + safe {args.train_center_jitter:.0%} center jitter"
@@ -418,7 +457,7 @@ def run(args):
         return full
 
     @torch.no_grad()
-    def evaluate(student, teacher, loader, device, fold, crop_rows):
+    def evaluate(student, teacher, loader, device, fold, crop_rows, prediction_dir=None):
         student.eval()
         teacher.eval()
         rows = []
@@ -449,6 +488,8 @@ def run(args):
                 "stage1_gt_crop_coverage": float(stage1["gt_crop_coverage"]),
                 "stage1_crop_fraction": float(stage1["crop_fraction"]),
                 "stage1_center_confidence": float(stage1["center_confidence"]),
+                "stage1_center_peak_margin": float(stage1.get("center_peak_margin", 0.0)),
+                "qc_full_grid_fallback": int(stage1.get("qc_full_grid_fallback", 0)),
                 "crop_z0": bounds[0], "crop_z1": bounds[1],
                 "crop_y0": bounds[2], "crop_y1": bounds[3],
                 "crop_x0": bounds[4], "crop_x1": bounds[5],
@@ -458,6 +499,15 @@ def run(args):
                     row[f"{prefix}_{key}"] = value
             row["lcc_delta_dice"] = row["lcc_dice"] - row["raw_dice"]
             rows.append(row)
+            if prediction_dir is not None:
+                prediction_dir = Path(prediction_dir)
+                prediction_dir.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    prediction_dir / f"{case_id}.npz",
+                    raw=raw_np.astype(np.uint8),
+                    lcc=lcc_np.astype(np.uint8),
+                    fold=np.asarray([int(fold)], dtype=np.int16),
+                )
         return rows, summarize(rows, "raw"), summarize(rows, "lcc")
 
     def preflight():
@@ -497,18 +547,28 @@ def run(args):
         extras = sorted(set(current_ids) - set(source_ids))
         if len(extras) != EXPECTED_EXTRA:
             raise RuntimeError("Expected exactly 44 train-only labels beyond original47")
-        scorable = sorted(set(source_ids) - set(quarantine))
-        if len(scorable) != EXPECTED_SCORABLE:
-            raise RuntimeError("Expected exactly 46 QC-scorable source cases")
-        if len(set(current_ids) - set(quarantine)) != EXPECTED_QC_TRAINABLE:
+        clean_current = sorted(set(current_ids) - set(quarantine))
+        scorable = clean_current if qc90_mode(args) else sorted(set(source_ids) - set(quarantine))
+        expected_scorable = EXPECTED_QC_TRAINABLE if qc90_mode(args) else EXPECTED_SCORABLE
+        if len(scorable) != expected_scorable:
+            raise RuntimeError(f"Expected exactly {expected_scorable} QC-scorable cases")
+        if len(clean_current) != EXPECTED_QC_TRAINABLE:
             raise RuntimeError("Expected exactly 90 QC-trainable cases")
 
-        stage1_dir = Path(args.stage1_dir)
+        stage1_dir = resolved_stage1_dir(args)
         stage1_gate = read_json(stage1_dir / "centernet3d_gate_summary.json")
-        if not stage1_gate.get("gate_pass", False) or not stage1_gate.get("stage2_authorized", False):
-            raise RuntimeError("Stage-1 CenterNet gate has not authorized Stage 2")
-        if not stage1_gate.get("complete_original46_qc_oof", False):
-            raise RuntimeError("Stage-1 gate is not complete for original46-QC")
+        if not stage1_gate.get("stage2_authorized", False):
+            raise RuntimeError("Stage-1 CenterNet OOF has not authorized Stage 2")
+        if qc90_mode(args):
+            if not stage1_gate.get("complete_qc90_oof", False):
+                raise RuntimeError("Stage-1 is not complete for all 90 QC-clean labels")
+            if stage1_gate.get("split_scope") != "qc90":
+                raise RuntimeError("Stage-1 split scope is not qc90")
+        else:
+            if not stage1_gate.get("gate_pass", False):
+                raise RuntimeError("Stage-1 CenterNet safety gate has not passed")
+            if not stage1_gate.get("complete_original46_qc_oof", False):
+                raise RuntimeError("Stage-1 gate is not complete for original46-QC")
         if sorted(stage1_gate.get("quarantined_case_ids", [])) != quarantine:
             raise RuntimeError("Stage-1 quarantine provenance differs")
         stage1_plan = read_json(stage1_dir / "centernet3d_cv_plan.json")
@@ -518,14 +578,23 @@ def run(args):
             raise RuntimeError("Stage-1 did not use the locked 50% safety margin")
 
         crop_rows_list = read_csv(stage1_dir / "centernet3d_oof_metrics.csv")
-        crop_rows = {str(row["case_id"]): row for row in crop_rows_list}
-        if len(crop_rows_list) != EXPECTED_SCORABLE or set(crop_rows) != set(scorable):
-            raise RuntimeError("Stage-1 OOF crop table is not exact original46-QC")
+        crop_rows = {str(row["case_id"]): dict(row) for row in crop_rows_list}
+        if len(crop_rows_list) != expected_scorable or set(crop_rows) != set(scorable):
+            raise RuntimeError("Stage-1 OOF crop table does not match the requested QC population")
         if set(crop_rows) & set(quarantine):
             raise RuntimeError("Quarantined case appears in Stage-1 crop table")
         for case_id, row in crop_rows.items():
-            if float(row["gt_crop_coverage"]) < 0.99:
+            coverage = float(row["gt_crop_coverage"])
+            row["qc_full_grid_fallback"] = int(qc90_mode(args) and coverage < 0.99)
+            if coverage < 0.99 and not qc90_mode(args):
                 raise RuntimeError(f"Unsafe Stage-1 crop for {case_id}")
+            if int(row["qc_full_grid_fallback"]):
+                for key, value in {
+                    "crop_z0": 0, "crop_z1": 127, "crop_y0": 0,
+                    "crop_y1": 127, "crop_x0": 0, "crop_x1": 127,
+                }.items():
+                    row[f"predicted_{key}"] = row[key]
+                    row[key] = value
             bounds = [int(float(row[key])) for key in (
                 "crop_z0", "crop_z1", "crop_y0", "crop_y1", "crop_x0", "crop_x1"
             )]
@@ -535,12 +604,19 @@ def run(args):
 
         fold_specs, held_out = [], []
         checkpoint_provenance = []
-        for original in manifest.get("folds", []):
+        split_rows = (
+            stage1_plan.get("folds", []) if qc90_mode(args) else manifest.get("folds", [])
+        )
+        for original in split_rows:
             fold = int(original["fold"])
-            val_ids = sorted(set(str(x) for x in original["val_ids"]) - set(quarantine))
-            train_ids = sorted(
-                (set(str(x) for x in original["train_ids"]) | set(extras)) - set(quarantine)
-            )
+            if qc90_mode(args):
+                val_ids = sorted(str(x) for x in original["val_ids"])
+                train_ids = sorted(str(x) for x in original["train_ids"])
+            else:
+                val_ids = sorted(set(str(x) for x in original["val_ids"]) - set(quarantine))
+                train_ids = sorted(
+                    (set(str(x) for x in original["train_ids"]) | set(extras)) - set(quarantine)
+                )
             if set(train_ids) & set(val_ids) or set(quarantine) & (set(train_ids) | set(val_ids)):
                 raise RuntimeError(f"Fold {fold}: leakage or quarantine violation")
             if any(int(float(crop_rows[x]["fold"])) != fold for x in val_ids):
@@ -559,16 +635,18 @@ def run(args):
             fold_specs.append({"fold": fold, "train_ids": train_ids, "val_ids": val_ids})
             held_out.extend(val_ids)
         if sorted(held_out) != scorable or len(fold_specs) != 5:
-            raise RuntimeError("Stage-2 folds do not cover original46-QC exactly once")
+            raise RuntimeError("Stage-2 folds do not cover the requested QC population exactly once")
 
-        baseline_rows = read_csv(args.full_volume_baseline)
-        baseline = {str(row["case_id"]): row for row in baseline_rows}
-        if not set(scorable).issubset(baseline):
-            raise RuntimeError("Full-volume Final91 baseline is missing a scorable comparison case")
-        for spec in fold_specs:
-            for case_id in spec["val_ids"]:
-                if int(float(baseline[case_id]["fold"])) != int(spec["fold"]):
-                    raise RuntimeError(f"Baseline fold mismatch for {case_id}")
+        baseline = {}
+        if not qc90_mode(args):
+            baseline_rows = read_csv(args.full_volume_baseline)
+            baseline = {str(row["case_id"]): row for row in baseline_rows}
+            if not set(scorable).issubset(baseline):
+                raise RuntimeError("Full-volume Final91 baseline is missing a comparison case")
+            for spec in fold_specs:
+                for case_id in spec["val_ids"]:
+                    if int(float(baseline[case_id]["fold"])) != int(spec["fold"]):
+                        raise RuntimeError(f"Baseline fold mismatch for {case_id}")
         return (
             config, by_id, extras, quarantine, scorable, fold_specs,
             crop_rows, checkpoint_provenance, baseline, source_path,
@@ -706,8 +784,11 @@ def run(args):
         teacher = build_network("dynunet", 1, 0.0).to(device)
         student.load_state_dict(state["net_A"])
         teacher.load_state_dict(state["teacher"])
+        prediction_dir = (
+            output_dir / "oof_model_grid_masks" if args.save_oof_masks else None
+        )
         rows, raw_summary, lcc_summary = evaluate(
-            student, teacher, val_loader, device, fold, crop_rows
+            student, teacher, val_loader, device, fold, crop_rows, prediction_dir
         )
         print(
             f"Fold {fold} best epoch={state['epoch']} | "
@@ -793,7 +874,8 @@ def run(args):
         crop_rows, stage1_checkpoints, baseline, source_path,
     ) = preflight()
     selected_folds = parse_fold(args.fold)
-    output_dir = Path(args.output_dir)
+    output_dir = resolved_output_dir(args)
+    stage1_dir = resolved_stage1_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     plan = {
         **recipe(args),
@@ -802,25 +884,29 @@ def run(args):
         "source_manifest_sha256": file_sha256(source_path),
         "audit_metadata": args.audit_metadata,
         "audit_metadata_sha256": file_sha256(args.audit_metadata),
-        "stage1_dir": args.stage1_dir,
-        "stage1_gate": str(Path(args.stage1_dir) / "centernet3d_gate_summary.json"),
+        "stage1_dir": str(stage1_dir),
+        "stage1_gate": str(stage1_dir / "centernet3d_gate_summary.json"),
         "stage1_gate_sha256": file_sha256(
-            Path(args.stage1_dir) / "centernet3d_gate_summary.json"
+            stage1_dir / "centernet3d_gate_summary.json"
         ),
-        "stage1_oof_crops": str(Path(args.stage1_dir) / "centernet3d_oof_metrics.csv"),
+        "stage1_oof_crops": str(stage1_dir / "centernet3d_oof_metrics.csv"),
         "stage1_oof_crops_sha256": file_sha256(
-            Path(args.stage1_dir) / "centernet3d_oof_metrics.csv"
+            stage1_dir / "centernet3d_oof_metrics.csv"
         ),
         "stage1_checkpoints": stage1_checkpoints,
-        "full_volume_baseline": args.full_volume_baseline,
-        "full_volume_baseline_sha256": file_sha256(args.full_volume_baseline),
+        "full_volume_baseline": None if qc90_mode(args) else args.full_volume_baseline,
+        "full_volume_baseline_sha256": (
+            None if qc90_mode(args) else file_sha256(args.full_volume_baseline)
+        ),
         "n_live_human_gold": EXPECTED_LIVE,
         "n_qc_trainable": EXPECTED_QC_TRAINABLE,
-        "n_scorable_source": EXPECTED_SCORABLE,
+        "n_scorable_source": len(scorable),
         "quarantined_case_ids": quarantine,
-        "train_only_extra_ids": extras,
+        "train_only_extra_ids": [] if qc90_mode(args) else extras,
         "folds": specs,
     }
+    if qc90_mode(args):
+        plan.update({"split_scope": "qc90", "save_oof_masks": bool(args.save_oof_masks)})
     plan_path = output_dir / "stage2_cv_plan.json"
     if plan_path.exists() and read_json(plan_path) != plan:
         raise RuntimeError(f"Existing Stage-2 plan differs: {plan_path}; use a fresh output directory")
@@ -831,11 +917,18 @@ def run(args):
     if device.type != "cuda":
         raise RuntimeError("Stage-2 DynUNet training requires CUDA")
     print("=" * 120)
-    print("FINAL91-QC TWO-STAGE BLADDER SEGMENTATION — STAGE 2")
+    print(
+        "FINAL91 FIVE-FOLD LABEL-QC — TWO-STAGE OOF"
+        if qc90_mode(args) else "FINAL91-QC TWO-STAGE BLADDER SEGMENTATION — STAGE 2"
+    )
     print(f"Running folds:            {selected_folds}")
-    print("Data:                     91 live | 90 QC-trainable | 46 QC-scorable")
+    print(f"Data:                     91 live | 90 QC-trainable | {len(scorable)} OOF-scorable")
     print(f"Quarantined:              {quarantine[0]}")
-    print("Frozen Stage 1:           CenterNet gate PASS; 46/46 complete coverage")
+    if qc90_mode(args):
+        print("Frozen Stage 1:           matching QC90 OOF CenterNet; every case held out")
+        print("Detector crop miss:       full-grid fallback for diagnosis only; recorded per case")
+    else:
+        print("Frozen Stage 1:           CenterNet gate PASS; 46/46 complete coverage")
     print("Training crop:            GT + randomized safe margin/jitter")
     print("Validation crop:          actual OOF CenterNet crop")
     print("Stage 2:                  DynUNet + DiceCE + Student/EMA ensemble @ .50")
@@ -864,28 +957,59 @@ def run(args):
         })
     write_csv(output_dir / "stage2_fold_summary.csv", fold_summaries)
 
-    comparisons, comparison_summary = compare_to_baseline(combined, baseline)
-    write_csv(output_dir / "stage2_vs_fullvolume_case_comparison.csv", comparisons)
-    write_json(output_dir / "stage2_vs_fullvolume_summary.json", comparison_summary)
     print("\n" + "=" * 120)
-    print("STAGE-2 vs FULL-VOLUME FINAL91-A3")
-    print(f"Cases / folds:       {len(combined)} / {comparison_summary['completed_folds']}")
-    print(
-        f"Mean Dice:           {comparison_summary['mean_dice']['fullvolume_final91_a3']:.4f} -> "
-        f"RAW {comparison_summary['mean_dice']['stage2_raw']:.4f} "
-        f"({comparison_summary['mean_delta_dice']['stage2_raw_minus_fullvolume']:+.4f})"
-    )
-    print(
-        f"LCC diagnostic:      {comparison_summary['mean_dice']['stage2_lcc']:.4f} "
-        f"({comparison_summary['mean_delta_dice']['stage2_lcc_minus_fullvolume']:+.4f} vs full-volume)"
-    )
-    print(
-        f"RAW case effects:    improved={comparison_summary['case_effects_raw']['improved']} | "
-        f"worsened={comparison_summary['case_effects_raw']['worsened']} | "
-        f"+>=.05={comparison_summary['case_effects_raw']['improved_ge_0p05']} | "
-        f"<=-.05={comparison_summary['case_effects_raw']['worsened_le_minus_0p05']}"
-    )
-    print(f"Complete original46-QC: {comparison_summary['complete_original46_qc']}")
+    if qc90_mode(args):
+        raw_summary = summarize(combined, "raw")
+        lcc_summary = summarize(combined, "lcc")
+        completed_folds = sorted({int(float(row["fold"])) for row in combined})
+        complete = (
+            len(combined) == EXPECTED_QC_TRAINABLE
+            and len({str(row["case_id"]) for row in combined}) == EXPECTED_QC_TRAINABLE
+            and completed_folds == list(range(5))
+        )
+        summary = {
+            "version": "final91_label_qc90_two_stage_oof_summary_v1",
+            "role": "heldout annotation diagnosis; not final model performance validation",
+            "n": len(combined), "completed_folds": completed_folds,
+            "complete_qc90_oof": complete,
+            "quarantined_case_ids": quarantine,
+            "raw": raw_summary, "lcc": lcc_summary,
+            "qc_full_grid_fallbacks": sum(
+                int(float(row.get("qc_full_grid_fallback", 0))) for row in combined
+            ),
+            "external31_access": False,
+        }
+        write_json(output_dir / "stage2_qc90_oof_summary.json", summary)
+        print("FINAL91 FIVE-FOLD LABEL-QC — TWO-STAGE OOF")
+        print(f"OOF complete:         {complete}")
+        print(f"Cases / folds:        {len(combined)} / {completed_folds}")
+        print(f"Mean RAW/LCC Dice:    {raw_summary['mean_dice']:.4f} / {lcc_summary['mean_dice']:.4f}")
+        print(f"RAW Dice <0.70:       {raw_summary['dice_lt_0p70']}")
+        print(f"RAW Dice <0.50:       {raw_summary['dice_lt_0p50']}")
+        print(f"QC crop fallbacks:    {summary['qc_full_grid_fallbacks']}")
+        print("Interpretation:       low OOF Dice selects review candidates; it does not prove bad GT")
+    else:
+        comparisons, comparison_summary = compare_to_baseline(combined, baseline)
+        write_csv(output_dir / "stage2_vs_fullvolume_case_comparison.csv", comparisons)
+        write_json(output_dir / "stage2_vs_fullvolume_summary.json", comparison_summary)
+        print("STAGE-2 vs FULL-VOLUME FINAL91-A3")
+        print(f"Cases / folds:       {len(combined)} / {comparison_summary['completed_folds']}")
+        print(
+            f"Mean Dice:           {comparison_summary['mean_dice']['fullvolume_final91_a3']:.4f} -> "
+            f"RAW {comparison_summary['mean_dice']['stage2_raw']:.4f} "
+            f"({comparison_summary['mean_delta_dice']['stage2_raw_minus_fullvolume']:+.4f})"
+        )
+        print(
+            f"LCC diagnostic:      {comparison_summary['mean_dice']['stage2_lcc']:.4f} "
+            f"({comparison_summary['mean_delta_dice']['stage2_lcc_minus_fullvolume']:+.4f} vs full-volume)"
+        )
+        print(
+            f"RAW case effects:    improved={comparison_summary['case_effects_raw']['improved']} | "
+            f"worsened={comparison_summary['case_effects_raw']['worsened']} | "
+            f"+>=.05={comparison_summary['case_effects_raw']['improved_ge_0p05']} | "
+            f"<=-.05={comparison_summary['case_effects_raw']['worsened_le_minus_0p05']}"
+        )
+        print(f"Complete original46-QC: {comparison_summary['complete_original46_qc']}")
     print(f"Results:             {results_path}")
     print("=" * 120)
 
@@ -898,6 +1022,10 @@ def build_parser():
     parser.add_argument("--stage1-dir", default=str(STAGE1_DIR))
     parser.add_argument("--full-volume-baseline", default=str(FULL_VOLUME_BASELINE))
     parser.add_argument("--output-dir", default=str(OUTPUT))
+    parser.add_argument(
+        "--split-scope", choices=("original46", "qc90"), default="original46",
+        help="original46 preserves performance CV; qc90 holds out all 90 clean labels once",
+    )
     parser.add_argument("--fold", default="2", help="all, 0..4, or comma-separated subset; default 2")
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--epochs", type=int, default=100)
@@ -910,6 +1038,10 @@ def build_parser():
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--ema-decay", type=float, default=0.99)
     parser.add_argument("--threshold", type=float, default=0.50)
+    parser.add_argument(
+        "--save-oof-masks", action="store_true",
+        help="save each final held-out RAW/LCC 128^3 mask for the native review-pack builder",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")

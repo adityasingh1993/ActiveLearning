@@ -14,6 +14,7 @@ blocked until the complete QC-clean OOF safety gate passes.
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import random
@@ -29,6 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 SOURCE_CV = Path("experiments/cv5_supervised_47_translation12")
 AUDIT = Path("experiments/round5_supervised_91_a3/final91_live_label_audit.json")
 OUTPUT = Path("experiments/final91_qc_stage1_centernet3d_cv")
+QC90_OUTPUT = Path("experiments/final91_label_qc90_centernet3d_oof")
 EXPECTED_SOURCE = 47
 EXPECTED_TOTAL = 91
 EXPECTED_EXTRA = 44
@@ -37,6 +39,31 @@ EXPECTED_SCORABLE_TOTAL = 90
 QUARANTINED_CASE_IDS = (
     "9435b1b67a41b88f6084a3e750fc54d913213ea55f33d165a1f42b9b50dd237c",
 )
+
+
+def qc90_mode(args):
+    return str(getattr(args, "split_scope", "original46")) == "qc90"
+
+
+def stable_qc90_folds(case_ids, seed):
+    """Create five deterministic, equal 18-case folds without another dependency."""
+    ordered = sorted(
+        (str(case_id) for case_id in case_ids),
+        key=lambda case_id: hashlib.sha256(f"{int(seed)}:{case_id}".encode()).hexdigest(),
+    )
+    if len(ordered) != EXPECTED_SCORABLE_TOTAL or len(set(ordered)) != EXPECTED_SCORABLE_TOTAL:
+        raise RuntimeError("QC90 split requires exactly 90 unique QC-clean cases")
+    validation_folds = [ordered[index::5] for index in range(5)]
+    if any(len(values) != 18 for values in validation_folds):
+        raise RuntimeError("QC90 split did not produce five equal 18-case folds")
+    return [
+        {
+            "fold": fold,
+            "train_ids": sorted(set(ordered) - set(val_ids)),
+            "val_ids": sorted(val_ids),
+        }
+        for fold, val_ids in enumerate(validation_folds)
+    ]
 
 
 def read_json(path):
@@ -100,7 +127,7 @@ def median(values):
 
 
 def recipe(args):
-    return {
+    result = {
         "version": "final91_qc_stage1_centernet3d_cv_v2",
         "task": "single_object_3d_bladder_detection",
         "architecture": "centernet3d_fpn",
@@ -152,12 +179,29 @@ def recipe(args):
         "heldout_evaluation": "frozen_original47_minus_documented_qc_quarantine",
         "external31_access": False,
     }
+    if qc90_mode(args):
+        result.update({
+            "version": "final91_label_qc90_stage1_centernet3d_oof_v1",
+            "heldout_evaluation": "all_90_qc_clean_cases_exactly_once",
+            "label_qc_only": True,
+            "qc_split_seed": int(args.qc_split_seed),
+            "qc_stage2_policy": (
+                "complete OOF required; GT-aware full-grid fallback is permitted only in the "
+                "downstream annotation-diagnostic Stage 2 when the predicted crop misses GT"
+            ),
+        })
+    return result
 
 
 def dry_run(args):
     output_size = args.resize_size // 4
     print("=" * 116)
-    print("FINAL91-QC STAGE-1 3D CENTERNET BLADDER LOCALIZER — DRY RUN")
+    title = (
+        "FINAL91 LABEL-QC90 STAGE-1 CENTERNET OOF — DRY RUN"
+        if qc90_mode(args) else
+        "FINAL91-QC STAGE-1 3D CENTERNET BLADDER LOCALIZER — DRY RUN"
+    )
+    print(title)
     print(f"Folds:                    {parse_fold(args.fold)}")
     print(f"Input:                    full padded image at {args.resize_size}^3")
     print(f"Heatmap:                  1 x {output_size}^3 (stride 4)")
@@ -168,11 +212,20 @@ def dry_run(args):
     print(f"Safety margin per side:   {args.safety_margin:.0%}")
     print("Live HUMAN_GOLD:          91 (files unchanged)")
     print("QC-trainable cases:       90")
-    print("Held out:                 frozen original47 minus 1 QC quarantine = 46")
+    if qc90_mode(args):
+        print("Held out:                 every QC-clean case once; 5 folds x 18")
+        print("Per fold:                 train=72 / validation=18")
+        print(f"QC split seed:            {args.qc_split_seed}")
+        print("Role:                     annotation diagnosis; not final performance validation")
+    else:
+        print("Held out:                 frozen original47 minus 1 QC quarantine = 46")
     print(f"Quarantined:              {QUARANTINED_CASE_IDS[0]}")
-    print("Newer 44 HUMAN_GOLD:      train-only")
+    print(
+        "Newer 44 HUMAN_GOLD:      included in rotating held-out folds"
+        if qc90_mode(args) else "Newer 44 HUMAN_GOLD:      train-only"
+    )
     print("External31:               NOT ACCESSED")
-    print("Stage 2:                  BLOCKED until complete OOF gate passes")
+    print("Stage 2:                  BLOCKED until complete Stage-1 OOF exists")
     print("=" * 116)
 
 
@@ -554,21 +607,34 @@ def run(args):
         if len(scorable_current_ids) != EXPECTED_SCORABLE_TOTAL:
             raise RuntimeError("QC-clean training population must contain exactly 90 cases")
         specs, held_out = [], []
-        for original in manifest.get("folds", []):
-            fold = int(original["fold"])
-            val_ids = sorted(set(str(x) for x in original["val_ids"]) - set(quarantine_ids))
-            train_ids = sorted(
-                (set(str(x) for x in original["train_ids"]) | set(extra_ids))
-                - set(quarantine_ids)
-            )
-            if set(train_ids) & set(val_ids) or set(extra_ids) & set(val_ids):
-                raise RuntimeError(f"Fold {fold}: leakage detected")
+        if qc90_mode(args):
+            specs = stable_qc90_folds(scorable_current_ids, args.qc_split_seed)
+            expected_held_out = scorable_current_ids
+        else:
+            for original in manifest.get("folds", []):
+                fold = int(original["fold"])
+                val_ids = sorted(set(str(x) for x in original["val_ids"]) - set(quarantine_ids))
+                train_ids = sorted(
+                    (set(str(x) for x in original["train_ids"]) | set(extra_ids))
+                    - set(quarantine_ids)
+                )
+                if set(train_ids) & set(val_ids) or set(extra_ids) & set(val_ids):
+                    raise RuntimeError(f"Fold {fold}: leakage detected")
+                if set(quarantine_ids) & (set(train_ids) | set(val_ids)):
+                    raise RuntimeError(
+                        f"Fold {fold}: quarantined case entered training or validation"
+                    )
+                specs.append({"fold": fold, "train_ids": train_ids, "val_ids": val_ids})
+            expected_held_out = scorable_source_ids
+        for spec in specs:
+            train_ids, val_ids = spec["train_ids"], spec["val_ids"]
+            if set(train_ids) & set(val_ids):
+                raise RuntimeError(f"Fold {spec['fold']}: train/validation leakage detected")
             if set(quarantine_ids) & (set(train_ids) | set(val_ids)):
-                raise RuntimeError(f"Fold {fold}: quarantined case entered training or validation")
-            specs.append({"fold": fold, "train_ids": train_ids, "val_ids": val_ids})
+                raise RuntimeError(f"Fold {spec['fold']}: quarantine violation")
             held_out.extend(val_ids)
-        if sorted(held_out) != scorable_source_ids or len(specs) != 5:
-            raise RuntimeError("QC-clean folds do not cover the 46 scorable source cases exactly once")
+        if sorted(held_out) != expected_held_out or len(specs) != 5:
+            raise RuntimeError("Selected folds do not cover their QC population exactly once")
         return config, by_id, extra_ids, quarantine_ids, specs, source_path
 
     def train_fold(config, by_id, spec, output_dir, device):
@@ -689,6 +755,8 @@ def run(args):
     config, by_id, extra_ids, quarantine_ids, specs, source_path = preflight()
     selected_folds = parse_fold(args.fold)
     output_dir = Path(args.output_dir)
+    if qc90_mode(args) and output_dir == OUTPUT:
+        output_dir = QC90_OUTPUT
     output_dir.mkdir(parents=True, exist_ok=True)
     plan = {
         **recipe(args), "config": args.config, "audit_metadata": args.audit_metadata,
@@ -697,9 +765,12 @@ def run(args):
         "n_frozen_source": EXPECTED_SOURCE,
         "n_scorable_frozen_source": EXPECTED_SCORABLE_SOURCE,
         "quarantined_case_ids": quarantine_ids,
-        "n_train_only_extra": len(extra_ids), "train_only_extra_ids": extra_ids,
+        "n_train_only_extra": 0 if qc90_mode(args) else len(extra_ids),
+        "train_only_extra_ids": [] if qc90_mode(args) else extra_ids,
         "folds": specs,
     }
+    if qc90_mode(args):
+        plan.update({"split_scope": "qc90", "qc_split_seed": int(args.qc_split_seed)})
     plan_path = output_dir / "centernet3d_cv_plan.json"
     if plan_path.exists() and read_json(plan_path) != plan:
         raise RuntimeError(f"Existing plan differs: {plan_path}; use a fresh --output-dir")
@@ -709,7 +780,10 @@ def run(args):
     if device.type != "cuda":
         raise RuntimeError("3D CenterNet training requires CUDA")
     print("=" * 116)
-    print("FINAL91-QC STAGE-1 3D CENTERNET BLADDER LOCALIZER")
+    print(
+        "FINAL91 LABEL-QC90 STAGE-1 CENTERNET OOF"
+        if qc90_mode(args) else "FINAL91-QC STAGE-1 3D CENTERNET BLADDER LOCALIZER"
+    )
     print(
         f"Folds: {selected_folds} | input={args.resize_size}^3 | "
         f"heatmap={args.resize_size // 4}^3 | epochs={args.epochs} | "
@@ -717,7 +791,8 @@ def run(args):
     )
     print(
         f"Data: {EXPECTED_TOTAL} live labels | {EXPECTED_SCORABLE_TOTAL} trainable | "
-        f"{EXPECTED_SCORABLE_SOURCE} scorable held-out | {len(quarantine_ids)} quarantined"
+        f"{EXPECTED_SCORABLE_TOTAL if qc90_mode(args) else EXPECTED_SCORABLE_SOURCE} "
+        f"OOF cases | {len(quarantine_ids)} quarantined"
     )
     print(f"Quarantined case: {quarantine_ids[0]}")
     print("Output: one center heatmap + one offset + one 3D size | External31: NOT ACCESSED")
@@ -739,9 +814,10 @@ def run(args):
         fold_rows.append(fold_summary)
     write_csv(output_dir / "centernet3d_fold_summary.csv", fold_rows)
     overall = summarize(combined)
+    expected_oof = EXPECTED_SCORABLE_TOTAL if qc90_mode(args) else EXPECTED_SCORABLE_SOURCE
     complete = (
-        len(combined) == EXPECTED_SCORABLE_SOURCE
-        and len({str(x["case_id"]) for x in combined}) == EXPECTED_SCORABLE_SOURCE
+        len(combined) == expected_oof
+        and len({str(x["case_id"]) for x in combined}) == expected_oof
         and {int(x["fold"]) for x in combined} == set(range(5))
         and not ({str(x["case_id"]) for x in combined} & set(quarantine_ids))
     )
@@ -766,9 +842,22 @@ def run(args):
         **overall, "criteria": gate, "gate_pass": passed,
         "stage2_authorized": passed, "external31_access": False,
     }
+    if qc90_mode(args):
+        summary.update({
+            "version": "final91_label_qc90_stage1_centernet3d_oof_summary_v1",
+            "split_scope": "qc90",
+            "label_qc_only": True,
+            "complete_original46_qc_oof": False,
+            "complete_qc90_oof": complete,
+            "qc_full_grid_fallback_policy": True,
+            "stage2_authorized": complete,
+        })
     write_json(output_dir / "centernet3d_gate_summary.json", summary)
     print("\n" + "=" * 116)
-    print("3D CENTERNET LOCALIZER GATE — QC-CLEAN")
+    print(
+        "3D CENTERNET LABEL-QC90 OOF SUMMARY"
+        if qc90_mode(args) else "3D CENTERNET LOCALIZER GATE — QC-CLEAN"
+    )
     print(f"OOF complete:              {complete}")
     print(f"Cases / folds:             {len(combined)} / {summary['completed_folds']}")
     print(f"QC quarantined:            {len(quarantine_ids)} / {quarantine_ids[0]}")
@@ -784,8 +873,10 @@ def run(args):
         f"{overall['mean_crop_fraction']:.4f}"
     )
     print(f"Mean center confidence:    {overall['mean_center_confidence']:.4f}")
-    print(f"GATE PASS:                 {passed}")
-    print(f"STAGE 2 AUTHORIZED:        {passed}")
+    print(f"{'LOCALIZER SAFETY GATE' if qc90_mode(args) else 'GATE PASS'}:     {passed}")
+    print(f"STAGE 2 AUTHORIZED:        {summary['stage2_authorized']}")
+    if qc90_mode(args) and complete and not passed:
+        print("QC fallback:               GT-missed OOF crops use full grid in diagnostic Stage 2")
     print("=" * 116)
 
 
@@ -795,6 +886,11 @@ def build_parser():
     parser.add_argument("--audit-metadata", default=str(AUDIT))
     parser.add_argument("--source-cv-dir", default=str(SOURCE_CV))
     parser.add_argument("--output-dir", default=str(OUTPUT))
+    parser.add_argument(
+        "--split-scope", choices=("original46", "qc90"), default="original46",
+        help="original46 preserves performance CV; qc90 holds out all 90 clean labels once",
+    )
+    parser.add_argument("--qc-split-seed", type=int, default=20260825)
     parser.add_argument("--fold", default="2", help="all, 0..4, or comma-separated subset; default 2")
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--epochs", type=int, default=300)
