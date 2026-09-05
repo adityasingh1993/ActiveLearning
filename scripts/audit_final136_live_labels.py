@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Read-only geometry/non-empty audit for the explicit all-136 training experiment.
+"""Read-only geometry/non-empty audit for the explicit 136-case dataset.
 
-This audit intentionally permits the historically quarantined 9435... case because the all-136
-experiment requested by the user includes every currently labeled case. It never edits labels and
-never accesses External31.
+The audit checks all 136 visible labels, records four user-selected exclusions, and produces the
+exact 132-case training scope. It never edits labels and never accesses External31.
 """
 
 import argparse
@@ -21,11 +20,18 @@ from scripts.audit_round1_labels import audit_case, discover_round1_cases, write
 
 
 SOURCE_MANIFEST = Path("experiments/cv5_supervised_47_translation12/cv_splits.json")
-OUTPUT_DIR = Path("experiments/final136_two_stage_all136/audit")
+OUTPUT_DIR = Path("experiments/final136_two_stage_train132/audit")
 EXPECTED_TOTAL = 136
 PRIOR_QUARANTINE_ID = (
     "9435b1b67a41b88f6084a3e750fc54d913213ea55f33d165a1f42b9b50dd237c"
 )
+EXCLUDED_CASE_IDS = {
+    "81a0f3f3fa1e2ad8bd01d3915898298ffff947a83b5749846b228a612356fb2f",
+    "96165b4ca29e10f85866ca53ac68e4e44a127fe676e5745e0a94d50602819f0f",
+    "a31909b0e87f789c68489e8ebe6a5adfb72c5a19dbe5546cd762ea2f82c7037a",
+    "d8269b9a976314fb41fa63187c4b2dc05ee94e2973125df67bb5e4fd75bc7563",
+}
+EXPECTED_TRAINING = EXPECTED_TOTAL - len(EXCLUDED_CASE_IDS)
 
 
 def main():
@@ -60,23 +66,41 @@ def main():
             f"Expected exactly {EXPECTED_TOTAL} unique live labels, found {len(set(current_ids))}"
         )
     if PRIOR_QUARANTINE_ID not in current_ids:
-        raise RuntimeError("Historically quarantined 9435... case is absent from the all-136 dataset")
+        raise RuntimeError("Historically quarantined 9435... case is absent from the 136-case dataset")
+    missing_exclusions = sorted(EXCLUDED_CASE_IDS - set(current_ids))
+    if missing_exclusions:
+        raise RuntimeError(
+            "Requested training exclusions are absent from the 136-case dataset: "
+            + ", ".join(missing_exclusions)
+        )
+    training_ids = sorted(set(current_ids) - EXCLUDED_CASE_IDS)
+    if len(training_ids) != EXPECTED_TRAINING:
+        raise RuntimeError(
+            f"Expected exactly {EXPECTED_TRAINING} training cases, found {len(training_ids)}"
+        )
 
     rows = []
-    failures = []
+    training_failures = []
+    excluded_failures = []
     for case_id in current_ids:
         row = audit_case(by_id[case_id])
+        if case_id in EXCLUDED_CASE_IDS:
+            training_status = "EXCLUDED_BY_USER"
+        elif case_id == PRIOR_QUARANTINE_ID:
+            training_status = "INTENTIONALLY_INCLUDED_PRIOR_QUARANTINE"
+        else:
+            training_status = "TRAIN_FINAL132"
         row = {
-            "training_status": (
-                "INTENTIONALLY_INCLUDED_PRIOR_QUARANTINE"
-                if case_id == PRIOR_QUARANTINE_ID
-                else "TRAIN_ALL136"
-            ),
+            "training_status": training_status,
             **row,
         }
         rows.append(row)
         if not int(row.get("audit_ok", 0)):
-            failures.append(f"{case_id}: {row.get('audit_error', 'audit failed')}")
+            failure = f"{case_id}: {row.get('audit_error', 'audit failed')}"
+            if case_id in EXCLUDED_CASE_IDS:
+                excluded_failures.append(failure)
+            else:
+                training_failures.append(failure)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -84,7 +108,7 @@ def main():
     json_path = output_dir / "final136_live_label_audit.json"
     write_csv(csv_path, rows)
     metadata = {
-        "version": "final136_live_label_audit_all136_v1",
+        "version": "final136_live_label_audit_train132_v1",
         "source_manifest": str(args.source_manifest),
         "n_frozen_source": len(source_ids),
         "n_frozen_source_present": len(set(source_ids) & set(current_ids)),
@@ -94,19 +118,28 @@ def main():
         "n_new_since_original47": len(new_ids),
         "n_total_human_gold": len(current_ids),
         "all_current_human_label_ids": current_ids,
-        "all_visible_labels_passed_audit": len(failures) == 0,
+        "n_training_cases": len(training_ids),
+        "training_case_ids": training_ids,
+        "excluded_training_case_ids": sorted(EXCLUDED_CASE_IDS),
+        "n_excluded_training_cases": len(EXCLUDED_CASE_IDS),
+        "all_visible_labels_passed_audit": not training_failures and not excluded_failures,
+        "all_training_labels_passed_audit": len(training_failures) == 0,
+        "excluded_case_audit_failures": excluded_failures,
         "selection_provenance_enforced": False,
         "training_scope_provenance_enforced": True,
-        "training_scope": "all_136_live_labels",
-        "quarantined_case_ids": [],
+        "training_scope": "132_of_136_live_labels_after_four_explicit_exclusions",
+        "quarantined_case_ids": sorted(EXCLUDED_CASE_IDS),
         "intentionally_included_prior_quarantine_ids": [PRIOR_QUARANTINE_ID],
         "label_source": "live central label directory; read-only audit",
         "external31_access": False,
     }
     json_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
-    if failures:
-        raise RuntimeError("FINAL136 AUDIT FAILED. Do not train.\n" + "\n".join(failures[:30]))
+    if training_failures:
+        raise RuntimeError(
+            "FINAL136 TRAINING-SCOPE AUDIT FAILED. Do not train.\n"
+            + "\n".join(training_failures[:30])
+        )
 
     print("=" * 112)
     print("FINAL136 LIVE HUMAN_GOLD AUDIT — PASS")
@@ -116,7 +149,10 @@ def main():
     if missing_frozen_ids:
         print("Missing frozen IDs:      " + ", ".join(missing_frozen_ids))
     print(f"New since original47:    {len(new_ids)}")
-    print(f"Total training labels:   {len(current_ids)}")
+    print(f"Total audited labels:    {len(current_ids)}")
+    print(f"Total training labels:   {len(training_ids)}")
+    print("Excluded by user:        " + ", ".join(sorted(EXCLUDED_CASE_IDS)))
+    print(f"Excluded audit failures: {len(excluded_failures)} (recorded; non-blocking)")
     print("Prior 9435 quarantine:   INTENTIONALLY INCLUDED")
     print("Geometry/non-empty:      PASS for all")
     print("External31:              NOT ACCESSED")

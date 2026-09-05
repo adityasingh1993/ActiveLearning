@@ -3,8 +3,8 @@
 
 Training uses safe randomized GT-derived crops exactly as Stage-2 CV. The fixed epoch count is the
 rounded median selected epoch from the five completed Stage-2 folds. Defaults preserve the all-90
-QC-clean Final91 experiment; explicit flags permit the separate all-136 experiment. External31 is
-not accessed.
+QC-clean Final91 experiment; explicit flags permit larger audited cohorts with recorded case
+exclusions. External31 is not accessed.
 """
 
 import argparse
@@ -40,14 +40,16 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def selected_training_ids(audited_ids, include_quarantined):
-    if include_quarantined:
-        return sorted(audited_ids)
-    return sorted(set(audited_ids) - {QUARANTINED_CASE_ID})
+def selected_training_ids(audited_ids, include_quarantined, excluded_ids=()):
+    excluded = set(str(x) for x in excluded_ids)
+    if not include_quarantined:
+        excluded.add(QUARANTINED_CASE_ID)
+    return sorted(set(audited_ids) - excluded)
 
 
 def dry_run(args):
-    training_count = args.expected_live if args.include_quarantined else args.expected_live - 1
+    default_count = args.expected_live if args.include_quarantined else args.expected_live - 1
+    training_count = args.expected_trainable or default_count
     print("=" * 116)
     print(f"FINAL{args.expected_live} FINAL STAGE-2 DYNUNET — ALL{training_count} DRY RUN")
     print(f"Prerequisite:         final all{training_count} CenterNet + complete Stage-2 OOF")
@@ -139,26 +141,46 @@ def run(args):
 
     audit = read_json(args.audit_metadata)
     audited_ids = sorted(str(x) for x in audit.get("all_current_human_label_ids", []))
+    excluded_ids = sorted(str(x) for x in audit.get("excluded_training_case_ids", []))
     provenance_ok = bool(
         audit.get("selection_provenance_enforced", False)
         or audit.get("training_scope_provenance_enforced", False)
+    )
+    training_audit_ok = bool(
+        audit.get(
+            "all_training_labels_passed_audit",
+            audit.get("all_visible_labels_passed_audit", False),
+        )
     )
     if bool(audit.get("missing_frozen_allowed", False)) != bool(args.allow_missing_frozen):
         raise RuntimeError(
             "Training --allow-missing-frozen policy differs from the audit metadata"
         )
     if (
-        not audit.get("all_visible_labels_passed_audit", False)
+        not training_audit_ok
         or not provenance_ok
         or len(audited_ids) != int(args.expected_live)
         or QUARANTINED_CASE_ID not in audited_ids
     ):
         raise RuntimeError("Final91 live-label audit/quarantine provenance is not valid")
+    unknown_exclusions = sorted(set(excluded_ids) - set(audited_ids))
+    if unknown_exclusions:
+        raise RuntimeError(
+            "Audit exclusion list contains IDs outside the audited cohort: "
+            + ", ".join(unknown_exclusions)
+        )
 
     stage1_final = Path(args.stage1_final_dir)
     stage1_checkpoint = stage1_final / "final_centernet3d.pth"
     stage1_metadata = read_json(stage1_final / "final_centernet3d_metadata.json")
-    expected_trainable = int(args.expected_live) if args.include_quarantined else int(args.expected_live) - 1
+    expected_trainable = len(
+        selected_training_ids(audited_ids, args.include_quarantined, excluded_ids)
+    )
+    if args.expected_trainable is not None and expected_trainable != int(args.expected_trainable):
+        raise RuntimeError(
+            f"Expected --expected-trainable {args.expected_trainable}, but audit selects "
+            f"{expected_trainable} cases"
+        )
     if (
         not stage1_checkpoint.exists()
         or int(stage1_metadata.get("n_qc_trainable", -1)) != expected_trainable
@@ -235,13 +257,14 @@ def run(args):
     )
     if len(source_ids) != 47 or sorted(by_id) != audited_ids:
         raise RuntimeError("Live labels or frozen original47 source changed after audit")
-    train_ids = selected_training_ids(audited_ids, args.include_quarantined)
+    train_ids = selected_training_ids(audited_ids, args.include_quarantined, excluded_ids)
     if len(train_ids) != expected_trainable:
         raise RuntimeError(
             f"Expected exactly {expected_trainable} training cases, found {len(train_ids)}"
         )
     if stage1_metadata.get("train_ids") != train_ids:
         raise RuntimeError("Final CenterNet and requested Stage-2 training IDs differ")
+    non_training_ids = sorted(set(audited_ids) - set(train_ids))
 
     output_dir = Path(args.output_dir)
     checkpoint_path = output_dir / "final_stage2_dynunet.pth"
@@ -339,7 +362,8 @@ def run(args):
         "teacher": ema.state_dict(),
         "epoch": final_epochs,
         "train_ids": train_ids,
-        "quarantined_case_ids": [] if args.include_quarantined else [QUARANTINED_CASE_ID],
+        "excluded_training_case_ids": excluded_ids,
+        "quarantined_case_ids": non_training_ids,
         "intentionally_included_prior_quarantine_ids": (
             [QUARANTINED_CASE_ID] if args.include_quarantined else []
         ),
@@ -363,7 +387,8 @@ def run(args):
         "n_live_labels": int(args.expected_live),
         "n_qc_trainable": len(train_ids),
         "train_ids": train_ids,
-        "quarantined_case_ids": [] if args.include_quarantined else [QUARANTINED_CASE_ID],
+        "excluded_training_case_ids": excluded_ids,
+        "quarantined_case_ids": non_training_ids,
         "intentionally_included_prior_quarantine_ids": (
             [QUARANTINED_CASE_ID] if args.include_quarantined else []
         ),
@@ -394,6 +419,7 @@ def build_parser():
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--expected-live", type=int, default=EXPECTED_LIVE)
+    parser.add_argument("--expected-trainable", type=int, default=None)
     parser.add_argument(
         "--include-quarantined",
         action="store_true",
@@ -417,6 +443,8 @@ def main():
         parser.error("--epochs must be >=1")
     if args.expected_live < 2:
         parser.error("--expected-live must be >=2")
+    if args.expected_trainable is not None and args.expected_trainable < 1:
+        parser.error("--expected-trainable must be >=1")
     if args.dry_run:
         dry_run(args)
         return
