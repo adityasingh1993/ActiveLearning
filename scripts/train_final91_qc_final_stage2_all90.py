@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Train the final Stage-2 DynUNet on all 90 QC-clean Final91 cases.
+"""Train the final Stage-2 DynUNet with an audited labeled-case set.
 
 Training uses safe randomized GT-derived crops exactly as Stage-2 CV. The fixed epoch count is the
-rounded median selected epoch from the five completed Stage-2 folds. External31 is not accessed.
+rounded median selected epoch from the five completed Stage-2 folds. Defaults preserve the all-90
+QC-clean Final91 experiment; explicit flags permit the separate all-136 experiment. External31 is
+not accessed.
 """
 
 import argparse
@@ -38,11 +40,19 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def selected_training_ids(audited_ids, include_quarantined):
+    if include_quarantined:
+        return sorted(audited_ids)
+    return sorted(set(audited_ids) - {QUARANTINED_CASE_ID})
+
+
 def dry_run(args):
+    training_count = args.expected_live if args.include_quarantined else args.expected_live - 1
     print("=" * 116)
-    print("FINAL91-QC FINAL STAGE-2 DYNUNET — ALL90 DRY RUN")
-    print("Prerequisite:         final all90 CenterNet + complete Stage-2 OOF")
-    print("Data:                 91 live labels - 1 quarantine = 90 training cases")
+    print(f"FINAL{args.expected_live} FINAL STAGE-2 DYNUNET — ALL{training_count} DRY RUN")
+    print(f"Prerequisite:         final all{training_count} CenterNet + complete Stage-2 OOF")
+    print(f"Data:                 {args.expected_live} live labels -> {training_count} training cases")
+    print(f"Prior quarantine:     {'INCLUDED by explicit experiment flag' if args.include_quarantined else 'EXCLUDED'}")
     print("Epoch selection:      rounded median Stage-2 CV selected epoch")
     print("Training crop:        GT box + 40%-60% safe margin + 10% center jitter")
     print("Model:                DynUNet Student+EMA; DiceCE; threshold 0.50")
@@ -129,10 +139,14 @@ def run(args):
 
     audit = read_json(args.audit_metadata)
     audited_ids = sorted(str(x) for x in audit.get("all_current_human_label_ids", []))
+    provenance_ok = bool(
+        audit.get("selection_provenance_enforced", False)
+        or audit.get("training_scope_provenance_enforced", False)
+    )
     if (
         not audit.get("all_visible_labels_passed_audit", False)
-        or not audit.get("selection_provenance_enforced", False)
-        or len(audited_ids) != EXPECTED_LIVE
+        or not provenance_ok
+        or len(audited_ids) != int(args.expected_live)
         or QUARANTINED_CASE_ID not in audited_ids
     ):
         raise RuntimeError("Final91 live-label audit/quarantine provenance is not valid")
@@ -140,8 +154,14 @@ def run(args):
     stage1_final = Path(args.stage1_final_dir)
     stage1_checkpoint = stage1_final / "final_centernet3d.pth"
     stage1_metadata = read_json(stage1_final / "final_centernet3d_metadata.json")
-    if not stage1_checkpoint.exists() or int(stage1_metadata.get("n_qc_trainable", -1)) != 90:
-        raise RuntimeError("Final all90 CenterNet must be completed before final Stage 2")
+    expected_trainable = int(args.expected_live) if args.include_quarantined else int(args.expected_live) - 1
+    if (
+        not stage1_checkpoint.exists()
+        or int(stage1_metadata.get("n_qc_trainable", -1)) != expected_trainable
+    ):
+        raise RuntimeError(
+            f"Final all{expected_trainable} CenterNet must be completed before final Stage 2"
+        )
     if stage1_metadata.get("external31_access") is not False:
         raise RuntimeError("Final CenterNet metadata indicates external-data access")
 
@@ -207,9 +227,13 @@ def run(args):
     _, source_ids, by_id, _ = discover_round1_cases(config, source_manifest)
     if len(source_ids) != 47 or sorted(by_id) != audited_ids:
         raise RuntimeError("Live labels or frozen original47 source changed after audit")
-    train_ids = sorted(set(audited_ids) - {QUARANTINED_CASE_ID})
-    if len(train_ids) != EXPECTED_TRAINABLE:
-        raise RuntimeError("Expected exactly 90 QC-clean training cases")
+    train_ids = selected_training_ids(audited_ids, args.include_quarantined)
+    if len(train_ids) != expected_trainable:
+        raise RuntimeError(
+            f"Expected exactly {expected_trainable} training cases, found {len(train_ids)}"
+        )
+    if stage1_metadata.get("train_ids") != train_ids:
+        raise RuntimeError("Final CenterNet and requested Stage-2 training IDs differ")
 
     output_dir = Path(args.output_dir)
     checkpoint_path = output_dir / "final_stage2_dynunet.pth"
@@ -258,7 +282,7 @@ def run(args):
     scaler = torch.cuda.amp.GradScaler(enabled=True)
 
     print("=" * 116)
-    print("FINAL91-QC FINAL STAGE-2 DYNUNET — TRAIN ALL90")
+    print(f"FINAL{args.expected_live} FINAL STAGE-2 DYNUNET — TRAIN ALL{len(train_ids)}")
     print(f"CV selected epochs:      {selected_epochs}")
     print(f"Median / final epochs:   {median_epoch} / {final_epochs}")
     print(f"Training cases:          {len(train_ids)}")
@@ -306,7 +330,10 @@ def run(args):
         "teacher": ema.state_dict(),
         "epoch": final_epochs,
         "train_ids": train_ids,
-        "quarantined_case_ids": [QUARANTINED_CASE_ID],
+        "quarantined_case_ids": [] if args.include_quarantined else [QUARANTINED_CASE_ID],
+        "intentionally_included_prior_quarantine_ids": (
+            [QUARANTINED_CASE_ID] if args.include_quarantined else []
+        ),
         "cv_selected_epochs": selected_epochs,
         "median_cv_selected_epoch": median_epoch,
         "recipe": {
@@ -321,13 +348,16 @@ def run(args):
         },
     }, checkpoint_path)
     metadata = {
-        "version": "final91_qc_final_stage2_all90_v1",
+        "version": f"final{args.expected_live}_final_stage2_all{len(train_ids)}_v1",
         "checkpoint": str(checkpoint_path),
         "paired_final_centernet": str(stage1_checkpoint),
-        "n_live_labels": EXPECTED_LIVE,
-        "n_qc_trainable": EXPECTED_TRAINABLE,
+        "n_live_labels": int(args.expected_live),
+        "n_qc_trainable": len(train_ids),
         "train_ids": train_ids,
-        "quarantined_case_ids": [QUARANTINED_CASE_ID],
+        "quarantined_case_ids": [] if args.include_quarantined else [QUARANTINED_CASE_ID],
+        "intentionally_included_prior_quarantine_ids": (
+            [QUARANTINED_CASE_ID] if args.include_quarantined else []
+        ),
         "cv_checkpoints": [str(path) for path, _ in cv_states],
         "cv_selected_epochs": selected_epochs,
         "median_cv_selected_epoch": median_epoch,
@@ -352,6 +382,12 @@ def build_parser():
     parser.add_argument("--output-dir", default=str(OUTPUT))
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--expected-live", type=int, default=EXPECTED_LIVE)
+    parser.add_argument(
+        "--include-quarantined",
+        action="store_true",
+        help="Intentionally include the historically quarantined 9435... case in training.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -363,6 +399,8 @@ def main():
     args = parser.parse_args()
     if args.epochs is not None and args.epochs < 1:
         parser.error("--epochs must be >=1")
+    if args.expected_live < 2:
+        parser.error("--expected-live must be >=2")
     if args.dry_run:
         dry_run(args)
         return
