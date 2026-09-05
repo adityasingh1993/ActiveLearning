@@ -34,14 +34,27 @@ def main():
     parser.add_argument("--source-manifest", default=str(SOURCE_MANIFEST))
     parser.add_argument("--output-dir", default=str(OUTPUT_DIR))
     parser.add_argument("--expected-count", type=int, default=EXPECTED_TOTAL)
+    parser.add_argument(
+        "--allow-missing-frozen",
+        action="store_true",
+        help=(
+            "Allow original47 cases absent from the current paired dataset. Missing IDs are "
+            "recorded; exactly 136 current valid pairs are still required."
+        ),
+    )
     args = parser.parse_args()
 
     if args.expected_count != EXPECTED_TOTAL:
         parser.error("Final136 audit is locked to --expected-count 136")
 
     config = HASSLConfig.from_yaml(args.config)
-    _, source_ids, by_id, new_ids = discover_round1_cases(config, args.source_manifest)
+    _, source_ids, by_id, new_ids = discover_round1_cases(
+        config,
+        args.source_manifest,
+        require_all_frozen=not args.allow_missing_frozen,
+    )
     current_ids = sorted(str(case_id) for case_id in by_id)
+    missing_frozen_ids = sorted(set(source_ids) - set(current_ids))
     if len(current_ids) != EXPECTED_TOTAL or len(set(current_ids)) != EXPECTED_TOTAL:
         raise RuntimeError(
             f"Expected exactly {EXPECTED_TOTAL} unique live labels, found {len(set(current_ids))}"
@@ -74,6 +87,10 @@ def main():
         "version": "final136_live_label_audit_all136_v1",
         "source_manifest": str(args.source_manifest),
         "n_frozen_source": len(source_ids),
+        "n_frozen_source_present": len(set(source_ids) & set(current_ids)),
+        "n_frozen_source_missing": len(missing_frozen_ids),
+        "missing_frozen_case_ids": missing_frozen_ids,
+        "missing_frozen_allowed": bool(args.allow_missing_frozen),
         "n_new_since_original47": len(new_ids),
         "n_total_human_gold": len(current_ids),
         "all_current_human_label_ids": current_ids,
@@ -94,6 +111,10 @@ def main():
     print("=" * 112)
     print("FINAL136 LIVE HUMAN_GOLD AUDIT — PASS")
     print(f"Frozen original47:       {len(source_ids)}")
+    print(f"Frozen present/missing:  {len(set(source_ids) & set(current_ids))} / "
+          f"{len(missing_frozen_ids)}")
+    if missing_frozen_ids:
+        print("Missing frozen IDs:      " + ", ".join(missing_frozen_ids))
     print(f"New since original47:    {len(new_ids)}")
     print(f"Total training labels:   {len(current_ids)}")
     print("Prior 9435 quarantine:   INTENTIONALLY INCLUDED")

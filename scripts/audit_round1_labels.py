@@ -150,7 +150,11 @@ def load_source_ids(path: Path):
     return payload, set(source_ids)
 
 
-def discover_round1_cases(config, source_manifest_path=DEFAULT_SOURCE_MANIFEST):
+def discover_round1_cases(
+    config,
+    source_manifest_path=DEFAULT_SOURCE_MANIFEST,
+    require_all_frozen=True,
+):
     """Return current labeled cases, frozen IDs, and newly added human-labeled cases."""
     source_manifest_path = Path(source_manifest_path)
     source_manifest, source_ids = load_source_ids(source_manifest_path)
@@ -161,7 +165,7 @@ def discover_round1_cases(config, source_manifest_path=DEFAULT_SOURCE_MANIFEST):
 
     current_ids = set(by_id)
     missing_frozen = sorted(source_ids - current_ids)
-    if missing_frozen:
+    if missing_frozen and require_all_frozen:
         raise RuntimeError(
             "Frozen source labels disappeared from the current dataset: " + ", ".join(missing_frozen)
         )

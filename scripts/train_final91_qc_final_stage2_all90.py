@@ -143,6 +143,10 @@ def run(args):
         audit.get("selection_provenance_enforced", False)
         or audit.get("training_scope_provenance_enforced", False)
     )
+    if bool(audit.get("missing_frozen_allowed", False)) != bool(args.allow_missing_frozen):
+        raise RuntimeError(
+            "Training --allow-missing-frozen policy differs from the audit metadata"
+        )
     if (
         not audit.get("all_visible_labels_passed_audit", False)
         or not provenance_ok
@@ -224,7 +228,11 @@ def run(args):
     config.include_boundary = False
     config.dropout = 0.0
     source_manifest = Path(args.source_cv_dir) / "cv_splits.json"
-    _, source_ids, by_id, _ = discover_round1_cases(config, source_manifest)
+    _, source_ids, by_id, _ = discover_round1_cases(
+        config,
+        source_manifest,
+        require_all_frozen=not args.allow_missing_frozen,
+    )
     if len(source_ids) != 47 or sorted(by_id) != audited_ids:
         raise RuntimeError("Live labels or frozen original47 source changed after audit")
     train_ids = selected_training_ids(audited_ids, args.include_quarantined)
@@ -286,6 +294,7 @@ def run(args):
     print(f"CV selected epochs:      {selected_epochs}")
     print(f"Median / final epochs:   {median_epoch} / {final_epochs}")
     print(f"Training cases:          {len(train_ids)}")
+    print(f"Missing frozen allowed:  {bool(args.allow_missing_frozen)}")
     print(f"Crop margin / jitter:    {locked['margin_min']:.0%}-{locked['margin_max']:.0%} / "
           f"{locked['center_jitter']:.0%}")
     print("Prediction:              Student+EMA 50/50 @ 0.50")
@@ -365,6 +374,8 @@ def run(args):
         "epoch_selection": "override" if args.epochs is not None else "rounded_median_cv",
         "prediction": "Student+EMA 50/50 raw ensemble @ 0.50",
         "external31_access": False,
+        "missing_frozen_case_ids": audit.get("missing_frozen_case_ids", []),
+        "missing_frozen_allowed": bool(args.allow_missing_frozen),
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print("\nFINAL STAGE-2 COMPLETE")
@@ -387,6 +398,11 @@ def build_parser():
         "--include-quarantined",
         action="store_true",
         help="Intentionally include the historically quarantined 9435... case in training.",
+    )
+    parser.add_argument(
+        "--allow-missing-frozen",
+        action="store_true",
+        help="Train the audited current cohort even if original47 cases are absent.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")

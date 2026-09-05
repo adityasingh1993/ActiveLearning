@@ -94,6 +94,10 @@ def run(args):
         audit.get("selection_provenance_enforced", False)
         or audit.get("training_scope_provenance_enforced", False)
     )
+    if bool(audit.get("missing_frozen_allowed", False)) != bool(args.allow_missing_frozen):
+        raise RuntimeError(
+            "Training --allow-missing-frozen policy differs from the audit metadata"
+        )
     if (
         not audit.get("all_visible_labels_passed_audit", False)
         or not provenance_ok
@@ -149,7 +153,11 @@ def run(args):
     config.preprocessing_mode = "resize"
     config.spatial_size = (128, 128, 128)
     source_manifest = Path(args.source_cv_dir) / "cv_splits.json"
-    _, source_ids, by_id, _ = discover_round1_cases(config, source_manifest)
+    _, source_ids, by_id, _ = discover_round1_cases(
+        config,
+        source_manifest,
+        require_all_frozen=not args.allow_missing_frozen,
+    )
     if len(source_ids) != 47 or sorted(by_id) != audited_ids:
         raise RuntimeError("Live labels or frozen original47 source changed after audit")
     train_ids = selected_training_ids(audited_ids, args.include_quarantined)
@@ -213,6 +221,7 @@ def run(args):
     print(f"Training cases:          {len(train_ids)}")
     print(f"Prior quarantine:        {'INCLUDED' if args.include_quarantined else 'EXCLUDED'}: "
           f"{QUARANTINED_CASE_ID}")
+    print(f"Missing frozen allowed:  {bool(args.allow_missing_frozen)}")
     print(f"LR / weight decay:       {learning_rate:g} / {weight_decay:g}")
     print("External31:              NOT ACCESSED")
     print("=" * 116)
@@ -285,6 +294,8 @@ def run(args):
         "final_epochs": final_epochs,
         "epoch_selection": "override" if args.epochs is not None else "rounded_median_cv",
         "external31_access": False,
+        "missing_frozen_case_ids": audit.get("missing_frozen_case_ids", []),
+        "missing_frozen_allowed": bool(args.allow_missing_frozen),
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print("\nFINAL CENTERNET COMPLETE")
@@ -307,6 +318,11 @@ def build_parser():
         "--include-quarantined",
         action="store_true",
         help="Intentionally include the historically quarantined 9435... case in training.",
+    )
+    parser.add_argument(
+        "--allow-missing-frozen",
+        action="store_true",
+        help="Train the audited current cohort even if original47 cases are absent.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
