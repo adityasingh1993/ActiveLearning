@@ -195,6 +195,7 @@ def infer_checkpoint(
     destinations,
     expected_dice,
     segment_metadata,
+    extra_metadata=None,
 ):
     transform = get_base_transforms(config, keys=["image"], is_training=False, apply_strong_aug=False)
     inverse_transform = build_invertd(
@@ -241,6 +242,7 @@ def infer_checkpoint(
                 segment_color=embedded["color"],
                 segment_layer=embedded["layer"],
                 segment_tags=embedded["tags"],
+                extra_metadata=(extra_metadata or {}).get(case_id),
             )
             verify_saved_segment_metadata(destinations[case_id], embedded)
             computed[case_id] = metrics
