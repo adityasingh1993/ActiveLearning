@@ -152,7 +152,7 @@ def diagnostic_hint(row):
 def infer_two_stage(
     config, selected_ids, images, labels, stage1_checkpoint, stage2_checkpoint,
     raw_destinations, lcc_destinations, roi_destinations, segment_metadata,
-    expected_raw, expected_lcc,
+    expected_raw, expected_lcc, extra_metadata=None,
 ):
     transform = get_base_transforms(
         config, keys=["image"], is_training=False, apply_strong_aug=False
@@ -231,12 +231,18 @@ def infer_two_stage(
                 (lcc_destinations[case_id], lcc, embedded),
                 (roi_destinations[case_id], roi, roi_metadata),
             ):
+                content = (
+                    "raw" if destination == raw_destinations[case_id]
+                    else "lcc" if destination == lcc_destinations[case_id]
+                    else "roi"
+                )
                 write_mask_with_spatial_geometry(
                     str(destination), mask.astype(np.uint8) * int(metadata["label_value"]),
                     reference_image_path=str(images[case_id]),
                     segment_name=metadata["segment_name"], segment_id=metadata["segment_id"],
                     label_value=metadata["label_value"], segment_color=metadata["color"],
                     segment_layer=metadata["layer"], segment_tags=metadata["tags"],
+                    extra_metadata=(extra_metadata or {}).get(case_id, {}).get(content),
                 )
                 verify_saved_segment_metadata(destination, metadata)
             results[case_id] = {
