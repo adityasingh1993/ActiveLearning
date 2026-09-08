@@ -18,20 +18,15 @@ if str(REPO_ROOT) not in sys.path:
 
 from hassl.config import HASSLConfig
 from scripts.audit_round1_labels import audit_case, discover_round1_cases, write_csv
+from scripts.stage2_cohort_contract import (
+    FINAL136_ALLOWED_MISSING_FROZEN_IDS as ALLOWED_MISSING_FROZEN_IDS,
+    PRIOR_QUARANTINE_ID,
+)
 
 
 SOURCE_MANIFEST = Path("experiments/cv5_supervised_47_translation12/cv_splits.json")
 OUTPUT_DIR = Path("experiments/final136_two_stage_all136/audit")
 EXPECTED_TOTAL = 136
-PRIOR_QUARANTINE_ID = (
-    "9435b1b67a41b88f6084a3e750fc54d913213ea55f33d165a1f42b9b50dd237c"
-)
-ALLOWED_MISSING_FROZEN_IDS = {
-    "81a0f3f3fa1e2ad8bd01d3915898298ffff947a83b5749846b228a612356fb2f",
-    "96165b4ca29e10f85866ca53ac68e4e44a127fe676e5745e0a94d50602819f0f",
-    "a31909b0e87f789c68489e8ebe6a5adfb72c5a19dbe5546cd762ea2f82c7037a",
-    "d8269b9a976314fb41fa63187c4b2dc05ee94e2973125df67bb5e4fd75bc7563",
-}
 
 
 def main():

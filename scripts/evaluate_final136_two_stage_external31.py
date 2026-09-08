@@ -22,6 +22,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.stage2_cohort_contract import validate_stage2_cv_summary
+
 AUDIT = Path("experiments/final136_two_stage_all136/audit/final136_live_label_audit.json")
 STAGE1_FINAL = Path("experiments/final136_two_stage_all136/stage1")
 STAGE2_FINAL = Path("experiments/final136_two_stage_all136/stage2")
@@ -218,8 +220,11 @@ def run(args):
     if QUARANTINED_CASE_ID not in training_ids:
         raise RuntimeError("Final136 must intentionally include the historical 9435... case")
     stage2_cv_summary = read_json(Path(args.stage2_cv_dir) / "stage2_vs_fullvolume_summary.json")
-    if not stage2_cv_summary.get("complete_original46_qc", False):
-        raise RuntimeError("Complete Stage-2 original46-QC OOF is required")
+    validate_stage2_cv_summary(
+        stage2_cv_summary,
+        audit,
+        expected_live=EXPECTED_TRAINING,
+    )
 
     stage1_dir, stage2_dir = Path(args.stage1_final_dir), Path(args.stage2_final_dir)
     stage1_checkpoint = stage1_dir / "final_centernet3d.pth"

@@ -11,9 +11,11 @@ Optional robust-training flags add a GT-safe wide-crop mixture, fold-local small
 oversampling, and mild ultrasound appearance augmentation. They require a fresh output directory;
 with all options disabled, the historical locked recipe and checkpoint identity are unchanged.
 
-The live 91-label dataset is unchanged. The documented uncertain case 9435... is excluded from
-training and scoring, leaving 90 QC-trainable cases and 46 QC-scorable frozen-source cases.
-External31 is never accessed.
+By default, the live 91-label dataset is unchanged: the documented uncertain case 9435... is
+excluded from training and scoring, leaving 90 QC-trainable and 46 frozen-source scoring cases.
+The explicit Final136 mode instead trains with all 136 current cases, including 9435..., while
+retaining leakage-free validation on the 42 currently available frozen-source OOF cases. The exact
+four missing frozen IDs must match the dedicated Final136 audit. External31 is never accessed.
 """
 
 import argparse
@@ -31,6 +33,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.stage2_cohort_contract import (
+    final136_mode as is_final136_count,
+    project_frozen_oof_folds,
+    resolve_stage2_cohort,
+)
 
 SOURCE_CV = Path("experiments/cv5_supervised_47_translation12")
 AUDIT = Path("experiments/round5_supervised_91_a3/final91_live_label_audit.json")
@@ -52,6 +60,10 @@ QUARANTINED_CASE_IDS = (
 
 def qc90_mode(args):
     return str(getattr(args, "split_scope", "original46")) == "qc90"
+
+
+def final136_mode(args):
+    return is_final136_count(getattr(args, "expected_live", EXPECTED_LIVE))
 
 
 def resolved_stage1_dir(args):
@@ -214,12 +226,24 @@ def recipe(args):
                 ),
             },
         })
+    if final136_mode(args):
+        result.update({
+            "version": "final136_stage2_centernet_dynunet_cv_v1",
+            "dataset_scope": "all_136_current_training_cases",
+            "heldout_evaluation": (
+                "all currently available frozen-original47 QC cases exactly once"
+            ),
+            "quarantined_case_ids": [],
+            "intentionally_included_prior_quarantine_ids": list(QUARANTINED_CASE_IDS),
+            "missing_frozen_policy": "exact approved four-case allowlist",
+        })
     if training_options.robust_enabled:
-        result["version"] = (
-            "final91_label_qc90_stage2_dynunet_oof_robust_v1"
-            if qc90_mode(args)
-            else "final91_qc_stage2_centernet_dynunet_cv_robust_v1"
-        )
+        if final136_mode(args):
+            result["version"] = "final136_stage2_centernet_dynunet_cv_robust_v1"
+        elif qc90_mode(args):
+            result["version"] = "final91_label_qc90_stage2_dynunet_oof_robust_v1"
+        else:
+            result["version"] = "final91_qc_stage2_centernet_dynunet_cv_robust_v1"
         result["training_profile"] = "oversegmentation_robust_v1"
         result = add_training_recipe_extensions(result, training_options)
     return result
@@ -227,18 +251,29 @@ def recipe(args):
 
 def dry_run(args):
     print("=" * 120)
-    print(
-        "FINAL91 LABEL-QC90 STAGE-2 OOF — DRY RUN"
-        if qc90_mode(args) else "FINAL91-QC STAGE-2 CENTERNET -> DYNUNET — DRY RUN"
-    )
+    if final136_mode(args):
+        print("FINAL136 STAGE-2 CENTERNET -> DYNUNET — DRY RUN")
+    else:
+        print(
+            "FINAL91 LABEL-QC90 STAGE-2 OOF — DRY RUN"
+            if qc90_mode(args) else "FINAL91-QC STAGE-2 CENTERNET -> DYNUNET — DRY RUN"
+        )
     print(f"Folds:                    {parse_fold(args.fold)}")
-    print("Live / QC trainable:      91 / 90")
-    print(f"OOF scorable:             {90 if qc90_mode(args) else 46}")
+    if final136_mode(args):
+        print("Live / trainable:         136 / 136")
+        print("OOF scorable:             42 available original-QC cases")
+        print("Per fold:                 train=136 minus usable frozen validation subset")
+        print("Prior 9435 quarantine:    INCLUDED as train-only")
+        print("Missing frozen:           exact approved four-case allowlist")
+    else:
+        print("Live / QC trainable:      91 / 90")
+        print(f"OOF scorable:             {90 if qc90_mode(args) else 46}")
     if qc90_mode(args):
         print("Per fold:                 train=72 / validation=18")
         print("Crop miss policy:         record detector miss + use full grid for QC segmentation")
         print("Role:                     annotation diagnosis; not final model validation")
-    print(f"Quarantined:              {QUARANTINED_CASE_IDS[0]}")
+    if not final136_mode(args):
+        print(f"Quarantined:              {QUARANTINED_CASE_IDS[0]}")
     print(f"Frozen Stage-1:           {resolved_stage1_dir(args)}")
     print(
         f"Training crop:            GT box + random {args.train_margin_min:.0%}-"
@@ -504,31 +539,31 @@ def run(args):
             raise RuntimeError("Source manifest is not frozen original47")
 
         audit = read_json(args.audit_metadata)
-        if not audit.get("all_visible_labels_passed_audit", False):
-            raise RuntimeError("Final91 live-label audit is not passing")
-        if not audit.get("selection_provenance_enforced", False):
-            raise RuntimeError("Final91 audit did not enforce selection provenance")
-        audited_ids = sorted(str(x) for x in audit.get("all_current_human_label_ids", []))
-        if len(audited_ids) != EXPECTED_LIVE:
-            raise RuntimeError("Final91 audit must contain exactly 91 labels")
-        _, discovered_source, by_id, _ = discover_round1_cases(config, source_path)
+        _, discovered_source, by_id, _ = discover_round1_cases(
+            config,
+            source_path,
+            require_all_frozen=not args.allow_missing_frozen,
+        )
         current_ids = sorted(str(x) for x in by_id)
-        if current_ids != audited_ids or sorted(str(x) for x in discovered_source) != source_ids:
-            raise RuntimeError("Live labels or frozen source changed after Final91 audit")
-
-        quarantine = sorted(set(QUARANTINED_CASE_IDS))
-        if set(quarantine) - set(source_ids) or set(quarantine) - set(current_ids):
-            raise RuntimeError("Configured quarantine is absent from source or live labels")
-        extras = sorted(set(current_ids) - set(source_ids))
-        if len(extras) != EXPECTED_EXTRA:
-            raise RuntimeError("Expected exactly 44 train-only labels beyond original47")
-        clean_current = sorted(set(current_ids) - set(quarantine))
-        scorable = clean_current if qc90_mode(args) else sorted(set(source_ids) - set(quarantine))
-        expected_scorable = EXPECTED_QC_TRAINABLE if qc90_mode(args) else EXPECTED_SCORABLE
-        if len(scorable) != expected_scorable:
-            raise RuntimeError(f"Expected exactly {expected_scorable} QC-scorable cases")
-        if len(clean_current) != EXPECTED_QC_TRAINABLE:
-            raise RuntimeError("Expected exactly 90 QC-trainable cases")
+        if sorted(str(x) for x in discovered_source) != source_ids:
+            raise RuntimeError("Frozen original47 source manifest changed")
+        cohort = resolve_stage2_cohort(
+            audit,
+            source_ids,
+            current_ids,
+            expected_live=args.expected_live,
+            expected_trainable=args.expected_trainable,
+            include_quarantined=args.include_quarantined,
+            allow_missing_frozen=args.allow_missing_frozen,
+            split_scope=args.split_scope,
+        )
+        training_ids = cohort["training_ids"]
+        quarantine = cohort["training_quarantined_case_ids"]
+        stage1_quarantine = cohort["stage1_quarantined_case_ids"]
+        extras = cohort["extra_ids"]
+        scorable = (
+            training_ids if qc90_mode(args) else cohort["scorable_ids"]
+        )
 
         stage1_dir = resolved_stage1_dir(args)
         stage1_gate = read_json(stage1_dir / "centernet3d_gate_summary.json")
@@ -544,7 +579,7 @@ def run(args):
                 raise RuntimeError("Stage-1 CenterNet safety gate has not passed")
             if not stage1_gate.get("complete_original46_qc_oof", False):
                 raise RuntimeError("Stage-1 gate is not complete for original46-QC")
-        if sorted(stage1_gate.get("quarantined_case_ids", [])) != quarantine:
+        if sorted(stage1_gate.get("quarantined_case_ids", [])) != stage1_quarantine:
             raise RuntimeError("Stage-1 quarantine provenance differs")
         stage1_plan = read_json(stage1_dir / "centernet3d_cv_plan.json")
         if stage1_plan.get("resize_size") != [128, 128, 128]:
@@ -553,10 +588,17 @@ def run(args):
             raise RuntimeError("Stage-1 did not use the locked 50% safety margin")
 
         crop_rows_list = read_csv(stage1_dir / "centernet3d_oof_metrics.csv")
-        crop_rows = {str(row["case_id"]): dict(row) for row in crop_rows_list}
-        if len(crop_rows_list) != expected_scorable or set(crop_rows) != set(scorable):
-            raise RuntimeError("Stage-1 OOF crop table does not match the requested QC population")
-        if set(crop_rows) & set(quarantine):
+        all_crop_rows = {str(row["case_id"]): dict(row) for row in crop_rows_list}
+        expected_stage1_oof = sorted(set(source_ids) - set(stage1_quarantine))
+        if qc90_mode(args):
+            expected_stage1_oof = scorable
+        if (
+            len(crop_rows_list) != len(expected_stage1_oof)
+            or set(all_crop_rows) != set(expected_stage1_oof)
+        ):
+            raise RuntimeError("Stage-1 OOF crop table differs from its frozen population")
+        crop_rows = {case_id: all_crop_rows[case_id] for case_id in scorable}
+        if set(crop_rows) & set(stage1_quarantine):
             raise RuntimeError("Quarantined case appears in Stage-1 crop table")
         for case_id, row in crop_rows.items():
             coverage = float(row["gt_crop_coverage"])
@@ -579,19 +621,29 @@ def run(args):
 
         fold_specs, held_out = [], []
         checkpoint_provenance = []
-        split_rows = (
-            stage1_plan.get("folds", []) if qc90_mode(args) else manifest.get("folds", [])
-        )
-        for original in split_rows:
-            fold = int(original["fold"])
-            if qc90_mode(args):
-                val_ids = sorted(str(x) for x in original["val_ids"])
-                train_ids = sorted(str(x) for x in original["train_ids"])
-            else:
-                val_ids = sorted(set(str(x) for x in original["val_ids"]) - set(quarantine))
-                train_ids = sorted(
-                    (set(str(x) for x in original["train_ids"]) | set(extras)) - set(quarantine)
-                )
+        if qc90_mode(args):
+            projected_specs = [
+                {
+                    "fold": int(original["fold"]),
+                    "train_ids": sorted(str(x) for x in original["train_ids"]),
+                    "val_ids": sorted(str(x) for x in original["val_ids"]),
+                }
+                for original in stage1_plan.get("folds", [])
+            ]
+            checkpoint_val_ids = {
+                int(spec["fold"]): spec["val_ids"] for spec in projected_specs
+            }
+        else:
+            projected_specs, checkpoint_val_ids = project_frozen_oof_folds(
+                manifest.get("folds", []),
+                training_ids,
+                scorable,
+                stage1_quarantine,
+            )
+        for projected in projected_specs:
+            fold = int(projected["fold"])
+            val_ids = projected["val_ids"]
+            train_ids = projected["train_ids"]
             if set(train_ids) & set(val_ids) or set(quarantine) & (set(train_ids) | set(val_ids)):
                 raise RuntimeError(f"Fold {fold}: leakage or quarantine violation")
             if any(int(float(crop_rows[x]["fold"])) != fold for x in val_ids):
@@ -600,13 +652,16 @@ def run(args):
             if not checkpoint.exists():
                 raise FileNotFoundError(checkpoint)
             state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-            if sorted(str(x) for x in state.get("val_ids", [])) != val_ids:
+            if sorted(str(x) for x in state.get("val_ids", [])) != checkpoint_val_ids[fold]:
                 raise RuntimeError(f"Fold {fold}: CenterNet checkpoint val IDs differ")
-            checkpoint_provenance.append({
+            checkpoint_record = {
                 "fold": fold, "checkpoint": str(checkpoint),
                 "selected_epoch": int(state.get("epoch", -1)),
                 "validation_summary": state.get("validation_summary", {}),
-            })
+            }
+            if final136_mode(args):
+                checkpoint_record["usable_validation_ids"] = val_ids
+            checkpoint_provenance.append(checkpoint_record)
             fold_specs.append({"fold": fold, "train_ids": train_ids, "val_ids": val_ids})
             held_out.extend(val_ids)
         if sorted(held_out) != scorable or len(fold_specs) != 5:
@@ -624,7 +679,7 @@ def run(args):
                         raise RuntimeError(f"Baseline fold mismatch for {case_id}")
         return (
             config, by_id, extras, quarantine, scorable, fold_specs,
-            crop_rows, checkpoint_provenance, baseline, source_path,
+            crop_rows, checkpoint_provenance, baseline, source_path, cohort,
         )
 
     def train_metrics(logits, target):
@@ -787,7 +842,7 @@ def run(args):
         torch.cuda.empty_cache()
         return rows
 
-    def compare_to_baseline(rows, baseline):
+    def compare_to_baseline(rows, baseline, expected_scorable, missing_frozen):
         comparisons = []
         for row in rows:
             case_id = str(row["case_id"])
@@ -818,13 +873,20 @@ def run(args):
         base_dice = [x["fullvolume_dice"] for x in comparisons]
         raw_delta = [x["raw_delta_dice"] for x in comparisons]
         lcc_delta = [x["lcc_delta_dice"] for x in comparisons]
+        completed_folds = sorted({int(x["fold"]) for x in comparisons})
+        complete_available = (
+            len(comparisons) == int(expected_scorable)
+            and len({str(x["case_id"]) for x in comparisons}) == int(expected_scorable)
+            and completed_folds == list(range(5))
+        )
         summary = {
             "version": "final91_qc_stage2_vs_fullvolume_v1",
             "n": len(comparisons),
-            "completed_folds": sorted({int(x["fold"]) for x in comparisons}),
+            "completed_folds": completed_folds,
             "complete_original46_qc": (
-                len(comparisons) == EXPECTED_SCORABLE
-                and {int(x["fold"]) for x in comparisons} == set(range(5))
+                complete_available
+                and int(expected_scorable) == EXPECTED_SCORABLE
+                and not missing_frozen
             ),
             "mean_dice": {
                 "fullvolume_final91_a3": mean(base_dice),
@@ -853,11 +915,33 @@ def run(args):
                 "Stage 2 correctly excludes it."
             ),
         }
+        if final136_mode(args):
+            summary.update({
+                "version": "final136_stage2_vs_fullvolume_available_frozen_v1",
+                "complete_available_frozen_source_oof": complete_available,
+                "n_live_human_gold": int(args.expected_live),
+                "n_training_cases": int(
+                    args.expected_trainable
+                    or (
+                        args.expected_live
+                        if args.include_quarantined
+                        else args.expected_live - 1
+                    )
+                ),
+                "n_available_frozen_source_scorable": int(expected_scorable),
+                "missing_frozen_case_ids": list(missing_frozen),
+                "external31_access": False,
+                "comparison_note": (
+                    "Final136 uses all 136 current labels for fold training except each usable "
+                    "frozen-source validation subset. The historical 9435... case is included "
+                    "as train-only; the exact four approved missing frozen cases are not scored."
+                ),
+            })
         return comparisons, summary
 
     (
         config, by_id, extras, quarantine, scorable, specs,
-        crop_rows, stage1_checkpoints, baseline, source_path,
+        crop_rows, stage1_checkpoints, baseline, source_path, cohort,
     ) = preflight()
     selected_folds = parse_fold(args.fold)
     output_dir = resolved_output_dir(args)
@@ -884,13 +968,23 @@ def run(args):
         "full_volume_baseline_sha256": (
             None if qc90_mode(args) else file_sha256(args.full_volume_baseline)
         ),
-        "n_live_human_gold": EXPECTED_LIVE,
-        "n_qc_trainable": EXPECTED_QC_TRAINABLE,
+        "n_live_human_gold": int(args.expected_live),
+        "n_qc_trainable": len(cohort["training_ids"]),
         "n_scorable_source": len(scorable),
         "quarantined_case_ids": quarantine,
         "train_only_extra_ids": [] if qc90_mode(args) else extras,
         "folds": specs,
     }
+    if final136_mode(args):
+        plan.update({
+            "missing_frozen_case_ids": cohort["missing_frozen_case_ids"],
+            "stage1_quarantined_case_ids": cohort["stage1_quarantined_case_ids"],
+            "intentionally_included_prior_quarantine_ids": (
+                cohort["intentionally_included_prior_quarantine_ids"]
+            ),
+            "train_only_case_ids": cohort["train_only_ids"],
+            "training_scope": "all136_current_with_available_frozen_source_oof",
+        })
     if qc90_mode(args):
         plan.update({"split_scope": "qc90", "save_oof_masks": bool(args.save_oof_masks)})
     plan_path = output_dir / "stage2_cv_plan.json"
@@ -903,18 +997,32 @@ def run(args):
     if device.type != "cuda":
         raise RuntimeError("Stage-2 DynUNet training requires CUDA")
     print("=" * 120)
-    print(
-        "FINAL91 FIVE-FOLD LABEL-QC — TWO-STAGE OOF"
-        if qc90_mode(args) else "FINAL91-QC TWO-STAGE BLADDER SEGMENTATION — STAGE 2"
-    )
+    if final136_mode(args):
+        print("FINAL136 TWO-STAGE BLADDER SEGMENTATION — STAGE 2 CV")
+    else:
+        print(
+            "FINAL91 FIVE-FOLD LABEL-QC — TWO-STAGE OOF"
+            if qc90_mode(args) else "FINAL91-QC TWO-STAGE BLADDER SEGMENTATION — STAGE 2"
+        )
     print(f"Running folds:            {selected_folds}")
-    print(f"Data:                     91 live | 90 QC-trainable | {len(scorable)} OOF-scorable")
-    print(f"Quarantined:              {quarantine[0]}")
+    print(
+        f"Data:                     {args.expected_live} live | "
+        f"{len(cohort['training_ids'])} trainable | {len(scorable)} OOF-scorable"
+    )
+    if quarantine:
+        print(f"Quarantined:              {', '.join(quarantine)}")
+    else:
+        print(f"Prior 9435 quarantine:    INCLUDED as train-only")
+    if cohort["missing_frozen_case_ids"]:
+        print(f"Missing frozen allowed:   {len(cohort['missing_frozen_case_ids'])} exact IDs")
     if qc90_mode(args):
         print("Frozen Stage 1:           matching QC90 OOF CenterNet; every case held out")
         print("Detector crop miss:       full-grid fallback for diagnosis only; recorded per case")
     else:
-        print("Frozen Stage 1:           CenterNet gate PASS; 46/46 complete coverage")
+        print(
+            f"Frozen Stage 1:           CenterNet gate PASS; "
+            f"{len(scorable)}/{len(scorable)} available-case coverage"
+        )
     print("Training crop:            GT + randomized safe margin/jitter")
     if args.train_wide_crop_probability > 0.0:
         print(
@@ -990,10 +1098,18 @@ def run(args):
         print(f"QC crop fallbacks:    {summary['qc_full_grid_fallbacks']}")
         print("Interpretation:       low OOF Dice selects review candidates; it does not prove bad GT")
     else:
-        comparisons, comparison_summary = compare_to_baseline(combined, baseline)
+        comparisons, comparison_summary = compare_to_baseline(
+            combined,
+            baseline,
+            expected_scorable=len(scorable),
+            missing_frozen=cohort["missing_frozen_case_ids"],
+        )
         write_csv(output_dir / "stage2_vs_fullvolume_case_comparison.csv", comparisons)
         write_json(output_dir / "stage2_vs_fullvolume_summary.json", comparison_summary)
-        print("STAGE-2 vs FULL-VOLUME FINAL91-A3")
+        print(
+            "FINAL136 STAGE-2 vs FULL-VOLUME FINAL91-A3 ON AVAILABLE FROZEN CASES"
+            if final136_mode(args) else "STAGE-2 vs FULL-VOLUME FINAL91-A3"
+        )
         print(f"Cases / folds:       {len(combined)} / {comparison_summary['completed_folds']}")
         print(
             f"Mean Dice:           {comparison_summary['mean_dice']['fullvolume_final91_a3']:.4f} -> "
@@ -1010,13 +1126,21 @@ def run(args):
             f"+>=.05={comparison_summary['case_effects_raw']['improved_ge_0p05']} | "
             f"<=-.05={comparison_summary['case_effects_raw']['worsened_le_minus_0p05']}"
         )
-        print(f"Complete original46-QC: {comparison_summary['complete_original46_qc']}")
+        if final136_mode(args):
+            print(
+                "Complete available frozen-source OOF: "
+                f"{comparison_summary['complete_available_frozen_source_oof']}"
+            )
+        else:
+            print(f"Complete original46-QC: {comparison_summary['complete_original46_qc']}")
     print(f"Results:             {results_path}")
     print("=" * 120)
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Final91-QC Stage-2 CenterNet-cropped DynUNet CV")
+    parser = argparse.ArgumentParser(
+        description="Audited Final91/Final136 Stage-2 CenterNet-cropped DynUNet CV"
+    )
     parser.add_argument("--config", required=True)
     parser.add_argument("--audit-metadata", default=str(AUDIT))
     parser.add_argument("--source-cv-dir", default=str(SOURCE_CV))
@@ -1024,8 +1148,29 @@ def build_parser():
     parser.add_argument("--full-volume-baseline", default=str(FULL_VOLUME_BASELINE))
     parser.add_argument("--output-dir", default=str(OUTPUT))
     parser.add_argument(
+        "--expected-live",
+        type=int,
+        choices=(91, 136),
+        default=EXPECTED_LIVE,
+        help="audited live cohort size; 136 activates the explicit Final136 contract",
+    )
+    parser.add_argument("--expected-trainable", type=int, default=None)
+    parser.add_argument(
+        "--include-quarantined",
+        action="store_true",
+        help="include the historical 9435... case as train-only (required for Final136)",
+    )
+    parser.add_argument(
+        "--allow-missing-frozen",
+        action="store_true",
+        help="allow only the exact four frozen IDs approved by the Final136 audit",
+    )
+    parser.add_argument(
         "--split-scope", choices=("original46", "qc90"), default="original46",
-        help="original46 preserves performance CV; qc90 holds out all 90 clean labels once",
+        help=(
+            "original46 preserves frozen-source performance CV; qc90 holds out all 90 "
+            "Final91 clean labels once"
+        ),
     )
     parser.add_argument("--fold", default="2", help="all, 0..4, or comma-separated subset; default 2")
     parser.add_argument("--gpu", default="0")
@@ -1077,6 +1222,25 @@ def main():
         parser.error(str(exc))
     if args.epochs < 1 or args.validation_every_n_epochs < 1:
         parser.error("epochs and validation cadence must be >=1")
+    if args.expected_trainable is not None and args.expected_trainable < 1:
+        parser.error("--expected-trainable must be >=1")
+    if final136_mode(args):
+        if args.split_scope != "original46":
+            parser.error("Final136 requires --split-scope original46")
+        if not args.include_quarantined or not args.allow_missing_frozen:
+            parser.error(
+                "Final136 requires --include-quarantined and --allow-missing-frozen"
+            )
+        if args.expected_trainable not in (None, 136):
+            parser.error("Final136 requires --expected-trainable 136")
+        if Path(args.audit_metadata).resolve() == AUDIT.resolve():
+            parser.error("Final136 requires its explicit --audit-metadata path")
+        if resolved_output_dir(args).resolve() == OUTPUT.resolve():
+            parser.error("Final136 requires a fresh explicit --output-dir")
+    elif args.include_quarantined or args.allow_missing_frozen:
+        parser.error(
+            "Final91 mode cannot use --include-quarantined or --allow-missing-frozen"
+        )
     if args.crop_size < 32 or args.crop_size % 16:
         parser.error("--crop-size must be >=32 and divisible by 16")
     if not 0 <= args.train_margin_min <= args.train_margin_max <= 1:

@@ -20,6 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.stage2_cohort_contract import validate_stage2_cv_summary
+
 AUDIT = Path("experiments/round5_supervised_91_a3/final91_live_label_audit.json")
 SOURCE_CV = Path("experiments/cv5_supervised_47_translation12")
 STAGE1_CV = Path("experiments/final91_qc_stage1_centernet3d_cv")
@@ -130,8 +132,11 @@ def run(args):
     ):
         raise RuntimeError("Complete passing Stage-1 original46-QC gate is required")
     stage2_summary = read_json(Path(args.stage2_cv_dir) / "stage2_vs_fullvolume_summary.json")
-    if not stage2_summary.get("complete_original46_qc", False):
-        raise RuntimeError("Complete Stage-2 original46-QC OOF comparison is required")
+    validate_stage2_cv_summary(
+        stage2_summary,
+        audit,
+        expected_live=args.expected_live,
+    )
 
     cv_states, selected_epochs = [], []
     for fold in range(5):
