@@ -7,6 +7,10 @@ margins and jitter; held-out evaluation uses only the corresponding fold's actua
 Every crop prediction is resized and pasted back into the full 128^3 model grid before metrics are
 calculated. Raw and largest-connected-component results are both reported.
 
+Optional robust-training flags add a GT-safe wide-crop mixture, fold-local small-bladder
+oversampling, and mild ultrasound appearance augmentation. They require a fresh output directory;
+with all options disabled, the historical locked recipe and checkpoint identity are unchanged.
+
 The live 91-label dataset is unchanged. The documented uncertain case 9435... is excluded from
 training and scoring, leaving 90 QC-trainable cases and 46 QC-scorable frozen-source cases.
 External31 is never accessed.
@@ -134,7 +138,30 @@ def median(values):
     return values[middle] if len(values) % 2 else 0.5 * (values[middle - 1] + values[middle])
 
 
+def stage2_training_options(args):
+    from hassl.data.stage2_training import Stage2TrainingOptions
+
+    return Stage2TrainingOptions(
+        output_size=int(args.crop_size),
+        margin_min=float(args.train_margin_min),
+        margin_max=float(args.train_margin_max),
+        center_jitter=float(args.train_center_jitter),
+        wide_crop_probability=float(getattr(args, "train_wide_crop_probability", 0.0)),
+        wide_margin_min=float(getattr(args, "train_wide_margin_min", 0.60)),
+        wide_margin_max=float(getattr(args, "train_wide_margin_max", 1.00)),
+        wide_center_jitter=float(getattr(args, "train_wide_center_jitter", 0.20)),
+        small_bladder_quantile=float(getattr(args, "small_bladder_quantile", 1.0 / 3.0)),
+        small_bladder_weight=float(getattr(args, "small_bladder_weight", 1.0)),
+        mild_appearance_augmentation=bool(
+            getattr(args, "mild_appearance_augmentation", False)
+        ),
+    ).validate()
+
+
 def recipe(args):
+    from hassl.data.stage2_training import add_training_recipe_extensions
+
+    training_options = stage2_training_options(args)
     result = {
         "version": "final91_qc_stage2_centernet_dynunet_cv_v1",
         "architecture": "DynUNet",
@@ -187,6 +214,14 @@ def recipe(args):
                 ),
             },
         })
+    if training_options.robust_enabled:
+        result["version"] = (
+            "final91_label_qc90_stage2_dynunet_oof_robust_v1"
+            if qc90_mode(args)
+            else "final91_qc_stage2_centernet_dynunet_cv_robust_v1"
+        )
+        result["training_profile"] = "oversegmentation_robust_v1"
+        result = add_training_recipe_extensions(result, training_options)
     return result
 
 
@@ -209,6 +244,21 @@ def dry_run(args):
         f"Training crop:            GT box + random {args.train_margin_min:.0%}-"
         f"{args.train_margin_max:.0%} margin + safe {args.train_center_jitter:.0%} center jitter"
     )
+    if args.train_wide_crop_probability > 0.0:
+        print(
+            f"Wide-crop mixture:        p={args.train_wide_crop_probability:.0%}; "
+            f"margin={args.train_wide_margin_min:.0%}-{args.train_wide_margin_max:.0%}; "
+            f"jitter={args.train_wide_center_jitter:.0%}"
+        )
+    if args.small_bladder_weight > 1.0:
+        print(
+            f"Small-bladder sampling:   bottom {args.small_bladder_quantile:.0%} at "
+            f"{args.small_bladder_weight:.2f}x weight"
+        )
+    print(
+        "Mild appearance aug:      "
+        + ("contrast + intensity + speckle" if args.mild_appearance_augmentation else "OFF")
+    )
     print("Validation crop:          actual frozen OOF CenterNet coordinates")
     print(f"Crop network input:       {args.crop_size}^3")
     print(f"Epochs / validation:      {args.epochs} / every {args.validation_every_n_epochs}")
@@ -224,13 +274,7 @@ def run(args):
     import torch.nn.functional as F
     from monai.data import CacheDataset, DataLoader
     from monai.metrics import HausdorffDistanceMetric
-    from monai.transforms import (
-        Compose,
-        MapTransform,
-        RandAffined,
-        RandFlipd,
-        RandomizableTransform,
-    )
+    from monai.transforms import Compose, MapTransform
     from monai.utils import set_determinism
 
     try:
@@ -240,30 +284,16 @@ def run(args):
 
     from hassl.config import HASSLConfig
     import hassl.data.data_engine as data_engine
+    from hassl.data.stage2_training import (
+        build_small_bladder_sampler,
+        build_stage2_training_transform,
+        crop_and_resize_pair,
+        plain_tensor,
+    )
     from hassl.training.ema import EMATeacher
     from hassl.training.losses import CombinedSegLoss
     from hassl.training.trainer import build_network, compute_multiscale_loss
     from scripts.audit_round1_labels import discover_round1_cases
-
-    def plain_tensor(value):
-        return value.as_tensor() if hasattr(value, "as_tensor") else torch.as_tensor(value)
-
-    def crop_and_resize(image, label, bounds, output_size):
-        z0, z1, y0, y1, x0, x1 = [int(x) for x in bounds]
-        image_t = plain_tensor(image).float()
-        label_t = plain_tensor(label).float()
-        image_crop = image_t[:, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1]
-        label_crop = label_t[:, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1]
-        if image_crop.numel() == 0 or label_crop.numel() == 0:
-            raise RuntimeError(f"Empty crop from bounds {bounds}")
-        target_size = (int(output_size),) * 3
-        image_out = F.interpolate(
-            image_crop.unsqueeze(0), size=target_size, mode="trilinear", align_corners=False
-        )[0]
-        label_out = F.interpolate(
-            label_crop.unsqueeze(0), size=target_size, mode="nearest"
-        )[0]
-        return image_out, (label_out > 0.5).float()
 
     def spacing_from_image(image, fallback):
         try:
@@ -275,47 +305,6 @@ def run(args):
             ], dtype=torch.float32)
         except Exception:
             return torch.tensor([float(x) for x in fallback], dtype=torch.float32)
-
-    class SafeGTBoxCropd(RandomizableTransform):
-        def __init__(self, output_size, margin_min, margin_max, center_jitter):
-            super().__init__(prob=1.0)
-            self.output_size = int(output_size)
-            self.margin_min = float(margin_min)
-            self.margin_max = float(margin_max)
-            self.center_jitter = float(center_jitter)
-
-        def __call__(self, data):
-            result = dict(data)
-            self.randomize(None)
-            label = plain_tensor(result["label"])
-            spatial = label[0] if label.ndim == 4 else label
-            coords = torch.nonzero(spatial > 0.5, as_tuple=False)
-            if coords.numel() == 0:
-                raise RuntimeError(f"Empty Stage-2 training GT: {result.get('id', '?')}")
-            gt_lo = coords.min(dim=0).values.cpu().numpy().astype(float)
-            gt_hi = coords.max(dim=0).values.cpu().numpy().astype(float)
-            gt_size = gt_hi - gt_lo + 1.0
-            gt_center = 0.5 * (gt_lo + gt_hi)
-            margin = float(self.R.uniform(self.margin_min, self.margin_max))
-            shift = self.R.uniform(
-                low=-self.center_jitter, high=self.center_jitter, size=3
-            ) * gt_size
-            proposed_center = gt_center + shift
-            proposed_size = gt_size * (1.0 + 2.0 * margin)
-            lo = np.floor(proposed_center - 0.5 * proposed_size).astype(int)
-            hi = np.ceil(proposed_center + 0.5 * proposed_size).astype(int)
-            # The randomized crop may move, but it is never allowed to cut the known GT.
-            lo = np.minimum(lo, gt_lo.astype(int))
-            hi = np.maximum(hi, gt_hi.astype(int))
-            shape = np.asarray(spatial.shape, dtype=int)
-            lo = np.maximum(lo, 0)
-            hi = np.minimum(hi, shape - 1)
-            bounds = (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2])
-            result["image"], result["label"] = crop_and_resize(
-                result["image"], result["label"], bounds, self.output_size
-            )
-            result["training_crop_bounds"] = torch.tensor(bounds, dtype=torch.int64)
-            return result
 
     class FixedCenterNetCropd(MapTransform):
         def __init__(self, crop_rows, output_size, fallback_spacing):
@@ -340,7 +329,7 @@ def run(args):
                 result["image"], self.fallback_spacing
             )
             result["crop_bounds"] = torch.tensor(bounds, dtype=torch.int64)
-            result["image"], result["label"] = crop_and_resize(
+            result["image"], result["label"] = crop_and_resize_pair(
                 result["image"], result["label"], bounds, self.output_size
             )
             return result
@@ -349,34 +338,20 @@ def run(args):
         base = data_engine.get_base_transforms(
             config, keys=["image", "label"], is_training=False, apply_strong_aug=False
         )
-        steps = list(getattr(base, "transforms", [base]))
         if training:
-            steps.extend([
-                SafeGTBoxCropd(
-                    args.crop_size, args.train_margin_min,
-                    args.train_margin_max, args.train_center_jitter,
-                ),
-                RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
-                RandAffined(
-                    keys=["image", "label"], prob=0.5,
-                    rotate_range=(0.0, 0.0, 0.0),
-                    translate_range=(4.0, 4.0, 4.0),
-                    scale_range=(0.0, 0.0, 0.0),
-                    mode=("bilinear", "nearest"), padding_mode="zeros",
-                ),
-            ])
-        else:
-            steps.append(FixedCenterNetCropd(crop_rows, args.crop_size, config.spacing))
+            return build_stage2_training_transform(base, stage2_training_options(args))
+        steps = list(getattr(base, "transforms", [base]))
+        steps.append(FixedCenterNetCropd(crop_rows, args.crop_size, config.spacing))
         return Compose(steps)
 
-    def make_loader(items, transform, training, config):
+    def make_loader(items, transform, training, config, sampler=None):
         workers = int(getattr(config, "num_workers", 0))
         dataset = CacheDataset(
             items, transform=transform, cache_rate=1.0,
             copy_cache=False, num_workers=workers,
         )
         return DataLoader(
-            dataset, batch_size=1, shuffle=training,
+            dataset, batch_size=1, shuffle=bool(training and sampler is None), sampler=sampler,
             num_workers=workers if training else 0,
             pin_memory=torch.cuda.is_available(),
         )
@@ -700,9 +675,14 @@ def run(args):
             make_transforms(config, False, crop_rows), False, config,
         )
         if state_name == "new":
+            train_items = [by_id[x] for x in spec["train_ids"]]
+            sampler, sampling_audit = build_small_bladder_sampler(
+                train_items, stage2_training_options(args), seed=seed + 10000
+            )
+            write_json(fold_dir / "training_sampling.json", sampling_audit)
             train_loader = make_loader(
-                [by_id[x] for x in spec["train_ids"]],
-                make_transforms(config, True, crop_rows), True, config,
+                train_items,
+                make_transforms(config, True, crop_rows), True, config, sampler=sampler,
             )
             student = build_network("dynunet", 1, 0.0).to(device)
             ema = EMATeacher(student).to(device)
@@ -715,6 +695,7 @@ def run(args):
             for epoch in range(1, args.epochs + 1):
                 student.train()
                 losses, dices, precisions, recalls = [], [], [], []
+                wide_draws, gt_fractions = [], []
                 for batch in train_loader:
                     image = batch["image"].to(device, non_blocking=True)
                     target = batch["label"].float().to(device, non_blocking=True)
@@ -733,6 +714,8 @@ def run(args):
                     dices.append(metrics["dice"])
                     precisions.append(metrics["precision"])
                     recalls.append(metrics["recall"])
+                    wide_draws.append(float(batch["training_crop_is_wide"].float().mean().item()))
+                    gt_fractions.append(float(target.float().mean().item()))
                 validate_now = (
                     epoch == 1 or epoch == args.epochs
                     or epoch % args.validation_every_n_epochs == 0
@@ -740,7 +723,8 @@ def run(args):
                 prefix = (
                     f"Fold {fold} | epoch {epoch:03d}/{args.epochs} | "
                     f"TRAIN loss={mean(losses):.4f} dice={mean(dices):.4f} "
-                    f"prec={mean(precisions):.4f} rec={mean(recalls):.4f}"
+                    f"prec={mean(precisions):.4f} rec={mean(recalls):.4f} "
+                    f"wide={mean(wide_draws):.2f} gt_frac={mean(gt_fractions):.4f}"
                 )
                 if validate_now:
                     rows, raw_summary, lcc_summary = evaluate(
@@ -762,12 +746,14 @@ def run(args):
                             "epoch": epoch, "best_key": list(key),
                             "validation_raw": raw_summary, "validation_lcc": lcc_summary,
                             "train_ids": spec["train_ids"], "val_ids": spec["val_ids"],
+                            "training_sampling": sampling_audit,
                             "recipe": recipe(args),
                         }, best_path)
                 else:
                     print(prefix + f" | VALID skipped (every {args.validation_every_n_epochs})")
             write_json(fold_dir / "training_complete.json", {
                 "fold": fold, "epochs": int(args.epochs), "best_checkpoint": str(best_path),
+                "training_sampling": sampling_audit,
                 "recipe": recipe(args),
             })
             del student, ema
@@ -930,6 +916,21 @@ def run(args):
     else:
         print("Frozen Stage 1:           CenterNet gate PASS; 46/46 complete coverage")
     print("Training crop:            GT + randomized safe margin/jitter")
+    if args.train_wide_crop_probability > 0.0:
+        print(
+            f"Wide crop:                p={args.train_wide_crop_probability:.0%} | "
+            f"margin={args.train_wide_margin_min:.0%}-{args.train_wide_margin_max:.0%} | "
+            f"jitter={args.train_wide_center_jitter:.0%}"
+        )
+    if args.small_bladder_weight > 1.0:
+        print(
+            f"Small oversampling:       bottom {args.small_bladder_quantile:.0%} | "
+            f"weight={args.small_bladder_weight:.2f}x | fold-local training labels only"
+        )
+    print(
+        "Appearance augmentation: "
+        + ("mild contrast/intensity/speckle" if args.mild_appearance_augmentation else "OFF")
+    )
     print("Validation crop:          actual OOF CenterNet crop")
     print("Stage 2:                  DynUNet + DiceCE + Student/EMA ensemble @ .50")
     print("Metrics:                  full-grid RAW + LCC")
@@ -1034,6 +1035,25 @@ def build_parser():
     parser.add_argument("--train-margin-min", type=float, default=0.40)
     parser.add_argument("--train-margin-max", type=float, default=0.60)
     parser.add_argument("--train-center-jitter", type=float, default=0.10)
+    parser.add_argument(
+        "--train-wide-crop-probability", type=float, default=0.0,
+        help="probability of replacing the locked crop with a wider GT-safe crop",
+    )
+    parser.add_argument("--train-wide-margin-min", type=float, default=0.60)
+    parser.add_argument("--train-wide-margin-max", type=float, default=1.00)
+    parser.add_argument("--train-wide-center-jitter", type=float, default=0.20)
+    parser.add_argument(
+        "--small-bladder-quantile", type=float, default=1.0 / 3.0,
+        help="training-only native physical-volume quantile defining SMALL",
+    )
+    parser.add_argument(
+        "--small-bladder-weight", type=float, default=1.0,
+        help="WeightedRandomSampler weight for SMALL training cases; 1 disables oversampling",
+    )
+    parser.add_argument(
+        "--mild-appearance-augmentation", action="store_true",
+        help="add mild contrast, intensity-scale, and multiplicative-speckle augmentation",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--ema-decay", type=float, default=0.99)
@@ -1063,12 +1083,30 @@ def main():
         parser.error("Require 0 <= train-margin-min <= train-margin-max <= 1")
     if not 0 <= args.train_center_jitter <= 0.5:
         parser.error("--train-center-jitter must be in [0,0.5]")
+    if not 0 <= args.train_wide_crop_probability <= 1:
+        parser.error("--train-wide-crop-probability must be in [0,1]")
+    if not 0 <= args.train_wide_margin_min <= args.train_wide_margin_max <= 2:
+        parser.error("Require 0 <= train-wide-margin-min <= train-wide-margin-max <= 2")
+    if not 0 <= args.train_wide_center_jitter <= 0.5:
+        parser.error("--train-wide-center-jitter must be in [0,0.5]")
+    if not 0 < args.small_bladder_quantile < 1:
+        parser.error("--small-bladder-quantile must be in (0,1)")
+    if args.small_bladder_weight < 1:
+        parser.error("--small-bladder-weight must be >=1")
     if args.learning_rate <= 0 or args.weight_decay < 0:
         parser.error("learning rate must be >0 and weight decay >=0")
     if not 0 < args.ema_decay < 1:
         parser.error("--ema-decay must be in (0,1)")
     if not 0 < args.threshold < 1:
         parser.error("--threshold must be in (0,1)")
+    robust_requested = bool(
+        args.train_wide_crop_probability > 0
+        or args.small_bladder_weight > 1
+        or args.mild_appearance_augmentation
+    )
+    locked_output = QC90_OUTPUT if qc90_mode(args) else OUTPUT
+    if robust_requested and resolved_output_dir(args).resolve() == locked_output.resolve():
+        parser.error("Robust Stage-2 experiments require a fresh explicit --output-dir")
     if args.dry_run:
         dry_run(args)
         return

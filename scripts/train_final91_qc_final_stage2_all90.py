@@ -4,7 +4,8 @@
 Training uses safe randomized GT-derived crops exactly as Stage-2 CV. The fixed epoch count is the
 rounded median selected epoch from the five completed Stage-2 folds. Defaults preserve the all-90
 QC-clean Final91 experiment; explicit flags permit larger audited cohorts with recorded case
-exclusions. External31 is not accessed.
+exclusions. Any robust crop, sampling, and appearance settings are inherited from the selected CV
+checkpoints rather than re-entered at final training. External31 is not accessed.
 """
 
 import argparse
@@ -56,7 +57,7 @@ def dry_run(args):
     print(f"Data:                 {args.expected_live} live labels -> {training_count} training cases")
     print(f"Prior quarantine:     {'INCLUDED by explicit experiment flag' if args.include_quarantined else 'EXCLUDED'}")
     print("Epoch selection:      rounded median Stage-2 CV selected epoch")
-    print("Training crop:        GT box + 40%-60% safe margin + 10% center jitter")
+    print("Training data recipe: inherited exactly from the selected five-fold Stage-2 CV")
     print("Model:                DynUNet Student+EMA; DiceCE; threshold 0.50")
     print("External31:           NOT ACCESSED")
     print(f"Output:               {args.output_dir}")
@@ -65,72 +66,21 @@ def dry_run(args):
 
 def run(args):
     import torch
-    import torch.nn.functional as F
     from monai.data import CacheDataset, DataLoader
-    from monai.transforms import Compose, RandAffined, RandFlipd, RandomizableTransform
     from monai.utils import set_determinism
 
     from hassl.config import HASSLConfig
     import hassl.data.data_engine as data_engine
+    from hassl.data.stage2_training import (
+        add_training_recipe_extensions,
+        build_small_bladder_sampler,
+        build_stage2_training_transform,
+        options_from_recipe,
+    )
     from hassl.training.ema import EMATeacher
     from hassl.training.losses import CombinedSegLoss
     from hassl.training.trainer import build_network, compute_multiscale_loss
     from scripts.audit_round1_labels import discover_round1_cases
-
-    def plain_tensor(value):
-        if hasattr(value, "as_tensor"):
-            return value.as_tensor()
-        return torch.as_tensor(value)
-
-    def crop_and_resize(image, label, bounds, output_size):
-        z0, z1, y0, y1, x0, x1 = [int(x) for x in bounds]
-        image_tensor = plain_tensor(image).float()
-        label_tensor = plain_tensor(label).float()
-        image_crop = image_tensor[:, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1].unsqueeze(0)
-        label_crop = label_tensor[:, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1].unsqueeze(0)
-        image_out = F.interpolate(
-            image_crop, size=(output_size,) * 3, mode="trilinear", align_corners=False
-        )[0]
-        label_out = F.interpolate(label_crop, size=(output_size,) * 3, mode="nearest")[0]
-        return image_out, label_out
-
-    class SafeGTBoxCropd(RandomizableTransform):
-        def __init__(self, output_size, margin_min, margin_max, center_jitter):
-            super().__init__(prob=1.0)
-            self.output_size = int(output_size)
-            self.margin_min = float(margin_min)
-            self.margin_max = float(margin_max)
-            self.center_jitter = float(center_jitter)
-
-        def __call__(self, data):
-            result = dict(data)
-            self.randomize(None)
-            label = plain_tensor(result["label"])
-            spatial = label[0] if label.ndim == 4 else label
-            coords = torch.nonzero(spatial > 0.5, as_tuple=False)
-            if coords.numel() == 0:
-                raise RuntimeError(f"Empty Stage-2 training GT: {result.get('id', '?')}")
-            gt_lo = coords.min(dim=0).values.cpu().numpy().astype(float)
-            gt_hi = coords.max(dim=0).values.cpu().numpy().astype(float)
-            gt_size = gt_hi - gt_lo + 1.0
-            gt_center = 0.5 * (gt_lo + gt_hi)
-            margin = float(self.R.uniform(self.margin_min, self.margin_max))
-            shift = self.R.uniform(
-                low=-self.center_jitter, high=self.center_jitter, size=3
-            ) * gt_size
-            proposed_center = gt_center + shift
-            proposed_size = gt_size * (1.0 + 2.0 * margin)
-            lo = np.floor(proposed_center - 0.5 * proposed_size).astype(int)
-            hi = np.ceil(proposed_center + 0.5 * proposed_size).astype(int)
-            lo = np.minimum(lo, gt_lo.astype(int))
-            hi = np.maximum(hi, gt_hi.astype(int))
-            shape = np.asarray(spatial.shape, dtype=int)
-            lo, hi = np.maximum(lo, 0), np.minimum(hi, shape - 1)
-            bounds = (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2])
-            result["image"], result["label"] = crop_and_resize(
-                result["image"], result["label"], bounds, self.output_size
-            )
-            return result
 
     def main_prediction(output):
         if isinstance(output, (list, tuple)):
@@ -220,25 +170,20 @@ def run(args):
     if final_epochs < 1:
         raise RuntimeError("Final epoch count must be >=1")
     first_recipe = cv_states[0][1]["recipe"]
-    locked = {
+    locked_optimization = {
         "learning_rate": float(first_recipe["learning_rate"]),
         "weight_decay": float(first_recipe["weight_decay"]),
         "ema_decay": float(first_recipe["ema_decay"]),
-        "margin_min": float(first_recipe["training_crop"]["margin_per_side_range"][0]),
-        "margin_max": float(first_recipe["training_crop"]["margin_per_side_range"][1]),
-        "center_jitter": float(first_recipe["training_crop"]["center_jitter_fraction_of_gt_size"]),
     }
+    training_options = options_from_recipe(first_recipe)
     for _, state in cv_states[1:]:
         recipe = state["recipe"]
         current = {
             "learning_rate": float(recipe["learning_rate"]),
             "weight_decay": float(recipe["weight_decay"]),
             "ema_decay": float(recipe["ema_decay"]),
-            "margin_min": float(recipe["training_crop"]["margin_per_side_range"][0]),
-            "margin_max": float(recipe["training_crop"]["margin_per_side_range"][1]),
-            "center_jitter": float(recipe["training_crop"]["center_jitter_fraction_of_gt_size"]),
         }
-        if current != locked:
+        if current != locked_optimization or options_from_recipe(recipe) != training_options:
             raise RuntimeError("Stage-2 CV recipes differ across folds")
 
     config = HASSLConfig.from_yaml(args.config)
@@ -269,6 +214,11 @@ def run(args):
     output_dir = Path(args.output_dir)
     checkpoint_path = output_dir / "final_stage2_dynunet.pth"
     metadata_path = output_dir / "final_stage2_metadata.json"
+    if training_options.robust_enabled and output_dir.resolve() == OUTPUT.resolve():
+        raise RuntimeError(
+            "Robust Stage-2 training requires a fresh explicit --output-dir; "
+            "the locked all90 output is protected"
+        )
     if checkpoint_path.exists() and not args.overwrite:
         print(f"Final Stage-2 checkpoint already exists: {checkpoint_path}")
         print("Use --overwrite only if intentionally retraining the same locked recipe.")
@@ -280,24 +230,18 @@ def run(args):
     base = data_engine.get_base_transforms(
         config, keys=["image", "label"], is_training=False, apply_strong_aug=False
     )
-    steps = list(getattr(base, "transforms", [base]))
-    steps.extend([
-        SafeGTBoxCropd(128, locked["margin_min"], locked["margin_max"], locked["center_jitter"]),
-        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
-        RandAffined(
-            keys=["image", "label"], prob=0.5,
-            rotate_range=(0.0, 0.0, 0.0), translate_range=(4.0, 4.0, 4.0),
-            scale_range=(0.0, 0.0, 0.0), mode=("bilinear", "nearest"),
-            padding_mode="zeros",
-        ),
-    ])
+    train_transform = build_stage2_training_transform(base, training_options)
     workers = int(getattr(config, "num_workers", 0))
+    train_items = [by_id[x] for x in train_ids]
+    sampler, sampling_audit = build_small_bladder_sampler(
+        train_items, training_options, seed=seed + 10000
+    )
     dataset = CacheDataset(
-        [by_id[x] for x in train_ids], transform=Compose(steps), cache_rate=1.0,
+        train_items, transform=train_transform, cache_rate=1.0,
         copy_cache=False, num_workers=workers,
     )
     loader = DataLoader(
-        dataset, batch_size=1, shuffle=True, num_workers=workers,
+        dataset, batch_size=1, shuffle=sampler is None, sampler=sampler, num_workers=workers,
         pin_memory=torch.cuda.is_available(),
     )
 
@@ -307,7 +251,8 @@ def run(args):
     student = build_network("dynunet", 1, 0.0).to(device)
     ema = EMATeacher(student).to(device)
     optimizer = torch.optim.AdamW(
-        student.parameters(), lr=locked["learning_rate"], weight_decay=locked["weight_decay"]
+        student.parameters(), lr=locked_optimization["learning_rate"],
+        weight_decay=locked_optimization["weight_decay"]
     )
     criterion = CombinedSegLoss(1, loss_type="dice_ce", include_boundary=False)
     scaler = torch.cuda.amp.GradScaler(enabled=True)
@@ -318,8 +263,31 @@ def run(args):
     print(f"Median / final epochs:   {median_epoch} / {final_epochs}")
     print(f"Training cases:          {len(train_ids)}")
     print(f"Missing frozen allowed:  {bool(args.allow_missing_frozen)}")
-    print(f"Crop margin / jitter:    {locked['margin_min']:.0%}-{locked['margin_max']:.0%} / "
-          f"{locked['center_jitter']:.0%}")
+    print(
+        f"Crop margin / jitter:    {training_options.margin_min:.0%}-"
+        f"{training_options.margin_max:.0%} / {training_options.center_jitter:.0%}"
+    )
+    if training_options.wide_crop_probability > 0.0:
+        print(
+            f"Wide crop:               p={training_options.wide_crop_probability:.0%} | "
+            f"margin={training_options.wide_margin_min:.0%}-"
+            f"{training_options.wide_margin_max:.0%} | "
+            f"jitter={training_options.wide_center_jitter:.0%}"
+        )
+    if sampling_audit["enabled"]:
+        print(
+            f"Small oversampling:      n={sampling_audit['n_small_training']}/"
+            f"{sampling_audit['n_training']} | weight="
+            f"{training_options.small_bladder_weight:.2f}x | expected draws="
+            f"{sampling_audit['expected_small_draw_fraction']:.0%}"
+        )
+    print(
+        "Appearance augmentation:"
+        + (
+            " mild contrast/intensity/speckle"
+            if training_options.mild_appearance_augmentation else " OFF"
+        )
+    )
     print("Prediction:              Student+EMA 50/50 @ 0.50")
     print("External31:              NOT ACCESSED")
     print("=" * 116)
@@ -327,6 +295,7 @@ def run(args):
     for epoch in range(1, final_epochs + 1):
         student.train()
         losses, dices, precisions, recalls = [], [], [], []
+        wide_draws, gt_fractions = [], []
         for batch in loader:
             image = batch["image"].to(device, non_blocking=True)
             target = batch["label"].float().to(device, non_blocking=True)
@@ -339,7 +308,7 @@ def run(args):
             torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=5.0)
             scaler.step(optimizer)
             scaler.update()
-            ema.update(student, decay=locked["ema_decay"])
+            ema.update(student, decay=locked_optimization["ema_decay"])
             with torch.no_grad():
                 prediction = (torch.sigmoid(main_prediction(logits)) > 0.50).float()
                 truth = (target > 0.5).float()
@@ -350,13 +319,52 @@ def run(args):
                 precisions.append(tp / (pred_sum + 1e-8))
                 recalls.append(tp / (gt_sum + 1e-8))
             losses.append(float(loss.item()))
+            wide_draws.append(float(batch["training_crop_is_wide"].float().mean().item()))
+            gt_fractions.append(float(target.float().mean().item()))
         print(
             f"Epoch {epoch:03d}/{final_epochs} | TRAIN loss={np.mean(losses):.4f} "
             f"dice={np.mean(dices):.4f} prec={np.mean(precisions):.4f} "
-            f"rec={np.mean(recalls):.4f}"
+            f"rec={np.mean(recalls):.4f} wide={np.mean(wide_draws):.2f} "
+            f"gt_frac={np.mean(gt_fractions):.4f}"
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "training_sampling.json").write_text(
+        json.dumps(sampling_audit, indent=2), encoding="utf-8"
+    )
+    final_recipe = {
+        "architecture": "DynUNet",
+        "input": "single CenterNet-localized crop resized to 128^3",
+        "loss": "DiceCE",
+        "prediction": "Student+EMA 50/50 ensemble",
+        "threshold": 0.50,
+        "crop_size": [128, 128, 128],
+        **locked_optimization,
+        "margin_min": training_options.margin_min,
+        "margin_max": training_options.margin_max,
+        "center_jitter": training_options.center_jitter,
+        "external31_access": False,
+    }
+    if training_options.robust_enabled:
+        final_recipe.update({
+            "version": "final_stage2_oversegmentation_robust_v1",
+            "training_profile": "oversegmentation_robust_v1",
+            "training_crop": {
+                "source": "GT bounding box only",
+                "margin_per_side_range": [
+                    training_options.margin_min, training_options.margin_max
+                ],
+                "center_jitter_fraction_of_gt_size": training_options.center_jitter,
+                "guarantee": "crop unioned with GT bounds so foreground is never cut",
+            },
+            "augmentation_after_crop": {
+                "translation_voxels": 4.0,
+                "translation_probability": 0.5,
+                "lr_flip_probability": 0.5,
+                "lr_flip_axis_after_ras": 0,
+            },
+        })
+        final_recipe = add_training_recipe_extensions(final_recipe, training_options)
     torch.save({
         "net_A": student.state_dict(),
         "teacher": ema.state_dict(),
@@ -369,19 +377,15 @@ def run(args):
         ),
         "cv_selected_epochs": selected_epochs,
         "median_cv_selected_epoch": median_epoch,
-        "recipe": {
-            "architecture": "DynUNet",
-            "input": "single CenterNet-localized crop resized to 128^3",
-            "loss": "DiceCE",
-            "prediction": "Student+EMA 50/50 ensemble",
-            "threshold": 0.50,
-            "crop_size": [128, 128, 128],
-            **locked,
-            "external31_access": False,
-        },
+        "training_sampling": sampling_audit,
+        "recipe": final_recipe,
     }, checkpoint_path)
     metadata = {
-        "version": f"final{args.expected_live}_final_stage2_all{len(train_ids)}_v1",
+        "version": (
+            f"final{args.expected_live}_final_stage2_all{len(train_ids)}_robust_v1"
+            if training_options.robust_enabled
+            else f"final{args.expected_live}_final_stage2_all{len(train_ids)}_v1"
+        ),
         "checkpoint": str(checkpoint_path),
         "paired_final_centernet": str(stage1_checkpoint),
         "n_live_labels": int(args.expected_live),
@@ -398,6 +402,9 @@ def run(args):
         "final_epochs": final_epochs,
         "epoch_selection": "override" if args.epochs is not None else "rounded_median_cv",
         "prediction": "Student+EMA 50/50 raw ensemble @ 0.50",
+        "training_profile": final_recipe.get("training_profile", "locked_legacy"),
+        "training_sampling": sampling_audit,
+        "training_recipe": final_recipe,
         "external31_access": False,
         "missing_frozen_case_ids": audit.get("missing_frozen_case_ids", []),
         "missing_frozen_allowed": bool(args.allow_missing_frozen),
